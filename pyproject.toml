@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qris-rsync-manager"
+version = "0.1.0"
+description = "Windows desktop rsync manager for QRIScloud collections"
+requires-python = ">=3.11"
+dependencies = ["PySide6>=6.7"]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0"]
+packaging = ["pyinstaller>=6.0"]
+
+[project.scripts]
+qris-rsync-manager = "app.main:main"
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+

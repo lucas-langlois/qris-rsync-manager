@@ -1,0 +1,11 @@
+envs/
+.venv/
+.conda_tmp/
+.test_tmp/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+*.spec
