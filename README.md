@@ -261,3 +261,7 @@ The app uses rsync `--outbuf=N` and `--info=progress2`, but rsync may still spen
 ### Build sync selection seems slow
 
 The remote manifest step recursively scans the selected remote path. This can be slow for large QRIScloud folders. Use **Stop** to cancel it.
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE).
