@@ -4,9 +4,29 @@ QRIS Rsync Manager is a Windows desktop app for moving research datasets between
 
 The app is designed for practical QRIScloud workflows: side-by-side local/remote browsing, dry-run comparison, resumable uploads/downloads, live logs, progress display, and safe defaults.
 
+Most users should download and run the `.exe` from the latest GitHub release. You do not need to install Python unless you want to develop or build the app yourself.
+
+## Download the App
+
+Download the latest Windows executable from:
+
+```text
+https://github.com/lucas-langlois/qris-rsync-manager/releases/latest
+```
+
+Use:
+
+```text
+QRISRsyncManager.exe
+```
+
+The `.exe` contains the Python application. You still need MSYS2 `rsync` and `ssh` installed separately because those are the transfer tools used by QRIScloud.
+
+On first launch, Windows may show a security warning because this is not yet a code-signed application. Choose **More info** and **Run anyway** if you trust the downloaded release.
+
 ## Features
 
-- PySide6 Windows desktop GUI
+- Windows desktop GUI
 - Side-by-side local and remote directory browser
 - QRIScloud connection profiles
 - SSH key authentication with in-app passphrase prompt
@@ -20,31 +40,9 @@ The app is designed for practical QRIScloud workflows: side-by-side local/remote
 - Stop/cancel for transfers and sync-selection scans
 - Logs saved to `%APPDATA%\QRISRsyncManager\logs`
 
-## Safety Defaults
-
-Default rsync flags:
-
-```text
--a -v -h --progress --partial -W --outbuf=N --info=progress2 --human-readable
-```
-
-Important QRIScloud choices:
-
-- `-W` is enabled to avoid rsync checksum/delta behavior that can be costly for stale QRIScloud data.
-- `-c` is not used by default.
-- `--delete` is not implemented.
-- Mirror/delete mode is intentionally absent.
-- `--append-verify` is not used with `-W` because rsync rejects that flag combination.
-
-SSH keepalive options:
-
-```text
-ssh -o ServerAliveInterval=60 -o ServerAliveCountMax=10
-```
-
 ## Install MSYS2, rsync, and SSH
 
-The app expects MSYS2 tools at:
+Install MSYS2 before using the app. The app expects these tools at:
 
 ```text
 C:\msys64\usr\bin\rsync.exe
@@ -65,7 +63,7 @@ Then open **MSYS2 MSYS** from the Start Menu and run:
 pacman -Syu
 ```
 
-Close the MSYS2 window if it asks you to, reopen **MSYS2 MSYS**, then run:
+If MSYS2 asks you to close the terminal, close it, reopen **MSYS2 MSYS**, then run:
 
 ```bash
 pacman -S --needed rsync openssh
@@ -90,13 +88,13 @@ Install to the default location, `C:\msys64`, then run the same `pacman` command
 
 ## SSH Key Setup
 
-Create a QRIScloud SSH key:
+Create a QRIScloud SSH key if you do not already have one:
 
 ```powershell
 ssh-keygen -t ed25519 -f "$env:USERPROFILE\.ssh\qriscloud_ed25519"
 ```
 
-Set the profile SSH key path to the private key:
+Set the app profile SSH key path to the private key:
 
 ```text
 C:\Users\<you>\.ssh\qriscloud_ed25519
@@ -108,7 +106,19 @@ Do not use the `.pub` file in the app. The `.pub` file is the public key you pro
 C:\Users\<you>\.ssh\qriscloud_ed25519.pub
 ```
 
-The app may ask for the SSH key passphrase. It keeps the passphrase in memory for the current app session only.
+The app may ask for the SSH key passphrase. It keeps the passphrase in memory for the current app session only; it is not saved into the profile.
+
+## First Run
+
+1. Start `QRISRsyncManager.exe`.
+2. Create or select a profile.
+3. Click **Test SSH**.
+4. Select a local folder in the left pane.
+5. Load and browse the remote folder in the right pane.
+6. Use **Compare / dry-run** before upload.
+7. Use **Upload** to upload the local folder contents to the remote path.
+8. Use **Compare download** before download.
+9. Use **Download** to download remote contents into the selected local folder.
 
 ## Profile Setup
 
@@ -124,42 +134,6 @@ Create or edit a profile with:
 - rsync executable path, usually `C:\msys64\usr\bin\rsync.exe`
 
 If the host is `ssh1.qriscloud.org.au` or `ssh2.qriscloud.org.au`, the app automatically tries the other host as a fallback.
-
-## Run From Source
-
-This project uses Python 3.11+.
-
-### Conda
-
-```powershell
-cd qris_rsync_manager
-conda create -n qris-rsync-manager python=3.11 pip
-conda activate qris-rsync-manager
-python -m pip install -r requirements.txt
-python -m app.main
-```
-
-### Project-local conda environment
-
-```powershell
-cd qris_rsync_manager
-conda create -p .\envs\qris-rsync-manager python=3.11 pip
-conda activate ".\envs\qris-rsync-manager"
-python -m pip install -r requirements.txt
-python -m app.main
-```
-
-## Basic Workflow
-
-1. Start the app.
-2. Create or select a profile.
-3. Click **Test SSH**.
-4. Select a local folder in the left pane.
-5. Load and browse the remote folder in the right pane.
-6. Use **Compare / dry-run** before upload.
-7. Use **Upload** to upload the local folder contents to the remote path.
-8. Use **Compare download** before download.
-9. Use **Download** to download remote contents into the selected local folder.
 
 ## Sync Selection
 
@@ -196,47 +170,26 @@ Other app data, including profiles and temporary file lists, is saved under:
 %APPDATA%\QRISRsyncManager
 ```
 
-## Run Tests
+## Safety Defaults
 
-```powershell
-cd qris_rsync_manager
-.\run_tests.ps1
-```
-
-Tests do not require live QRIScloud access, rsync execution, or network access.
-
-The test wrapper creates a project-local temporary directory for pytest and removes it when the test run finishes. This avoids Windows/OneDrive temp-directory permission issues.
-
-## Build the EXE
-
-Install packaging dependencies and build:
-
-```powershell
-cd qris_rsync_manager
-python -m pip install -e ".[packaging]"
-.\packaging\build_pyinstaller.ps1
-```
-
-The executable is written to:
+Default rsync flags:
 
 ```text
-dist\QRISRsyncManager.exe
+-a -v -h --progress --partial -W --outbuf=N --info=progress2 --human-readable
 ```
 
-## Create a GitHub Release
+Important QRIScloud choices:
 
-After building the executable:
+- `-W` is enabled to avoid rsync checksum/delta behavior that can be costly for stale QRIScloud data.
+- `-c` is not used by default.
+- `--delete` is not implemented.
+- Mirror/delete mode is intentionally absent.
+- `--append-verify` is not used with `-W` because rsync rejects that flag combination.
 
-```powershell
-git tag v0.1.0
-git push origin main --tags
-gh release create v0.1.0 .\dist\QRISRsyncManager.exe --title "QRIS Rsync Manager v0.1.0" --notes "Initial MVP release."
-```
+SSH keepalive options:
 
-If GitHub CLI is not authenticated:
-
-```powershell
-gh auth login -h github.com
+```text
+ssh -o ServerAliveInterval=60 -o ServerAliveCountMax=10
 ```
 
 ## Troubleshooting
@@ -261,6 +214,77 @@ The app uses rsync `--outbuf=N` and `--info=progress2`, but rsync may still spen
 ### Build sync selection seems slow
 
 The remote manifest step recursively scans the selected remote path. This can be slow for large QRIScloud folders. Use **Stop** to cancel it.
+
+## Developer Setup
+
+Most users do not need this section. Use it only if you want to run the app from source, change the code, run tests, or build a new `.exe`.
+
+This project uses Python 3.11+.
+
+### Run From Source
+
+With conda:
+
+```powershell
+cd qris_rsync_manager
+conda create -n qris-rsync-manager python=3.11 pip
+conda activate qris-rsync-manager
+python -m pip install -r requirements.txt
+python -m app.main
+```
+
+With a project-local conda environment:
+
+```powershell
+cd qris_rsync_manager
+conda create -p .\envs\qris-rsync-manager python=3.11 pip
+conda activate ".\envs\qris-rsync-manager"
+python -m pip install -r requirements.txt
+python -m app.main
+```
+
+### Run Tests
+
+```powershell
+cd qris_rsync_manager
+.\run_tests.ps1
+```
+
+Tests do not require live QRIScloud access, rsync execution, or network access.
+
+The test wrapper creates a project-local temporary directory for pytest and removes it when the test run finishes. This avoids Windows/OneDrive temp-directory permission issues.
+
+### Build the EXE
+
+Install packaging dependencies and build:
+
+```powershell
+cd qris_rsync_manager
+python -m pip install -e ".[packaging]"
+.\packaging\build_pyinstaller.ps1
+```
+
+The executable is written to:
+
+```text
+dist\QRISRsyncManager.exe
+```
+
+### Create a GitHub Release
+
+After building the executable:
+
+```powershell
+git tag v0.1.0
+git push origin main --tags
+gh release create v0.1.0 .\dist\QRISRsyncManager.exe --title "QRIS Rsync Manager v0.1.0" --notes "Initial MVP release."
+```
+
+If GitHub CLI is not authenticated:
+
+```powershell
+gh auth login -h github.com
+```
 
 ## License
 
