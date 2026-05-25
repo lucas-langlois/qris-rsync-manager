@@ -10,10 +10,19 @@ New-Item -ItemType Directory -Force -Path $TempRoot | Out-Null
 $env:TEMP = $TempRoot
 $env:TMP = $TempRoot
 
-if (Test-Path $ProjectPython) {
-    & $ProjectPython -m pytest -q -p no:cacheprovider --basetemp=$BaseTemp @args
-} else {
-    & python -m pytest -q -p no:cacheprovider --basetemp=$BaseTemp @args
+$exitCode = 0
+
+try {
+    if (Test-Path $ProjectPython) {
+        & $ProjectPython -m pytest -q -p no:cacheprovider --basetemp=$BaseTemp @args
+    } else {
+        & python -m pytest -q -p no:cacheprovider --basetemp=$BaseTemp @args
+    }
+    $exitCode = $LASTEXITCODE
+} finally {
+    if (Test-Path $TempRoot) {
+        Remove-Item -LiteralPath $TempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
-exit $LASTEXITCODE
+exit $exitCode

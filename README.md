@@ -200,10 +200,12 @@ Other app data, including profiles and temporary file lists, is saved under:
 
 ```powershell
 cd qris_rsync_manager
-python -m pytest
+.\run_tests.ps1
 ```
 
 Tests do not require live QRIScloud access, rsync execution, or network access.
+
+The test wrapper creates a project-local temporary directory for pytest and removes it when the test run finishes. This avoids Windows/OneDrive temp-directory permission issues.
 
 ## Build the EXE
 
@@ -259,4 +261,3 @@ The app uses rsync `--outbuf=N` and `--info=progress2`, but rsync may still spen
 ### Build sync selection seems slow
 
 The remote manifest step recursively scans the selected remote path. This can be slow for large QRIScloud folders. Use **Stop** to cancel it.
-
