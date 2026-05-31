@@ -260,8 +260,14 @@ Install packaging dependencies and build:
 
 ```powershell
 cd qris_rsync_manager
-python -m pip install -e ".[packaging]"
 .\packaging\build_pyinstaller.ps1
+```
+
+The build script uses the project-local conda environment at `envs\qris-rsync-manager`.
+For a fresh environment, install the project into that environment first:
+
+```powershell
+.\packaging\build_pyinstaller.ps1 -Install
 ```
 
 The executable is written to:

@@ -71,6 +71,20 @@ def test_download_command_reverses_source_and_destination(tmp_path: Path) -> Non
     assert "download target" in command[-1]
 
 
+def test_download_command_can_use_files_from(tmp_path: Path) -> None:
+    local = tmp_path / "download target"
+    local.mkdir()
+    file_list = tmp_path / "remote files.txt"
+    file_list.write_text("image 1.JPG\nimage 2.JPG\n", encoding="utf-8")
+    profile = Profile(username="user", host="ssh2.qriscloud.org.au", remote_path="/data/Q8940", rsync_path=r"C:\msys64\usr\bin\rsync.exe")
+
+    command = build_rsync_command(profile, local, dry_run=False, direction="download", files_from=file_list)
+
+    assert any(part.startswith("--files-from=/") for part in command)
+    assert command[-2] == "user@ssh2.qriscloud.org.au:/data/Q8940/"
+    assert command[-1].endswith("/")
+
+
 def test_ssh_transport_has_keepalive_and_no_checksum_flag(tmp_path: Path) -> None:
     profile = Profile(
         username="user",

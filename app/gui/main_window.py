@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import queue
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
@@ -35,6 +38,7 @@ from PySide6.QtWidgets import (
 from app.core.askpass import build_askpass_environment, scrub_askpass_environment
 from app.core.logging_utils import new_log_file
 from app.core.file_scan import scan_folder
+from app.core.medici import build_recall_medici_files_command, medici_path_for_remote_path
 from app.core.paths import detect_ssh, is_executable_file
 from app.core.profiles import Profile, fallback_hosts, load_profiles, profile_with_host, save_profiles, upsert_profile
 from app.core.progress import parse_rsync_progress
@@ -99,15 +103,254 @@ class FallbackCommandWorker(CommandWorker):
             result = run_ssh_test(attempt_profile, ssh_path=self.ssh_path, passphrase=self.passphrase, timeout=30)
             if result.returncode != 0:
                 self.output.emit(f"{host} unavailable for transfer: exit code {result.returncode}\n")
+                if result.output:
+                    self.output.emit(result.output)
+                    if not result.output.endswith("\n"):
+                        self.output.emit("\n")
                 continue
             self.output.emit(f"Using {host} for transfer.\n")
             self.command = self.command_factory(attempt_profile)
+            self.output.emit("Starting rsync. Large remote folders may spend time on the file list before file progress appears.\n")
             code = self.runner.run(self.command, log_file, self.output.emit, passphrase=self.passphrase, ssh_path=self.ssh_path)
             self.output.emit(f"\nLog saved to: {log_file}\n")
             self.finished.emit(code)
             return
         self.output.emit("No QRIScloud SSH host was available for transfer.\n")
         self.finished.emit(124)
+
+
+class RecallMediciWorker(QObject):
+    output = Signal(str)
+    finished = Signal(int)
+
+    def __init__(
+        self,
+        profile: Profile,
+        remote_files: list[str],
+        ssh_path: str,
+        passphrase: str = "",
+        batch_size: int = 1,
+        max_reconnect_attempts: int = 3,
+        reconnect_delay_seconds: int = 15,
+    ) -> None:
+        super().__init__()
+        self.profile = profile
+        self.remote_files = remote_files
+        self.ssh_path = ssh_path
+        self.passphrase = passphrase
+        self.batch_size = max(1, int(batch_size))
+        self.max_reconnect_attempts = max(1, int(max_reconnect_attempts))
+        self.reconnect_delay_seconds = max(0, int(reconnect_delay_seconds))
+        self._process: subprocess.Popen[str] | None = None
+        self._cancelled = False
+
+    @Slot()
+    def run(self) -> None:
+        log_file = new_log_file(f"recall_medici_{self.profile.name}")
+        try:
+            code = self._run_with_fallback(log_file)
+        except Exception as exc:
+            self._write_and_emit(log_file, f"\nRecall failed before completion: {exc}\n")
+            code = 1
+        self.output.emit(f"\nLog saved to: {log_file}\n")
+        self.finished.emit(code)
+
+    def _run_with_fallback(self, log_file: Path) -> int:
+        for host in fallback_hosts(self.profile):
+            if self._cancelled:
+                self._write_and_emit(log_file, "Recall was cancelled.\n")
+                return 130
+            attempt_profile = profile_with_host(self.profile, host)
+            self._write_and_emit(log_file, f"Checking {host} before recall...\n")
+            result = run_ssh_test(attempt_profile, ssh_path=self.ssh_path, passphrase=self.passphrase, timeout=30)
+            if result.returncode != 0:
+                self._write_and_emit(log_file, f"{host} unavailable for recall: exit code {result.returncode}\n")
+                if result.output:
+                    text = result.output if result.output.endswith("\n") else result.output + "\n"
+                    self._write_and_emit(log_file, text)
+                continue
+            self._write_and_emit(log_file, f"Using {host} for recall.\n")
+            return self._run_batches(attempt_profile, log_file)
+        self._write_and_emit(log_file, "No QRIScloud SSH host was available for recall.\n")
+        return 124
+
+    def _run_batches(self, profile: Profile, log_file: Path) -> int:
+        chunks = [
+            self.remote_files[index : index + self.batch_size]
+            for index in range(0, len(self.remote_files), self.batch_size)
+        ]
+        creationflags = subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") else 0
+        for index, chunk in enumerate(chunks, start=1):
+            if self._cancelled:
+                self._write_and_emit(log_file, "Recall was cancelled.\n")
+                return 130
+            first_name = Path(chunk[0]).name
+            last_name = Path(chunk[-1]).name
+            if first_name == last_name:
+                summary = first_name
+            else:
+                summary = f"{first_name} ... {last_name}"
+            self._write_and_emit(log_file, f"\n[{index}/{len(chunks)}] recalling {len(chunk)} file(s): {summary}\n")
+            code = self._run_batch_with_reconnects(profile, chunk, log_file, index, len(chunks), creationflags)
+            if code != 0:
+                self._write_and_emit(log_file, f"[{index}/{len(chunks)}] recall failed with exit code {code}.\n")
+                return code
+            self._write_and_emit(log_file, f"[{index}/{len(chunks)}] done.\n")
+        self._write_and_emit(log_file, f"\nRecall finished for {len(self.remote_files):,} file(s).\n")
+        return 0
+
+    def _run_batch_with_reconnects(
+        self,
+        profile: Profile,
+        chunk: list[str],
+        log_file: Path,
+        batch_index: int,
+        batch_count: int,
+        creationflags: int,
+    ) -> int:
+        hosts = fallback_hosts(profile)
+        last_code = 1
+        for attempt in range(1, self.max_reconnect_attempts + 1):
+            for host in hosts:
+                if self._cancelled:
+                    self._write_and_emit(log_file, "Recall was cancelled.\n")
+                    return 130
+                attempt_profile = profile_with_host(profile, host)
+                if attempt > 1 or host != profile.host:
+                    self._write_and_emit(
+                        log_file,
+                        f"[{batch_index}/{batch_count}] reconnect attempt {attempt}/{self.max_reconnect_attempts} using {host}...\n",
+                    )
+                code = self._run_recall_command(attempt_profile, chunk, log_file, batch_index, batch_count, creationflags)
+                if code == 0 or self._cancelled:
+                    return code
+                last_code = code
+                if not self._is_retryable_recall_exit(code):
+                    return code
+                self._write_and_emit(
+                    log_file,
+                    f"[{batch_index}/{batch_count}] SSH connection failed with exit code {code}; will retry this file.\n",
+                )
+            if attempt < self.max_reconnect_attempts and self.reconnect_delay_seconds > 0:
+                self._sleep_before_reconnect(log_file, batch_index, batch_count)
+        return last_code
+
+    def _run_recall_command(
+        self,
+        profile: Profile,
+        chunk: list[str],
+        log_file: Path,
+        batch_index: int,
+        batch_count: int,
+        creationflags: int,
+    ) -> int:
+        command = build_recall_medici_files_command(
+            profile,
+            chunk,
+            ssh_path=self.ssh_path,
+            batch_mode=not bool(self.passphrase),
+            batch_size=len(chunk),
+        )
+        env = build_askpass_environment(self.passphrase, ssh_path=self.ssh_path)
+        try:
+            with subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                shell=False,
+                creationflags=creationflags,
+                env=env,
+            ) as process:
+                self._process = process
+                code = self._monitor_recall_process(process, log_file, batch_index, batch_count)
+        finally:
+            self._process = None
+            scrub_askpass_environment(env)
+        return code
+
+    def _sleep_before_reconnect(self, log_file: Path, batch_index: int, batch_count: int) -> None:
+        self._write_and_emit(
+            log_file,
+            f"[{batch_index}/{batch_count}] waiting {self.reconnect_delay_seconds}s before reconnect...\n",
+        )
+        deadline = time.monotonic() + self.reconnect_delay_seconds
+        while not self._cancelled and time.monotonic() < deadline:
+            time.sleep(0.2)
+
+    @staticmethod
+    def _is_retryable_recall_exit(code: int) -> bool:
+        return code == 255
+
+    def _monitor_recall_process(
+        self,
+        process: subprocess.Popen[str],
+        log_file: Path,
+        batch_index: int,
+        batch_count: int,
+    ) -> int:
+        output_queue: queue.Queue[str | None] = queue.Queue()
+
+        def read_output() -> None:
+            try:
+                if process.stdout:
+                    for line in process.stdout:
+                        output_queue.put(line)
+            finally:
+                output_queue.put(None)
+
+        reader = threading.Thread(target=read_output, daemon=True)
+        reader.start()
+        started = time.monotonic()
+        next_heartbeat = started + 30
+        output_done = False
+
+        while True:
+            try:
+                item = output_queue.get(timeout=0.2)
+            except queue.Empty:
+                item = ""
+
+            if item is None:
+                output_done = True
+            elif item:
+                self._write_and_emit(log_file, item)
+
+            if self._cancelled:
+                process.terminate()
+                self._write_and_emit(log_file, "\nRecall was cancelled.\n")
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                return 130
+
+            now = time.monotonic()
+            if process.poll() is None and now >= next_heartbeat:
+                elapsed = int(now - started)
+                self._write_and_emit(
+                    log_file,
+                    f"[{batch_index}/{batch_count}] still recalling after {elapsed}s; waiting for QRIScloud tape/cache...\n",
+                )
+                next_heartbeat = now + 30
+
+            if process.poll() is not None and output_done and output_queue.empty():
+                break
+
+        reader.join(timeout=1)
+        return process.wait()
+
+    def _write_and_emit(self, log_file: Path, text: str) -> None:
+        with log_file.open("a", encoding="utf-8", errors="replace") as handle:
+            handle.write(text)
+        self.output.emit(text)
+
+    @Slot()
+    def cancel(self) -> None:
+        self._cancelled = True
+        if self._process and self._process.poll() is None:
+            self._process.terminate()
 
 
 class SshTestWorker(QObject):
@@ -255,12 +498,14 @@ class MainWindow(QMainWindow):
 
         self.profiles = load_profiles()
         self.current_thread: QThread | None = None
-        self.current_worker: CommandWorker | SshTestWorker | None = None
+        self.current_worker: CommandWorker | SshTestWorker | RecallMediciWorker | None = None
         self.remote_thread: QThread | None = None
         self.remote_worker: RemoteListWorker | None = None
         self.compare_thread: QThread | None = None
         self.compare_worker: SyncCompareWorker | None = None
         self.sync_selection: dict[str, object] | None = None
+        self.remote_entries: list[RemoteEntry] = []
+        self.remote_entries_path = ""
         self.session_passphrase: str | None = None
 
         self.profile_combo = QComboBox()
@@ -276,6 +521,7 @@ class MainWindow(QMainWindow):
         self._progress_buffer = ""
         self.log_output = QTextEdit()
         self.log_output.setReadOnly(True)
+        self.log_output.document().setMaximumBlockCount(5000)
 
         self.local_model = QFileSystemModel(self)
         self.local_model.setRootPath("")
@@ -309,6 +555,7 @@ class MainWindow(QMainWindow):
         self.upload_selection_button = QPushButton("Upload selection")
         self.upload_selection_button.setEnabled(False)
         self.upload_button = QPushButton("Upload")
+        self.recall_button = QPushButton("Recall tape")
         self.download_button = QPushButton("Download")
         self.stop_button = QPushButton("Stop")
         self.stop_button.setEnabled(False)
@@ -351,6 +598,7 @@ class MainWindow(QMainWindow):
         button_row.addWidget(self.build_selection_button)
         button_row.addWidget(self.upload_selection_button)
         button_row.addWidget(self.upload_button)
+        button_row.addWidget(self.recall_button)
         button_row.addWidget(self.download_button)
         button_row.addStretch()
         button_row.addWidget(self.stop_button)
@@ -381,6 +629,7 @@ class MainWindow(QMainWindow):
         self.build_selection_button.clicked.connect(self._build_sync_selection)
         self.upload_selection_button.clicked.connect(self._upload_sync_selection)
         self.upload_button.clicked.connect(lambda: self._start_rsync(dry_run=False, direction="upload"))
+        self.recall_button.clicked.connect(self._recall_medici)
         self.download_button.clicked.connect(lambda: self._start_rsync(dry_run=False, direction="download"))
         self.stop_button.clicked.connect(self._cancel_current)
 
@@ -573,6 +822,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Remote listing failed", error)
             return
         remote_entries = list(entries)
+        self.remote_entries = remote_entries
+        self.remote_entries_path = self.remote_path_edit.text().strip().rstrip("/")
         self._populate_remote_table(remote_entries)
         self.remote_status_label.setText(f"{len(remote_entries)} items in {self.remote_path_edit.text().strip()}")
 
@@ -609,6 +860,65 @@ class MainWindow(QMainWindow):
         self.remote_path_edit.setText(parent)
         self._clear_sync_selection()
         self._refresh_remote_table()
+
+    def _visible_remote_file_list(self) -> Path | None:
+        current_path = self.remote_path_edit.text().strip().rstrip("/")
+        if not self.remote_entries or self.remote_entries_path != current_path:
+            return None
+        files = [entry.name for entry in self.remote_entries if not entry.is_dir]
+        directories = [entry.name for entry in self.remote_entries if entry.is_dir]
+        if not files or directories:
+            return None
+        path = new_log_file("download_visible_files").with_suffix(".txt")
+        path.write_text("\n".join(files) + "\n", encoding="utf-8", newline="\n")
+        return path
+
+    def _visible_remote_file_paths(self) -> list[str]:
+        current_path = self.remote_path_edit.text().strip().rstrip("/")
+        if not self.remote_entries or self.remote_entries_path != current_path:
+            return []
+        return [entry.path for entry in self.remote_entries if not entry.is_dir]
+
+    def _recall_medici(self) -> None:
+        profile = self.current_profile()
+        if not profile:
+            return
+        errors = self._profile_errors(profile, require_rsync=False)
+        if errors:
+            self._show_errors(errors)
+            return
+        try:
+            medici_path = medici_path_for_remote_path(self.remote_path_edit.text())
+        except ValueError as exc:
+            self._show_errors([str(exc)])
+            return
+        remote_files = self._visible_remote_file_paths()
+        if not remote_files:
+            self._show_errors(["Load a remote folder containing files before running tape recall."])
+            return
+        if (
+            QMessageBox.question(
+                self,
+                "Recall tape",
+                f"Run recall_medici for {len(remote_files):,} visible files under {medici_path}?\n\nThis runs one file at a time for testing and can take a long time on QRIScloud/HPC.",
+            )
+            != QMessageBox.Yes
+        ):
+            return
+        passphrase = self._get_session_passphrase(profile)
+        if passphrase is None:
+            return
+
+        self._start_worker(
+            RecallMediciWorker(
+                profile,
+                remote_files,
+                self.detected_ssh,
+                passphrase=passphrase,
+                batch_size=1,
+            ),
+            "Recall tape",
+        )
 
     def _build_sync_selection(self) -> None:
         profile = self.current_profile()
@@ -744,6 +1054,9 @@ class MainWindow(QMainWindow):
                 != QMessageBox.Yes
             ):
                 return
+            visible_files_from = self._visible_remote_file_list()
+        else:
+            visible_files_from = None
         passphrase = self._get_session_passphrase(profile)
         if passphrase is None:
             return
@@ -755,6 +1068,7 @@ class MainWindow(QMainWindow):
                 dry_run=dry_run,
                 ssh_path=self.detected_ssh,
                 batch_mode=not bool(passphrase),
+                files_from=visible_files_from,
                 direction=direction,
             )
 
@@ -774,6 +1088,10 @@ class MainWindow(QMainWindow):
             ),
             label,
         )
+        if visible_files_from:
+            self._append_log(
+                f"Using visible remote file list ({self.remote_table.rowCount():,} entries) to avoid recursive rsync discovery.\n"
+            )
 
     def _ask_passphrase(self, profile: Profile) -> str | None:
         if not profile.ssh_key_path:
@@ -810,7 +1128,7 @@ class MainWindow(QMainWindow):
         message = "\n\n".join(warnings) + "\n\nContinue upload?"
         return QMessageBox.warning(self, "Large upload warning", message, QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes
 
-    def _start_worker(self, worker: CommandWorker | SshTestWorker, label: str) -> None:
+    def _start_worker(self, worker: CommandWorker | SshTestWorker | RecallMediciWorker, label: str) -> None:
         if self.current_thread:
             QMessageBox.information(self, "Transfer running", "A command is already running.")
             return
@@ -832,7 +1150,7 @@ class MainWindow(QMainWindow):
 
     def _worker_finished(self, code: int, label: str) -> None:
         self._append_log(f"\n{label} finished with exit code {code}.\n")
-        if code == 0 and any(word in label.lower() for word in ("upload", "dry run")):
+        if code == 0 and any(word in label.lower() for word in ("upload", "dry run", "recall")):
             self.transfer_progress.setValue(100)
         self.transfer_status_label.setText(f"{label} finished with exit code {code}.")
         self.current_thread = None
@@ -840,8 +1158,8 @@ class MainWindow(QMainWindow):
         self._set_running(False)
 
     def _cancel_current(self) -> None:
-        if isinstance(self.current_worker, CommandWorker):
-            self._append_log("\nCancelling transfer...\n")
+        if isinstance(self.current_worker, (CommandWorker, RecallMediciWorker)):
+            self._append_log("\nCancelling current command...\n")
             self.current_worker.cancel()
         elif isinstance(self.compare_worker, SyncCompareWorker):
             self._append_log("\nCancelling sync comparison...\n")
@@ -860,6 +1178,7 @@ class MainWindow(QMainWindow):
         self.build_selection_button.setEnabled(not running and self.compare_thread is None)
         self.upload_selection_button.setEnabled(not running and self.compare_thread is None and bool(self.sync_selection and self.sync_selection.get("selected")))
         self.upload_button.setEnabled(not running)
+        self.recall_button.setEnabled(not running)
         self.download_button.setEnabled(not running)
         self.stop_button.setEnabled(running)
 
@@ -876,6 +1195,7 @@ class MainWindow(QMainWindow):
         self.build_selection_button.setEnabled(not running and self.current_thread is None)
         self.upload_selection_button.setEnabled(not running and bool(self.sync_selection and self.sync_selection.get("selected")))
         self.upload_button.setEnabled(not running and self.current_thread is None)
+        self.recall_button.setEnabled(not running and self.current_thread is None)
         self.download_button.setEnabled(not running and self.current_thread is None)
         self.stop_button.setEnabled(running or self.current_thread is not None)
 
@@ -896,6 +1216,7 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "Cannot start", "\n".join(errors))
 
     def _append_log(self, text: str) -> None:
+        text = text.replace("\r", "\n")
         self.log_output.moveCursor(QTextCursor.End)
         self.log_output.insertPlainText(text)
         self.log_output.moveCursor(QTextCursor.End)

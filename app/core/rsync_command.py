@@ -14,6 +14,7 @@ DEFAULT_RSYNC_OPTIONS = [
     "--progress",
     "--partial",
     "-W",
+    "--timeout=120",
     "--outbuf=N",
     "--info=progress2",
     "--human-readable",

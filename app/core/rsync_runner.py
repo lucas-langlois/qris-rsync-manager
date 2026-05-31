@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -25,9 +26,11 @@ class RsyncRunner:
         on_output: OutputCallback | None = None,
         passphrase: str = "",
         ssh_path: str | None = None,
+        idle_timeout_seconds: int | None = None,
     ) -> int:
         log_file.parent.mkdir(parents=True, exist_ok=True)
         self._cancel_requested = False
+        timed_out = False
         env = build_askpass_environment(passphrase, ssh_path=ssh_path or self._ssh_path_from_command(command))
         creationflags = 0
         if sys.platform.startswith("win"):
@@ -47,14 +50,45 @@ class RsyncRunner:
                 ) as process:
                     with self._lock:
                         self._process = process
+                    last_output = time.monotonic()
+                    stop_watchdog = threading.Event()
+
+                    def watchdog() -> None:
+                        nonlocal timed_out
+                        if not idle_timeout_seconds:
+                            return
+                        while not stop_watchdog.wait(1):
+                            if process.poll() is not None:
+                                return
+                            if time.monotonic() - last_output >= idle_timeout_seconds:
+                                timed_out = True
+                                self._cancel_requested = True
+                                process.terminate()
+                                return
+
+                    watchdog_thread = threading.Thread(target=watchdog, daemon=True)
+                    watchdog_thread.start()
                     if process.stdout:
+                        buffer: list[str] = []
+                        last_emit = time.monotonic()
                         while True:
                             chunk = process.stdout.read(1)
                             if not chunk:
                                 break
-                            self._emit(log, on_output, chunk)
+                            last_output = time.monotonic()
+                            buffer.append(chunk)
+                            now = time.monotonic()
+                            if chunk in {"\n", "\r"} or len(buffer) >= 4096 or now - last_emit >= 0.2:
+                                self._emit(log, on_output, "".join(buffer))
+                                buffer.clear()
+                                last_emit = now
+                        if buffer:
+                            self._emit(log, on_output, "".join(buffer))
+                    stop_watchdog.set()
                     returncode = process.wait()
-                    if self._cancel_requested:
+                    if timed_out:
+                        self._emit(log, on_output, f"\nProcess stopped after {idle_timeout_seconds} seconds without output.\n")
+                    elif self._cancel_requested:
                         self._emit(log, on_output, "\nProcess cancelled by user.\n")
                     self._emit(log, on_output, f"\nProcess exited with code {returncode}\n")
                     return returncode
