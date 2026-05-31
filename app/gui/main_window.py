@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -19,6 +20,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QAbstractItemView,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -43,6 +45,7 @@ from app.core.paths import detect_ssh, is_executable_file
 from app.core.profiles import Profile, fallback_hosts, load_profiles, profile_with_host, save_profiles, upsert_profile
 from app.core.progress import parse_rsync_progress
 from app.core.remote_dirs import RemoteEntry, build_list_remote_entries_command
+from app.core.remote_ops import build_remote_delete_command, build_remote_mkdir_command, build_remote_move_command
 from app.core.rsync_command import build_rsync_command, validate_transfer_inputs
 from app.core.rsync_runner import RsyncRunner
 from app.core.ssh_test import run_ssh_test
@@ -109,7 +112,12 @@ class FallbackCommandWorker(CommandWorker):
                         self.output.emit("\n")
                 continue
             self.output.emit(f"Using {host} for transfer.\n")
-            self.command = self.command_factory(attempt_profile)
+            try:
+                self.command = self.command_factory(attempt_profile)
+            except Exception as exc:
+                self.output.emit(f"Could not build command: {exc}\n")
+                self.finished.emit(1)
+                return
             self.output.emit("Starting rsync. Large remote folders may spend time on the file list before file progress appears.\n")
             code = self.runner.run(self.command, log_file, self.output.emit, passphrase=self.passphrase, ssh_path=self.ssh_path)
             self.output.emit(f"\nLog saved to: {log_file}\n")
@@ -499,6 +507,10 @@ class MainWindow(QMainWindow):
         self.profiles = load_profiles()
         self.current_thread: QThread | None = None
         self.current_worker: CommandWorker | SshTestWorker | RecallMediciWorker | None = None
+        self.current_label = ""
+        self.current_finished_handled = False
+        self.current_refresh_local = False
+        self.current_refresh_remote = False
         self.remote_thread: QThread | None = None
         self.remote_worker: RemoteListWorker | None = None
         self.compare_thread: QThread | None = None
@@ -529,6 +541,7 @@ class MainWindow(QMainWindow):
         self.local_tree.setModel(self.local_model)
         self.local_tree.setSortingEnabled(True)
         self.local_tree.sortByColumn(0, Qt.AscendingOrder)
+        self.local_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.local_tree.doubleClicked.connect(self._local_double_clicked)
 
         self.remote_table = QTableWidget(0, 4)
@@ -539,6 +552,7 @@ class MainWindow(QMainWindow):
         self.remote_table.setColumnWidth(2, 110)
         self.remote_table.setColumnWidth(3, 150)
         self.remote_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.remote_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.remote_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.remote_table.itemDoubleClicked.connect(self._remote_double_clicked)
         self.remote_status_label = QLabel("Remote browser not loaded.")
@@ -546,9 +560,15 @@ class MainWindow(QMainWindow):
         self.ssh_button = QPushButton("Test SSH")
         self.local_up_button = QPushButton("Up")
         self.local_refresh_button = QPushButton("Refresh")
+        self.local_new_folder_button = QPushButton("New folder")
+        self.local_rename_button = QPushButton("Rename/move")
+        self.local_delete_button = QPushButton("Delete")
         self.remote_load_button = QPushButton("Load")
         self.remote_up_button = QPushButton("Up")
         self.remote_refresh_button = QPushButton("Refresh")
+        self.remote_new_folder_button = QPushButton("New folder")
+        self.remote_rename_button = QPushButton("Rename/move")
+        self.remote_delete_button = QPushButton("Delete")
         self.dry_run_button = QPushButton("Compare / dry-run")
         self.download_dry_run_button = QPushButton("Compare download")
         self.build_selection_button = QPushButton("Build sync selection")
@@ -621,9 +641,15 @@ class MainWindow(QMainWindow):
         self.ssh_button.clicked.connect(self._start_ssh_test)
         self.local_up_button.clicked.connect(self._local_go_up)
         self.local_refresh_button.clicked.connect(self._refresh_local_tree)
+        self.local_new_folder_button.clicked.connect(self._local_new_folder)
+        self.local_rename_button.clicked.connect(self._local_rename_or_move)
+        self.local_delete_button.clicked.connect(self._local_delete_selected)
         self.remote_load_button.clicked.connect(self._refresh_remote_table)
         self.remote_up_button.clicked.connect(self._remote_go_up)
         self.remote_refresh_button.clicked.connect(self._refresh_remote_table)
+        self.remote_new_folder_button.clicked.connect(self._remote_new_folder)
+        self.remote_rename_button.clicked.connect(self._remote_rename_or_move)
+        self.remote_delete_button.clicked.connect(self._remote_delete_selected)
         self.dry_run_button.clicked.connect(lambda: self._start_rsync(dry_run=True, direction="upload"))
         self.download_dry_run_button.clicked.connect(lambda: self._start_rsync(dry_run=True, direction="download"))
         self.build_selection_button.clicked.connect(self._build_sync_selection)
@@ -657,6 +683,9 @@ class MainWindow(QMainWindow):
         row.addWidget(button)
         row.addWidget(self.local_up_button)
         row.addWidget(self.local_refresh_button)
+        row.addWidget(self.local_new_folder_button)
+        row.addWidget(self.local_rename_button)
+        row.addWidget(self.local_delete_button)
         return row
 
     def _remote_path_row(self) -> QHBoxLayout:
@@ -666,6 +695,9 @@ class MainWindow(QMainWindow):
         row.addWidget(self.remote_load_button)
         row.addWidget(self.remote_up_button)
         row.addWidget(self.remote_refresh_button)
+        row.addWidget(self.remote_new_folder_button)
+        row.addWidget(self.remote_rename_button)
+        row.addWidget(self.remote_delete_button)
         return row
 
     def _load_profile_combo(self) -> None:
@@ -752,6 +784,100 @@ class MainWindow(QMainWindow):
         path = Path(self.local_model.filePath(index))
         if path.is_dir():
             self._set_local_root(str(path))
+
+    def _selected_local_files(self) -> list[Path]:
+        return [path for path in self._selected_local_paths() if path.is_file()]
+
+    def _selected_local_paths(self) -> list[Path]:
+        indexes = self.local_tree.selectionModel().selectedRows(0)
+        if not indexes and self.local_tree.currentIndex().isValid():
+            indexes = [self.local_tree.currentIndex()]
+        paths: list[Path] = []
+        for index in indexes:
+            path = Path(self.local_model.filePath(index)).expanduser()
+            if path.exists():
+                paths.append(path)
+        return paths
+
+    def _local_new_folder(self) -> None:
+        root = Path(self.local_folder_edit.text() or str(Path.home())).expanduser()
+        name, accepted = QInputDialog.getText(self, "New local folder", "Folder name:")
+        if not accepted:
+            return
+        name = name.strip()
+        if not name or "/" in name or "\\" in name:
+            self._show_errors(["Folder name is required and must not contain path separators."])
+            return
+        target = root / name
+        try:
+            target.mkdir()
+        except OSError as exc:
+            self._show_errors([f"Could not create local folder: {exc}"])
+            return
+        self._append_log(f"Created local folder: {target}\n")
+        self._refresh_local_tree()
+
+    def _local_rename_or_move(self) -> None:
+        paths = self._selected_local_paths()
+        if len(paths) != 1:
+            self._show_errors(["Select exactly one local file or folder to rename/move."])
+            return
+        source = paths[0]
+        text, accepted = QInputDialog.getText(
+            self,
+            "Rename/move local item",
+            "New name, or full destination path:",
+            text=source.name,
+        )
+        if not accepted:
+            return
+        text = text.strip()
+        if not text:
+            self._show_errors(["Destination is required."])
+            return
+        destination = Path(text).expanduser()
+        if not destination.is_absolute():
+            destination = source.parent / text
+        if destination.exists():
+            self._show_errors([f"Destination already exists: {destination}"])
+            return
+        try:
+            source.rename(destination)
+        except OSError as exc:
+            self._show_errors([f"Could not rename/move local item: {exc}"])
+            return
+        self._append_log(f"Moved local item: {source} -> {destination}\n")
+        self._refresh_local_tree()
+
+    def _local_delete_selected(self) -> None:
+        paths = self._selected_local_paths()
+        if not paths:
+            self._show_errors(["Select one or more local files or folders to delete."])
+            return
+        if (
+            QMessageBox.warning(
+                self,
+                "Delete local items",
+                f"Delete {len(paths):,} selected local item(s)?\n\nThis cannot be undone.",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            != QMessageBox.Yes
+        ):
+            return
+        failures: list[str] = []
+        for path in paths:
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink()
+            except OSError as exc:
+                failures.append(f"{path}: {exc}")
+        if failures:
+            self._show_errors(failures)
+        else:
+            self._append_log(f"Deleted {len(paths):,} local item(s).\n")
+        self._refresh_local_tree()
 
     def _start_ssh_test(self) -> None:
         profile = self.current_profile()
@@ -852,6 +978,150 @@ class MainWindow(QMainWindow):
             self._clear_sync_selection()
             self._refresh_remote_table()
 
+    def _selected_remote_files(self) -> list[RemoteEntry]:
+        return [entry for entry in self._selected_remote_entries() if not entry.is_dir]
+
+    def _selected_remote_entries(self) -> list[RemoteEntry]:
+        current_path = self.remote_path_edit.text().strip().rstrip("/")
+        if self.remote_entries_path != current_path:
+            return []
+        rows = {index.row() for index in self.remote_table.selectionModel().selectedRows()}
+        if not rows:
+            rows = {item.row() for item in self.remote_table.selectedItems()}
+        if not rows and self.remote_table.currentRow() >= 0:
+            rows = {self.remote_table.currentRow()}
+        rows = sorted(rows)
+        entries: list[RemoteEntry] = []
+        for row in rows:
+            if row < 0 or row >= len(self.remote_entries):
+                continue
+            entry = self.remote_entries[row]
+            entries.append(entry)
+        return entries
+
+    def _remote_new_folder(self) -> None:
+        profile = self.current_profile()
+        if not profile:
+            return
+        name, accepted = QInputDialog.getText(self, "New remote folder", "Folder name:")
+        if not accepted:
+            return
+        name = name.strip()
+        if not name or "/" in name:
+            self._show_errors(["Folder name is required and must not contain '/'."])
+            return
+        errors = self._profile_errors(profile, require_rsync=False)
+        if errors:
+            self._show_errors(errors)
+            return
+        passphrase = self._get_session_passphrase(profile)
+        if passphrase is None:
+            return
+
+        def command_factory(attempt_profile: Profile) -> list[str]:
+            return build_remote_mkdir_command(
+                attempt_profile,
+                self.remote_path_edit.text(),
+                name,
+                ssh_path=self.detected_ssh,
+                batch_mode=not bool(passphrase),
+            )
+
+        self._start_worker(
+            FallbackCommandWorker(profile, command_factory, f"remote_mkdir_{profile.name}", passphrase=passphrase, ssh_path=self.detected_ssh),
+            "Create remote folder",
+            refresh_remote=True,
+        )
+
+    def _remote_rename_or_move(self) -> None:
+        profile = self.current_profile()
+        if not profile:
+            return
+        errors = self._profile_errors(profile, require_rsync=False)
+        if errors:
+            self._show_errors(errors)
+            return
+        entries = self._selected_remote_entries()
+        if len(entries) != 1:
+            self._show_errors(["Select exactly one remote file or folder to rename/move."])
+            return
+        entry = entries[0]
+        text, accepted = QInputDialog.getText(
+            self,
+            "Rename/move remote item",
+            "New name, or full remote destination path:",
+            text=entry.name,
+        )
+        if not accepted:
+            return
+        text = text.strip()
+        if not text:
+            self._show_errors(["Destination is required."])
+            return
+        if text.startswith("/"):
+            destination = text.rstrip("/")
+        else:
+            parent = entry.path.rsplit("/", 1)[0]
+            destination = f"{parent}/{text}"
+        passphrase = self._get_session_passphrase(profile)
+        if passphrase is None:
+            return
+
+        def command_factory(attempt_profile: Profile) -> list[str]:
+            return build_remote_move_command(
+                attempt_profile,
+                entry.path,
+                destination,
+                ssh_path=self.detected_ssh,
+                batch_mode=not bool(passphrase),
+            )
+
+        self._start_worker(
+            FallbackCommandWorker(profile, command_factory, f"remote_move_{profile.name}", passphrase=passphrase, ssh_path=self.detected_ssh),
+            "Rename/move remote item",
+            refresh_remote=True,
+        )
+
+    def _remote_delete_selected(self) -> None:
+        profile = self.current_profile()
+        if not profile:
+            return
+        errors = self._profile_errors(profile, require_rsync=False)
+        if errors:
+            self._show_errors(errors)
+            return
+        entries = self._selected_remote_entries()
+        if not entries:
+            self._show_errors(["Select one or more remote files or folders to delete."])
+            return
+        preview = "\n".join(f"- {entry.path}" for entry in entries[:10])
+        if len(entries) > 10:
+            preview += f"\n... and {len(entries) - 10:,} more"
+        typed, accepted = QInputDialog.getText(
+            self,
+            "Delete remote items",
+            f"Type DELETE to permanently delete {len(entries):,} remote item(s):\n\n{preview}",
+        )
+        if not accepted or typed != "DELETE":
+            return
+        passphrase = self._get_session_passphrase(profile)
+        if passphrase is None:
+            return
+
+        def command_factory(attempt_profile: Profile) -> list[str]:
+            return build_remote_delete_command(
+                attempt_profile,
+                [entry.path for entry in entries],
+                ssh_path=self.detected_ssh,
+                batch_mode=not bool(passphrase),
+            )
+
+        self._start_worker(
+            FallbackCommandWorker(profile, command_factory, f"remote_delete_{profile.name}", passphrase=passphrase, ssh_path=self.detected_ssh),
+            "Delete remote items",
+            refresh_remote=True,
+        )
+
     def _remote_go_up(self) -> None:
         current = self.remote_path_edit.text().strip().rstrip("/") or "/"
         if current == "/":
@@ -878,6 +1148,24 @@ class MainWindow(QMainWindow):
         if not self.remote_entries or self.remote_entries_path != current_path:
             return []
         return [entry.path for entry in self.remote_entries if not entry.is_dir]
+
+    def _selected_local_file_list(self, files: list[Path]) -> Path:
+        root = Path(self.local_folder_edit.text()).expanduser()
+        path = new_log_file("upload_selected_files").with_suffix(".txt")
+        lines: list[str] = []
+        for file in files:
+            try:
+                relative = file.relative_to(root)
+            except ValueError:
+                relative = Path(file.name)
+            lines.append(relative.as_posix())
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+        return path
+
+    def _selected_remote_file_list(self, entries: list[RemoteEntry]) -> Path:
+        path = new_log_file("download_selected_files").with_suffix(".txt")
+        path.write_text("\n".join(entry.name for entry in entries) + "\n", encoding="utf-8", newline="\n")
+        return path
 
     def _recall_medici(self) -> None:
         profile = self.current_profile()
@@ -1037,39 +1325,52 @@ class MainWindow(QMainWindow):
         profile = self.current_profile()
         if not profile:
             return
+        selected_local_files = self._selected_local_files() if direction == "upload" else []
+        selected_remote_files = self._selected_remote_files() if direction == "download" else []
+        selected_local_file = selected_local_files[0] if len(selected_local_files) == 1 else None
+        selected_remote_file = selected_remote_files[0] if len(selected_remote_files) == 1 else None
+        local_transfer_path = str(selected_local_file) if selected_local_file else self.local_folder_edit.text()
+        remote_transfer_path = selected_remote_file.path if selected_remote_file else self.remote_path_edit.text()
         errors = self._profile_errors(profile, require_rsync=True)
-        errors.extend(validate_transfer_inputs(profile, self.local_folder_edit.text(), self.remote_path_edit.text()))
+        errors.extend(validate_transfer_inputs(profile, local_transfer_path, remote_transfer_path, direction=direction))
         if errors:
             self._show_errors(errors)
             return
-        if not dry_run and direction == "upload" and not self._confirm_upload_scan():
+        selected_local_files_from = self._selected_local_file_list(selected_local_files) if len(selected_local_files) > 1 else None
+        selected_remote_files_from = self._selected_remote_file_list(selected_remote_files) if len(selected_remote_files) > 1 else None
+        if not dry_run and direction == "upload" and not selected_local_files and not self._confirm_upload_scan():
             return
-        if not dry_run and direction == "download":
-            if (
+        if direction == "download":
+            if selected_remote_files_from:
+                source_label = f"{len(selected_remote_files):,} selected files from {self.remote_path_edit.text()}"
+            else:
+                source_label = selected_remote_file.path if selected_remote_file else self.remote_path_edit.text()
+            if not dry_run and (
                 QMessageBox.question(
                     self,
                     "Download",
-                    f"Download from {self.remote_path_edit.text()} into {self.local_folder_edit.text()}?",
+                    f"Download from {source_label} into {self.local_folder_edit.text()}?",
                 )
                 != QMessageBox.Yes
             ):
                 return
-            visible_files_from = self._visible_remote_file_list()
+            visible_files_from = selected_remote_files_from if selected_remote_files_from else (None if selected_remote_file else self._visible_remote_file_list())
         else:
-            visible_files_from = None
+            visible_files_from = selected_local_files_from if direction == "upload" else None
         passphrase = self._get_session_passphrase(profile)
         if passphrase is None:
             return
         def command_factory(attempt_profile: Profile) -> list[str]:
             return build_rsync_command(
                 attempt_profile,
-                self.local_folder_edit.text(),
-                remote_path=self.remote_path_edit.text(),
+                local_transfer_path,
+                remote_path=remote_transfer_path,
                 dry_run=dry_run,
                 ssh_path=self.detected_ssh,
                 batch_mode=not bool(passphrase),
                 files_from=visible_files_from,
                 direction=direction,
+                remote_is_file=selected_remote_file is not None,
             )
 
         if dry_run:
@@ -1089,9 +1390,18 @@ class MainWindow(QMainWindow):
             label,
         )
         if visible_files_from:
-            self._append_log(
-                f"Using visible remote file list ({self.remote_table.rowCount():,} entries) to avoid recursive rsync discovery.\n"
-            )
+            if selected_local_files_from:
+                self._append_log(f"Uploading {len(selected_local_files):,} selected files.\n")
+            elif selected_remote_files_from:
+                self._append_log(f"Downloading {len(selected_remote_files):,} selected files.\n")
+            else:
+                self._append_log(
+                    f"Using visible remote file list ({self.remote_table.rowCount():,} entries) to avoid recursive rsync discovery.\n"
+                )
+        elif selected_local_file:
+            self._append_log(f"Uploading selected file: {selected_local_file}\n")
+        elif selected_remote_file:
+            self._append_log(f"Downloading selected file: {selected_remote_file.path}\n")
 
     def _ask_passphrase(self, profile: Profile) -> str | None:
         if not profile.ssh_key_path:
@@ -1128,7 +1438,13 @@ class MainWindow(QMainWindow):
         message = "\n\n".join(warnings) + "\n\nContinue upload?"
         return QMessageBox.warning(self, "Large upload warning", message, QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes
 
-    def _start_worker(self, worker: CommandWorker | SshTestWorker | RecallMediciWorker, label: str) -> None:
+    def _start_worker(
+        self,
+        worker: CommandWorker | SshTestWorker | RecallMediciWorker,
+        label: str,
+        refresh_local: bool = False,
+        refresh_remote: bool = False,
+    ) -> None:
         if self.current_thread:
             QMessageBox.information(self, "Transfer running", "A command is already running.")
             return
@@ -1136,26 +1452,62 @@ class MainWindow(QMainWindow):
         thread = QThread(self)
         worker.moveToThread(thread)
         worker.output.connect(self._append_log)
-        worker.finished.connect(lambda code: self._worker_finished(code, label))
+        worker.finished.connect(self._worker_finished)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._current_thread_finished)
         thread.finished.connect(thread.deleteLater)
         thread.started.connect(worker.run)
         self.current_thread = thread
         self.current_worker = worker
+        self.current_label = label
+        self.current_finished_handled = False
+        self.current_refresh_local = refresh_local
+        self.current_refresh_remote = refresh_remote
         self._set_running(True)
         self._reset_transfer_progress(label)
         self._append_log(f"{label} started.\n")
         thread.start()
 
-    def _worker_finished(self, code: int, label: str) -> None:
+    @Slot(int)
+    def _worker_finished(self, code: int) -> None:
+        if self.current_finished_handled:
+            return
+        self.current_finished_handled = True
+        label = self.current_label or "Command"
         self._append_log(f"\n{label} finished with exit code {code}.\n")
-        if code == 0 and any(word in label.lower() for word in ("upload", "dry run", "recall")):
+        if code == 0 and any(word in label.lower() for word in ("upload", "download", "dry run", "recall")):
             self.transfer_progress.setValue(100)
         self.transfer_status_label.setText(f"{label} finished with exit code {code}.")
         self.current_thread = None
         self.current_worker = None
+        self.current_label = ""
         self._set_running(False)
+        self._run_post_worker_refresh()
+
+    @Slot()
+    def _current_thread_finished(self) -> None:
+        if self.current_finished_handled:
+            return
+        label = self.current_label or "Command"
+        self.current_finished_handled = True
+        self._append_log(f"\n{label} thread finished.\n")
+        self.transfer_status_label.setText(f"{label} finished.")
+        self.current_thread = None
+        self.current_worker = None
+        self.current_label = ""
+        self._set_running(False)
+        self._run_post_worker_refresh()
+
+    def _run_post_worker_refresh(self) -> None:
+        refresh_local = self.current_refresh_local
+        refresh_remote = self.current_refresh_remote
+        self.current_refresh_local = False
+        self.current_refresh_remote = False
+        if refresh_local:
+            self._refresh_local_tree()
+        if refresh_remote:
+            self._refresh_remote_table()
 
     def _cancel_current(self) -> None:
         if isinstance(self.current_worker, (CommandWorker, RecallMediciWorker)):
@@ -1173,6 +1525,12 @@ class MainWindow(QMainWindow):
         self.remote_refresh_button.setEnabled(not running and self.remote_thread is None)
         self.remote_up_button.setEnabled(not running and self.remote_thread is None)
         self.remote_table.setEnabled(not running and self.remote_thread is None)
+        self.local_new_folder_button.setEnabled(not running)
+        self.local_rename_button.setEnabled(not running)
+        self.local_delete_button.setEnabled(not running)
+        self.remote_new_folder_button.setEnabled(not running and self.remote_thread is None)
+        self.remote_rename_button.setEnabled(not running and self.remote_thread is None)
+        self.remote_delete_button.setEnabled(not running and self.remote_thread is None)
         self.dry_run_button.setEnabled(not running)
         self.download_dry_run_button.setEnabled(not running)
         self.build_selection_button.setEnabled(not running and self.compare_thread is None)
@@ -1187,6 +1545,9 @@ class MainWindow(QMainWindow):
         self.remote_refresh_button.setEnabled(not busy and self.current_thread is None)
         self.remote_up_button.setEnabled(not busy)
         self.remote_table.setEnabled(not busy)
+        self.remote_new_folder_button.setEnabled(not busy and self.current_thread is None)
+        self.remote_rename_button.setEnabled(not busy and self.current_thread is None)
+        self.remote_delete_button.setEnabled(not busy and self.current_thread is None)
 
     def _set_compare_running(self, running: bool) -> None:
         self.ssh_button.setEnabled(not running and self.current_thread is None)
@@ -1195,7 +1556,13 @@ class MainWindow(QMainWindow):
         self.build_selection_button.setEnabled(not running and self.current_thread is None)
         self.upload_selection_button.setEnabled(not running and bool(self.sync_selection and self.sync_selection.get("selected")))
         self.upload_button.setEnabled(not running and self.current_thread is None)
+        self.local_new_folder_button.setEnabled(not running and self.current_thread is None)
+        self.local_rename_button.setEnabled(not running and self.current_thread is None)
+        self.local_delete_button.setEnabled(not running and self.current_thread is None)
         self.recall_button.setEnabled(not running and self.current_thread is None)
+        self.remote_new_folder_button.setEnabled(not running and self.current_thread is None)
+        self.remote_rename_button.setEnabled(not running and self.current_thread is None)
+        self.remote_delete_button.setEnabled(not running and self.current_thread is None)
         self.download_button.setEnabled(not running and self.current_thread is None)
         self.stop_button.setEnabled(running or self.current_thread is not None)
 

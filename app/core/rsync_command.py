@@ -3,7 +3,7 @@ from __future__ import annotations
 import shlex
 from pathlib import Path
 
-from .paths import detect_ssh, directory_source_for_rsync, path_for_rsync
+from .paths import detect_ssh, directory_source_for_rsync, file_source_for_rsync, path_for_rsync
 from .profiles import Profile
 
 
@@ -38,6 +38,14 @@ def remote_target(profile: Profile, remote_path: str | None = None) -> str:
     return f"{clean.username}@{clean.host}:{path.rstrip('/')}/"
 
 
+def remote_source(profile: Profile, remote_path: str | None = None, is_file: bool = False) -> str:
+    clean = profile.normalized()
+    path = (remote_path or clean.remote_path).strip() or f"/data/{clean.collection_id}"
+    if is_file:
+        return f"{clean.username}@{clean.host}:{path.rstrip('/')}"
+    return remote_target(clean, remote_path=path)
+
+
 def local_destination(path: str | Path, rsync_path: str | Path | None = None) -> str:
     return directory_source_for_rsync(path, rsync_path)
 
@@ -58,7 +66,12 @@ def build_ssh_transport(profile: Profile, ssh_path: str | None = None, batch_mod
     return shlex.join(args)
 
 
-def validate_transfer_inputs(profile: Profile, local_folder: str | Path, remote_path: str | None = None) -> list[str]:
+def validate_transfer_inputs(
+    profile: Profile,
+    local_folder: str | Path,
+    remote_path: str | None = None,
+    direction: str = "upload",
+) -> list[str]:
     clean = profile.normalized()
     errors: list[str] = []
     if not clean.username:
@@ -67,8 +80,15 @@ def validate_transfer_inputs(profile: Profile, local_folder: str | Path, remote_
         errors.append("Host is required.")
     if not clean.rsync_path:
         errors.append("rsync executable path is required.")
-    if not Path(local_folder).expanduser().is_dir():
-        errors.append("Local folder must exist.")
+    local_path = Path(local_folder).expanduser()
+    if direction == "upload":
+        if not local_path.exists():
+            errors.append("Local file or folder must exist.")
+    elif direction == "download":
+        if not local_path.is_dir():
+            errors.append("Local download folder must exist.")
+    else:
+        errors.append("direction must be 'upload' or 'download'.")
     if not (remote_path or clean.remote_path).strip():
         errors.append("Remote path is required.")
     return errors
@@ -83,8 +103,10 @@ def build_rsync_command(
     batch_mode: bool = True,
     files_from: str | Path | None = None,
     direction: str = "upload",
+    remote_is_file: bool = False,
 ) -> list[str]:
     clean = profile.normalized()
+    local_path = Path(local_folder).expanduser()
     command = [clean.rsync_path, *DEFAULT_RSYNC_OPTIONS]
     if dry_run:
         command.append("--dry-run")
@@ -93,10 +115,13 @@ def build_rsync_command(
         command.append(f"--files-from={path_for_rsync(files_from, clean.rsync_path)}")
     command.extend(["-e", build_ssh_transport(clean, ssh_path=ssh_path, batch_mode=batch_mode)])
     if direction == "upload":
-        command.append(directory_source_for_rsync(local_folder, clean.rsync_path))
+        if local_path.is_file() and not files_from:
+            command.append(file_source_for_rsync(local_path, clean.rsync_path))
+        else:
+            command.append(directory_source_for_rsync(local_folder, clean.rsync_path))
         command.append(remote_target(clean, remote_path=remote_path))
     elif direction == "download":
-        command.append(remote_target(clean, remote_path=remote_path))
+        command.append(remote_source(clean, remote_path=remote_path, is_file=remote_is_file))
         command.append(local_destination(local_folder, clean.rsync_path))
     else:
         raise ValueError("direction must be 'upload' or 'download'.")

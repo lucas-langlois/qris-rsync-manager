@@ -89,3 +89,6 @@ def directory_source_for_rsync(path: str | Path, rsync_path: str | Path | None =
     source = path_for_rsync(path, rsync_path)
     return source.rstrip("/\\") + "/"
 
+
+def file_source_for_rsync(path: str | Path, rsync_path: str | Path | None = None) -> str:
+    return path_for_rsync(path, rsync_path)

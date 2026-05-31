@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from app.core.profiles import Profile
-from app.core.rsync_command import DEFAULT_RSYNC_OPTIONS, build_rsync_command, build_ssh_transport
+from app.core.rsync_command import DEFAULT_RSYNC_OPTIONS, build_rsync_command, build_ssh_transport, validate_transfer_inputs
 
 
 def test_rsync_command_uses_safe_argument_list_and_defaults(tmp_path: Path) -> None:
@@ -59,6 +59,18 @@ def test_upload_command_can_use_files_from(tmp_path: Path) -> None:
     assert any(part.startswith("--files-from=/") for part in command)
 
 
+def test_upload_command_can_send_single_file(tmp_path: Path) -> None:
+    local = tmp_path / "image one.JPG"
+    local.write_text("data", encoding="utf-8")
+    profile = Profile(username="user", remote_path="/data/Q8940/images", rsync_path=r"C:\msys64\usr\bin\rsync.exe")
+
+    command = build_rsync_command(profile, local, dry_run=False)
+
+    assert command[-2].endswith("image one.JPG")
+    assert not command[-2].endswith("/")
+    assert command[-1] == "user@ssh1.qriscloud.org.au:/data/Q8940/images/"
+
+
 def test_download_command_reverses_source_and_destination(tmp_path: Path) -> None:
     local = tmp_path / "download target"
     local.mkdir()
@@ -83,6 +95,33 @@ def test_download_command_can_use_files_from(tmp_path: Path) -> None:
     assert any(part.startswith("--files-from=/") for part in command)
     assert command[-2] == "user@ssh2.qriscloud.org.au:/data/Q8940/"
     assert command[-1].endswith("/")
+
+
+def test_download_command_can_fetch_single_remote_file(tmp_path: Path) -> None:
+    local = tmp_path / "download target"
+    local.mkdir()
+    profile = Profile(username="user", host="ssh2.qriscloud.org.au", rsync_path=r"C:\msys64\usr\bin\rsync.exe")
+
+    command = build_rsync_command(
+        profile,
+        local,
+        remote_path="/data/Q8940/images/image one.JPG",
+        direction="download",
+        remote_is_file=True,
+    )
+
+    assert command[-2] == "user@ssh2.qriscloud.org.au:/data/Q8940/images/image one.JPG"
+    assert command[-1].endswith("/")
+
+
+def test_validate_download_requires_local_folder(tmp_path: Path) -> None:
+    local_file = tmp_path / "target.txt"
+    local_file.write_text("data", encoding="utf-8")
+    profile = Profile(username="user", rsync_path=r"C:\msys64\usr\bin\rsync.exe")
+
+    errors = validate_transfer_inputs(profile, local_file, "/data/Q8940/file.txt", direction="download")
+
+    assert "Local download folder must exist." in errors
 
 
 def test_ssh_transport_has_keepalive_and_no_checksum_flag(tmp_path: Path) -> None:
