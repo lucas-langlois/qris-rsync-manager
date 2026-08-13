@@ -5,6 +5,8 @@ from app.core.profiles import Profile
 from app.core.rsync_runner import RsyncRunner
 from app.gui import main_window
 from app.gui.remote_browser_dialog import RemoteListWorker
+from app.gui.main_window import RecallMediciWorker
+from app.core.ssh_test import CommandResult
 
 
 def test_fallback_worker_does_not_start_preflight_when_already_cancelled(monkeypatch) -> None:
@@ -130,3 +132,22 @@ def test_remote_listing_cancel_escalates_to_kill_without_blocking(monkeypatch) -
 
     assert process.terminate_calls == 1
     assert process.killed.wait(1)
+
+
+def test_recall_cancel_during_preflight_never_starts_batches(monkeypatch, tmp_path) -> None:
+    worker = RecallMediciWorker(Profile(name="test", username="user"), ["/data/Q0101/a.txt"], "ssh.exe")
+    observed_event = None
+
+    def cancel_preflight(*_args, cancel_event=None, **_kwargs):
+        nonlocal observed_event
+        observed_event = cancel_event
+        worker.cancel()
+        return CommandResult(130, "cancelled")
+
+    monkeypatch.setattr("app.gui.main_window.run_ssh_test", cancel_preflight)
+    monkeypatch.setattr(worker, "_run_batches", lambda *_args: (_ for _ in ()).throw(AssertionError("batches started")))
+
+    code = worker._run_with_fallback(tmp_path / "recall.log")
+
+    assert observed_event is worker._cancelled
+    assert code == 130

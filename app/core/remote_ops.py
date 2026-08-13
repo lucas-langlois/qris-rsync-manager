@@ -42,9 +42,10 @@ def build_remote_move_command(
         raise ValueError("Source and destination are the same.")
     if is_dangerous_remote_path(source):
         raise ValueError(f"Refusing to move unsafe remote path: {source}")
+    exists_message = shlex.quote(f"Destination already exists: {destination}")
     remote_command = (
         f"if [ -e {shlex.quote(destination)} ]; then "
-        f"echo 'Destination already exists: {destination}' >&2; exit 73; "
+        f"echo {exists_message} >&2; exit 73; "
         f"else mv -- {shlex.quote(source)} {shlex.quote(destination)}; fi"
     )
     return [*build_remote_ssh_base(profile, ssh_path=ssh_path, batch_mode=batch_mode), remote_command]
@@ -68,6 +69,8 @@ def build_remote_delete_command(
 
 def clean_remote_path(remote_path: str) -> str:
     raw = remote_path.strip()
+    if any(part in {".", ".."} for part in raw.split("/")):
+        raise ValueError("Remote path must not contain '.' or '..' components.")
     if raw == "/":
         return "/"
     clean = raw.rstrip("/")
@@ -75,7 +78,10 @@ def clean_remote_path(remote_path: str) -> str:
         raise ValueError("Remote path is required.")
     if not clean.startswith("/"):
         raise ValueError("Remote path must start with '/'.")
-    return clean or "/"
+    normalized = posixpath.normpath(clean)
+    if not normalized.startswith("/"):
+        raise ValueError("Remote path must start with '/'.")
+    return normalized or "/"
 
 
 def is_dangerous_remote_path(remote_path: str) -> bool:

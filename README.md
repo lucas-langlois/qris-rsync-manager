@@ -291,7 +291,3 @@ If GitHub CLI is not authenticated:
 ```powershell
 gh auth login -h github.com
 ```
-
-## License
-
-This project is licensed under the MIT License. See [LICENSE](LICENSE).

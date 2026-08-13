@@ -132,7 +132,7 @@ class _CompletedProcess:
 def test_remote_manifest_is_parsed_incrementally(monkeypatch, tmp_path: Path) -> None:
     worker = _worker(tmp_path)
     results = _capture(worker)
-    process = _CompletedProcess(["a.txt\t1\t10.0\n", "bad output\n"])
+    process = _CompletedProcess(["a.txt\t1\t10.0\n", "nested/b.txt\t2\t11.0\n"])
     selection_file = tmp_path / "selection.txt"
     monkeypatch.setattr("app.gui.main_window.scan_local_manifest", lambda *_args, **_kwargs: {})
     monkeypatch.setattr("app.gui.main_window.fallback_hosts", lambda _profile: ["host"])
@@ -276,3 +276,21 @@ def test_live_process_that_closes_stdout_is_stopped(tmp_path: Path) -> None:
     assert code == 1
     assert "Could not read remote manifest output" in error
     assert process.poll() is not None
+
+
+def test_successful_process_with_malformed_manifest_fails_closed(monkeypatch, tmp_path: Path) -> None:
+    worker = _worker(tmp_path)
+    results = _capture(worker)
+    process = _CompletedProcess(["a.txt\t1\t10.0\n", "filename-with-tab\tbad\trow\n"])
+    monkeypatch.setattr("app.gui.main_window.scan_local_manifest", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr("app.gui.main_window.fallback_hosts", lambda _profile: ["host"])
+    monkeypatch.setattr("app.gui.main_window.build_askpass_environment", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr("app.gui.main_window.scrub_askpass_environment", lambda _env: None)
+    monkeypatch.setattr("app.gui.main_window.subprocess.Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr("app.gui.main_window.write_files_from", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("selection written")))
+
+    worker.run()
+
+    assert len(results) == 1
+    assert results[0][0] is None
+    assert "malformed line" in results[0][1]

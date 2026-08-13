@@ -279,7 +279,7 @@ class RecallMediciWorker(QObject):
         self.max_reconnect_attempts = max(1, int(max_reconnect_attempts))
         self.reconnect_delay_seconds = max(0, int(reconnect_delay_seconds))
         self._process: subprocess.Popen[str] | None = None
-        self._cancelled = False
+        self._cancelled = threading.Event()
 
     @Slot()
     def run(self) -> None:
@@ -294,12 +294,21 @@ class RecallMediciWorker(QObject):
 
     def _run_with_fallback(self, log_file: Path) -> int:
         for host in fallback_hosts(self.profile):
-            if self._cancelled:
+            if self._cancelled.is_set():
                 self._write_and_emit(log_file, "Recall was cancelled.\n")
                 return 130
             attempt_profile = profile_with_host(self.profile, host)
             self._write_and_emit(log_file, f"Checking {host} before recall...\n")
-            result = run_ssh_test(attempt_profile, ssh_path=self.ssh_path, passphrase=self.passphrase, timeout=30)
+            result = run_ssh_test(
+                attempt_profile,
+                ssh_path=self.ssh_path,
+                passphrase=self.passphrase,
+                timeout=30,
+                cancel_event=self._cancelled,
+            )
+            if self._cancelled.is_set():
+                self._write_and_emit(log_file, "Recall was cancelled.\n")
+                return 130
             if result.returncode != 0:
                 self._write_and_emit(log_file, f"{host} unavailable for recall: exit code {result.returncode}\n")
                 if result.output:
@@ -318,7 +327,7 @@ class RecallMediciWorker(QObject):
         ]
         creationflags = subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") else 0
         for index, chunk in enumerate(chunks, start=1):
-            if self._cancelled:
+            if self._cancelled.is_set():
                 self._write_and_emit(log_file, "Recall was cancelled.\n")
                 return 130
             first_name = Path(chunk[0]).name
@@ -349,7 +358,7 @@ class RecallMediciWorker(QObject):
         last_code = 1
         for attempt in range(1, self.max_reconnect_attempts + 1):
             for host in hosts:
-                if self._cancelled:
+                if self._cancelled.is_set():
                     self._write_and_emit(log_file, "Recall was cancelled.\n")
                     return 130
                 attempt_profile = profile_with_host(profile, host)
@@ -359,7 +368,7 @@ class RecallMediciWorker(QObject):
                         f"[{batch_index}/{batch_count}] reconnect attempt {attempt}/{self.max_reconnect_attempts} using {host}...\n",
                     )
                 code = self._run_recall_command(attempt_profile, chunk, log_file, batch_index, batch_count, creationflags)
-                if code == 0 or self._cancelled:
+                if code == 0 or self._cancelled.is_set():
                     return code
                 last_code = code
                 if not self._is_retryable_recall_exit(code):
@@ -395,6 +404,8 @@ class RecallMediciWorker(QObject):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 bufsize=1,
                 shell=False,
                 creationflags=creationflags,
@@ -413,7 +424,7 @@ class RecallMediciWorker(QObject):
             f"[{batch_index}/{batch_count}] waiting {self.reconnect_delay_seconds}s before reconnect...\n",
         )
         deadline = time.monotonic() + self.reconnect_delay_seconds
-        while not self._cancelled and time.monotonic() < deadline:
+        while not self._cancelled.is_set() and time.monotonic() < deadline:
             time.sleep(0.2)
 
     @staticmethod
@@ -456,7 +467,7 @@ class RecallMediciWorker(QObject):
             elif item:
                 self._write_and_emit(log_file, item)
 
-            if self._cancelled:
+            if self._cancelled.is_set():
                 process.terminate()
                 self._write_and_emit(log_file, "\nRecall was cancelled.\n")
                 try:
@@ -487,7 +498,7 @@ class RecallMediciWorker(QObject):
 
     @Slot()
     def cancel(self) -> None:
-        self._cancelled = True
+        self._cancelled.set()
         if self._process and self._process.poll() is None:
             self._process.terminate()
 
@@ -615,6 +626,8 @@ class SyncCompareWorker(QObject):
                         stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT,
                         text=True,
+                        encoding="utf-8",
+                        errors="replace",
                         bufsize=1,
                         shell=False,
                         creationflags=creationflags,
@@ -637,6 +650,13 @@ class SyncCompareWorker(QObject):
                     self._finish(None, last_error if "could not stop" in last_error.lower() else "Sync comparison was cancelled.")
                     return
                 if returncode == 0:
+                    if collector.malformed_line_count:
+                        self._finish(
+                            None,
+                            f"Remote manifest contained {collector.malformed_line_count:,} malformed line(s); "
+                            "comparison was stopped to avoid an incomplete selection.",
+                        )
+                        return
                     self.output.emit(f"Remote manifest succeeded using {host}.\n")
                     remote_manifest = collector.records
                     break

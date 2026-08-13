@@ -54,3 +54,27 @@ def test_dangerous_remote_paths() -> None:
     assert is_dangerous_remote_path("/")
     assert is_dangerous_remote_path("/data/Q8940")
     assert not is_dangerous_remote_path("/data/Q8940/folder")
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/data/Q8940/../Q8940", "/data/Q8940/folder/./file.txt", "/data/Q8940/folder/../../Q8940"],
+)
+def test_remote_mutations_reject_dot_path_components(path: str) -> None:
+    profile = Profile(username="user")
+
+    with pytest.raises(ValueError, match="components"):
+        build_remote_delete_command(profile, [path], ssh_path="ssh.exe")
+    with pytest.raises(ValueError, match="components"):
+        build_remote_move_command(profile, path, "/data/Q8940/safe.txt", ssh_path="ssh.exe")
+
+
+def test_remote_move_quotes_apostrophe_in_destination_message() -> None:
+    command = build_remote_move_command(
+        Profile(username="user"),
+        "/data/Q8940/source.txt",
+        "/data/Q8940/researcher's file.txt",
+        ssh_path="ssh.exe",
+    )
+
+    assert "researcher'\"'\"'s file.txt" in command[-1]
