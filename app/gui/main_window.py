@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import queue
+import ctypes
+import codecs
+import os
 import subprocess
 import sys
 import threading
@@ -41,7 +44,7 @@ from app.core.logging_utils import new_log_file
 from app.core.file_scan import FolderScan, scan_folder
 from app.core.local_delete import LocalDeleteResult, delete_local_paths
 from app.core.medici import build_recall_medici_files_command, medici_path_for_remote_path
-from app.core.paths import detect_ssh, is_executable_file
+from app.core.paths import app_data_dir, detect_ssh, is_executable_file
 from app.core.profiles import Profile, fallback_hosts, load_profiles, profile_with_host, save_profiles, upsert_profile
 from app.core.progress import parse_rsync_progress
 from app.core.remote_dirs import RemoteEntry, build_list_remote_entries_command
@@ -50,9 +53,10 @@ from app.core.rsync_command import build_rsync_command, validate_transfer_inputs
 from app.core.rsync_runner import RsyncRunner
 from app.core.ssh_test import run_ssh_test
 from app.core.sync_compare import (
+    ManifestScanProgress,
+    RemoteManifestCollector,
     build_remote_manifest_command,
     compare_manifests,
-    parse_remote_manifest,
     scan_local_manifest,
     write_files_from,
 )
@@ -430,6 +434,8 @@ class RecallMediciWorker(QObject):
                 if process.stdout:
                     for line in process.stdout:
                         output_queue.put(line)
+            except (OSError, ValueError):
+                pass
             finally:
                 output_queue.put(None)
 
@@ -541,6 +547,11 @@ class SyncCompareWorker(QObject):
     output = Signal(str)
     finished = Signal(object, str)
 
+    REMOTE_TIMEOUT_SECONDS = 300.0
+    STOP_GRACE_SECONDS = 5.0
+    OUTPUT_DRAIN_SECONDS = 5.0
+    READER_JOIN_SECONDS = 1.0
+
     def __init__(self, profile: Profile, ssh_path: str, local_folder: str, remote_path: str, passphrase: str) -> None:
         super().__init__()
         self.profile = profile
@@ -549,20 +560,41 @@ class SyncCompareWorker(QObject):
         self.remote_path = remote_path
         self.passphrase = passphrase
         self._process: subprocess.Popen[str] | None = None
-        self._cancelled = False
+        self._process_lock = threading.Lock()
+        self._finish_lock = threading.Lock()
+        self._cancelled = threading.Event()
+        self._did_finish = False
+        self._last_local_progress = 0
 
     @Slot()
     def run(self) -> None:
         try:
+            if self._cancelled.is_set():
+                self._finish(None, "Sync comparison was cancelled.")
+                return
             self.output.emit("Scanning local files...\n")
-            local_manifest = scan_local_manifest(self.local_folder)
+            local_manifest = scan_local_manifest(
+                self.local_folder,
+                cancel_event=self._cancelled,
+                progress_callback=self._report_local_progress,
+            )
+            if self._cancelled.is_set():
+                self._finish(None, "Sync comparison was cancelled.")
+                return
             self.output.emit(f"Local manifest: {len(local_manifest):,} files.\n")
 
             creationflags = subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") else 0
-            remote_output: list[str] = []
             returncode = 1
-            output_text = ""
+            remote_manifest = None
+            last_error = ""
+            deadline = time.monotonic() + self.REMOTE_TIMEOUT_SECONDS
             for host in fallback_hosts(self.profile):
+                if self._cancelled.is_set():
+                    self._finish(None, last_error if "could not stop" in last_error.lower() else "Sync comparison was cancelled.")
+                    return
+                if time.monotonic() >= deadline:
+                    self._finish(None, "Remote manifest timed out.")
+                    return
                 attempt_profile = profile_with_host(self.profile, host)
                 self.output.emit(f"Reading remote file manifest from {host}... This can take a while for large QRIScloud folders.\n")
                 command = build_remote_manifest_command(
@@ -572,9 +604,13 @@ class SyncCompareWorker(QObject):
                     batch_mode=not bool(self.passphrase),
                 )
                 env = build_askpass_environment(self.passphrase, ssh_path=self.ssh_path)
-                remote_output = []
+                collector = RemoteManifestCollector()
+                process = None
                 try:
-                    with subprocess.Popen(
+                    if self._cancelled.is_set():
+                        self._finish(None, "Sync comparison was cancelled.")
+                        return
+                    process = subprocess.Popen(
                         command,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT,
@@ -583,42 +619,53 @@ class SyncCompareWorker(QObject):
                         shell=False,
                         creationflags=creationflags,
                         env=env,
-                    ) as process:
+                    )
+                    with self._process_lock:
                         self._process = process
-                        line_count = 0
-                        if process.stdout:
-                            for line in process.stdout:
-                                if self._cancelled:
-                                    process.terminate()
-                                    self.finished.emit(None, "Sync comparison was cancelled.")
-                                    return
-                                remote_output.append(line)
-                                line_count += 1
-                                if line_count % 500 == 0:
-                                    self.output.emit(f"Remote manifest on {host}: read {line_count:,} lines...\n")
-                        returncode = process.wait(timeout=300)
+                    returncode, last_error = self._collect_remote_manifest(
+                        process,
+                        collector,
+                        host,
+                        deadline,
+                    )
                 finally:
+                    with self._process_lock:
+                        if process is not None and self._process is process:
+                            self._process = None
                     scrub_askpass_environment(env)
-                output_text = "".join(remote_output)
+                if self._cancelled.is_set():
+                    self._finish(None, last_error if "could not stop" in last_error.lower() else "Sync comparison was cancelled.")
+                    return
                 if returncode == 0:
                     self.output.emit(f"Remote manifest succeeded using {host}.\n")
+                    remote_manifest = collector.records
                     break
                 self.output.emit(f"Remote manifest failed on {host} with exit code {returncode}.\n")
-            if returncode != 0:
-                self.finished.emit(None, output_text or f"Remote manifest failed with exit code {returncode}.")
+            if returncode != 0 or remote_manifest is None:
+                self._finish(None, last_error or f"Remote manifest failed with exit code {returncode}.")
                 return
 
-            remote_manifest = parse_remote_manifest(output_text)
             self.output.emit(f"Remote manifest: {len(remote_manifest):,} files.\n")
             selection = compare_manifests(local_manifest, remote_manifest)
             selected = selection.selected
-            file_list = write_files_from(selected, "sync_selection")
+            if self._cancelled.is_set():
+                self._finish(None, "Sync comparison was cancelled.")
+                return
+            file_list = write_files_from(selected, f"sync_selection_{time.time_ns()}")
+            if self._cancelled.is_set():
+                try:
+                    file_list.unlink()
+                except OSError:
+                    pass
+                self._finish(None, "Sync comparison was cancelled.")
+                return
             self.output.emit(
                 f"Sync selection: {len(selection.missing):,} missing, {len(selection.changed):,} changed, "
                 f"{len(selected):,} total selected.\n"
             )
             self.output.emit(f"Selection file list: {file_list}\n")
-            self.finished.emit(
+            self._finish_success(
+                file_list,
                 {
                     "missing": len(selection.missing),
                     "changed": len(selection.changed),
@@ -627,18 +674,293 @@ class SyncCompareWorker(QObject):
                     "local_folder": self.local_folder,
                     "remote_path": self.remote_path,
                 },
-                "",
             )
         except Exception as exc:
-            self.finished.emit(None, f"Sync comparison failed: {exc}")
+            self._finish(None, f"Sync comparison failed: {exc}")
         finally:
-            self._process = None
+            with self._process_lock:
+                self._process = None
+
+    def _report_local_progress(self, progress: ManifestScanProgress) -> None:
+        if progress.files_scanned - self._last_local_progress >= 1000:
+            self._last_local_progress = progress.files_scanned
+            self.output.emit(
+                f"Local manifest: scanned {progress.files_scanned:,} files in "
+                f"{progress.directories_scanned:,} folders...\n"
+            )
+
+    def _collect_remote_manifest(
+        self,
+        process: subprocess.Popen[str],
+        collector: RemoteManifestCollector,
+        host: str,
+        deadline: float,
+    ) -> tuple[int, str]:
+        if sys.platform.startswith("win") and getattr(process, "stdout", None) is not None:
+            try:
+                process.stdout.fileno()
+            except (AttributeError, OSError, ValueError):
+                pass
+            else:
+                return self._collect_remote_manifest_windows(process, collector, host, deadline)
+
+        output_queue: queue.Queue[str | None] = queue.Queue(maxsize=1000)
+        reader_stop = threading.Event()
+
+        def read_output() -> None:
+            try:
+                if process.stdout:
+                    for line in process.stdout:
+                        while not reader_stop.is_set():
+                            try:
+                                output_queue.put(line, timeout=0.1)
+                                break
+                            except queue.Full:
+                                continue
+            except (OSError, ValueError):
+                pass
+            finally:
+                while not reader_stop.is_set():
+                    try:
+                        output_queue.put(None, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+
+        reader = threading.Thread(target=read_output, daemon=True, name="sync-manifest-reader")
+        reader.start()
+        output_done = False
+        line_count = 0
+        error_tail = ""
+        drain_deadline: float | None = None
+        while True:
+            now = time.monotonic()
+            if self._cancelled.is_set():
+                stopped = self._stop_process(process)
+                self._shutdown_manifest_reader(process, reader, reader_stop)
+                return (130, "Sync comparison was cancelled.") if stopped else (1, "Remote SSH process could not stop after cancellation.")
+            if now >= deadline:
+                stopped = self._stop_process(process)
+                self._shutdown_manifest_reader(process, reader, reader_stop)
+                if not stopped:
+                    return 1, "Remote SSH process could not stop after the manifest timeout."
+                return 124, f"Remote manifest timed out after {self.REMOTE_TIMEOUT_SECONDS:g} seconds."
+            try:
+                item = output_queue.get(timeout=min(0.2, max(0.01, deadline - now)))
+            except queue.Empty:
+                item = ""
+            if item is None:
+                output_done = True
+            elif item:
+                record = collector.feed_line(item)
+                line_count += 1
+                if record is None and not item.startswith("** WARNING:"):
+                    error_tail = (error_tail + item)[-4000:]
+                if line_count % 500 == 0:
+                    self.output.emit(f"Remote manifest on {host}: read {line_count:,} lines...\n")
+
+            polled = process.poll()
+            if polled is not None:
+                if output_done and output_queue.empty():
+                    reader.join(timeout=1.0)
+                    return polled, error_tail.strip()
+                if drain_deadline is None:
+                    drain_deadline = min(deadline, now + self.OUTPUT_DRAIN_SECONDS)
+                elif now >= drain_deadline:
+                    self._shutdown_manifest_reader(process, reader, reader_stop)
+                    return 1, "Remote manifest output did not close cleanly; comparison was stopped to avoid using incomplete data."
+
+    def _collect_remote_manifest_windows(
+        self,
+        process: subprocess.Popen[str],
+        collector: RemoteManifestCollector,
+        host: str,
+        deadline: float,
+    ) -> tuple[int, str]:
+        import msvcrt
+
+        stdout = process.stdout
+        assert stdout is not None
+        descriptor = stdout.fileno()
+        pipe_handle = msvcrt.get_osfhandle(descriptor)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.PeekNamedPipe.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.c_void_p,
+        ]
+        kernel32.PeekNamedPipe.restype = ctypes.c_int
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        text_buffer = ""
+        error_tail = ""
+        line_count = 0
+        drain_deadline: float | None = None
+
+        def consume(text: str, final: bool = False) -> None:
+            nonlocal text_buffer, error_tail, line_count
+            text_buffer += text
+            lines = text_buffer.splitlines(keepends=True)
+            text_buffer = ""
+            for index, line in enumerate(lines):
+                if not final and index == len(lines) - 1 and not line.endswith(("\n", "\r")):
+                    text_buffer = line
+                    continue
+                record = collector.feed_line(line)
+                line_count += 1
+                if record is None and not line.startswith("** WARNING:"):
+                    error_tail = (error_tail + line)[-4000:]
+                if line_count % 500 == 0:
+                    self.output.emit(f"Remote manifest on {host}: read {line_count:,} lines...\n")
+
+        try:
+            while True:
+                now = time.monotonic()
+                if self._cancelled.is_set():
+                    stopped = self._stop_process(process)
+                    return (130, "Sync comparison was cancelled.") if stopped else (1, "Remote SSH process could not stop after cancellation.")
+                if now >= deadline:
+                    stopped = self._stop_process(process)
+                    if not stopped:
+                        return 1, "Remote SSH process could not stop after the manifest timeout."
+                    return 124, f"Remote manifest timed out after {self.REMOTE_TIMEOUT_SECONDS:g} seconds."
+
+                available = ctypes.c_ulong()
+                peek_ok = kernel32.PeekNamedPipe(
+                    ctypes.c_void_p(pipe_handle), None, 0, None, ctypes.byref(available), None
+                )
+                if peek_ok and available.value:
+                    chunk = os.read(descriptor, min(int(available.value), 65536))
+                    if chunk:
+                        consume(decoder.decode(chunk))
+                        continue
+
+                polled = process.poll()
+                if not peek_ok:
+                    error = ctypes.get_last_error()
+                    if error in (109, 232) and polled is not None:
+                        consume(decoder.decode(b"", final=True), final=True)
+                        consume("", final=True)
+                        return polled, error_tail.strip()
+                    if polled is None:
+                        stopped = self._stop_process(process)
+                        if not stopped:
+                            return 1, "Remote SSH process closed its output and could not be stopped."
+                    return 1, f"Could not read remote manifest output (Windows error {error})."
+
+                if polled is not None:
+                    if drain_deadline is None:
+                        drain_deadline = min(deadline, now + self.OUTPUT_DRAIN_SECONDS)
+                    elif now >= drain_deadline:
+                        return 1, "Remote manifest output did not close cleanly; comparison was stopped to avoid using incomplete data."
+                self._cancelled.wait(0.02)
+        finally:
+            try:
+                stdout.close()
+            except OSError:
+                pass
+
+    def _shutdown_manifest_reader(
+        self,
+        process: subprocess.Popen[str],
+        reader: threading.Thread,
+        reader_stop: threading.Event,
+    ) -> None:
+        reader_stop.set()
+        self._cancel_reader_io(process, reader)
+        reader.join(timeout=self.READER_JOIN_SECONDS)
+        stdout = getattr(process, "stdout", None)
+        if reader.is_alive() and stdout is not None and not hasattr(stdout, "fileno") and hasattr(stdout, "close"):
+            stdout.close()
+            reader.join(timeout=self.READER_JOIN_SECONDS)
+        if not reader.is_alive():
+            if stdout:
+                try:
+                    stdout.close()
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _cancel_reader_io(process: subprocess.Popen[str], reader: threading.Thread) -> None:
+        if not sys.platform.startswith("win") or reader.native_id is None:
+            return
+        # CancelIoEx targets the pipe handle without acquiring TextIOWrapper's
+        # lock. CancelSynchronousIo is retained as a thread-specific fallback.
+        import msvcrt
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CancelIoEx.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        kernel32.CancelIoEx.restype = ctypes.c_int
+        stdout = getattr(process, "stdout", None)
+        if stdout is not None:
+            try:
+                pipe_handle = msvcrt.get_osfhandle(stdout.fileno())
+                kernel32.CancelIoEx(ctypes.c_void_p(pipe_handle), None)
+            except (AttributeError, OSError, ValueError):
+                pass
+        kernel32.OpenThread.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+        kernel32.OpenThread.restype = ctypes.c_void_p
+        kernel32.CancelSynchronousIo.argtypes = [ctypes.c_void_p]
+        kernel32.CancelSynchronousIo.restype = ctypes.c_int
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_int
+        thread_handle = kernel32.OpenThread(0x0001, False, reader.native_id)
+        if not thread_handle:
+            return
+        try:
+            kernel32.CancelSynchronousIo(thread_handle)
+        finally:
+            kernel32.CloseHandle(thread_handle)
+
+    def _stop_process(self, process: subprocess.Popen[str]) -> bool:
+        if process.poll() is not None:
+            return True
+        try:
+            process.terminate()
+            process.wait(timeout=self.STOP_GRACE_SECONDS)
+            return True
+        except (OSError, subprocess.TimeoutExpired):
+            if process.poll() is not None:
+                return True
+            pass
+        try:
+            process.kill()
+            process.wait(timeout=self.STOP_GRACE_SECONDS)
+            return process.poll() is not None
+        except (OSError, subprocess.TimeoutExpired):
+            return process.poll() is not None
+
+    def _finish(self, result: object, error: str) -> None:
+        with self._finish_lock:
+            if self._did_finish:
+                return
+            self._did_finish = True
+        self.finished.emit(result, error)
+
+    def _finish_success(self, file_list: Path, result: object) -> None:
+        cancelled = False
+        with self._finish_lock:
+            if self._did_finish:
+                return
+            if self._cancelled.is_set():
+                cancelled = True
+            self._did_finish = True
+        if cancelled:
+            try:
+                file_list.unlink()
+            except OSError:
+                pass
+            self.finished.emit(None, "Sync comparison was cancelled.")
+        else:
+            self.finished.emit(result, "")
 
     @Slot()
     def cancel(self) -> None:
-        self._cancelled = True
-        if self._process and self._process.poll() is None:
-            self._process.terminate()
+        with self._finish_lock:
+            if not self._did_finish:
+                self._cancelled.set()
 
 
 class MainWindow(QMainWindow):
@@ -1958,7 +2280,16 @@ class MainWindow(QMainWindow):
         self.download_dry_run_button.setEnabled(idle and (not selected_scope or bool(remote_files)))
 
     def _clear_sync_selection(self) -> None:
+        selection = self.sync_selection
         self.sync_selection = None
+        if selection and selection.get("file_list"):
+            file_list = Path(str(selection["file_list"]))
+            expected_parent = app_data_dir() / "filelists"
+            try:
+                if file_list.parent.resolve() == expected_parent.resolve() and file_list.name.startswith("sync_selection_"):
+                    file_list.unlink(missing_ok=True)
+            except OSError:
+                pass
         if hasattr(self, "upload_selection_button"):
             self.upload_selection_button.setEnabled(False)
 
