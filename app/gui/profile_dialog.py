@@ -8,7 +8,9 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
+    QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QSpinBox,
     QVBoxLayout,
@@ -16,6 +18,7 @@ from PySide6.QtWidgets import (
 
 from app.core.paths import detect_rsync
 from app.core.profiles import DEFAULT_HOST, Profile
+from app.gui.setup_guide_dialog import SetupGuideDialog
 
 
 class ProfileDialog(QDialog):
@@ -38,9 +41,28 @@ class ProfileDialog(QDialog):
         self.key_path_edit = QLineEdit(current.ssh_key_path)
         self.rsync_path_edit = QLineEdit(current.rsync_path or detect_rsync())
 
+        self.name_edit.setPlaceholderText("Example: Q0101 reef data")
+        self.username_edit.setPlaceholderText("The UQ identity granted collection access")
+        self.host_edit.setPlaceholderText(DEFAULT_HOST)
+        self.collection_edit.setPlaceholderText("Example: Q0101")
+        self.remote_path_edit.setPlaceholderText("Example: /data/Q0101")
+        self.key_path_edit.setPlaceholderText(r"C:\Users\you\.ssh\qriscloud_ed25519 (not .pub)")
+        self.rsync_path_edit.setPlaceholderText(r"C:\msys64\usr\bin\rsync.exe")
+        self.username_edit.setToolTip("Use the exact UQ identity that was granted access to this collection.")
+        self.key_path_edit.setToolTip("Choose the private key file. The public .pub file cannot authenticate the app.")
+        self.remote_path_edit.setToolTip("QRISdata collections are normally available at /data/Qnnnn.")
+
         self.collection_edit.textEdited.connect(self._collection_changed)
 
         layout = QVBoxLayout(self)
+        intro = QLabel(
+            "New to SSH? The setup guide explains the key pair, every field below, and how to test safely."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        help_button = QPushButton("Open first-time setup guide")
+        help_button.clicked.connect(self._open_setup_guide)
+        layout.addWidget(help_button)
         form = QFormLayout()
         form.addRow("Profile name", self.name_edit)
         form.addRow("Username", self.username_edit)
@@ -53,7 +75,7 @@ class ProfileDialog(QDialog):
         layout.addLayout(form)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
+        buttons.accepted.connect(self._validate_and_accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
@@ -95,3 +117,23 @@ class ProfileDialog(QDialog):
         if path:
             self.rsync_path_edit.setText(path)
 
+    def validation_errors(self) -> list[str]:
+        profile = self.profile()
+        errors: list[str] = []
+        if not profile.username:
+            errors.append("Enter the UQ username that was granted access to the collection.")
+        if not profile.remote_path.startswith("/"):
+            errors.append("Remote path must start with '/', for example /data/Q0101.")
+        if profile.ssh_key_path.lower().endswith(".pub"):
+            errors.append("SSH key path must be the private key, not the public .pub file.")
+        return errors
+
+    def _validate_and_accept(self) -> None:
+        errors = self.validation_errors()
+        if errors:
+            QMessageBox.warning(self, "Check profile details", "\n".join(f"• {error}" for error in errors))
+            return
+        self.accept()
+
+    def _open_setup_guide(self) -> None:
+        SetupGuideDialog(self, offer_profile_creation=False).exec()

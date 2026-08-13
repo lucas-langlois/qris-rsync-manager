@@ -62,6 +62,7 @@ from app.core.sync_compare import (
 )
 from app.gui.profile_dialog import ProfileDialog
 from app.gui.remote_browser_dialog import RemoteListWorker
+from app.gui.setup_guide_dialog import SetupGuideDialog
 
 
 class CommandWorker(QObject):
@@ -1104,11 +1105,13 @@ class MainWindow(QMainWindow):
         edit_button = QPushButton("Edit")
         delete_button = QPushButton("Delete")
         save_button = QPushButton("Save profiles")
+        self.setup_guide_button = QPushButton("First-time setup")
         profile_layout.addWidget(new_button, 0, 2)
         profile_layout.addWidget(edit_button, 0, 3)
         profile_layout.addWidget(delete_button, 0, 4)
         profile_layout.addWidget(save_button, 0, 5)
-        profile_layout.addWidget(self.status_label, 1, 0, 1, 6)
+        profile_layout.addWidget(self.setup_guide_button, 0, 6)
+        profile_layout.addWidget(self.status_label, 1, 0, 1, 7)
         layout.addWidget(self.profile_box)
 
         browser = QSplitter()
@@ -1147,6 +1150,7 @@ class MainWindow(QMainWindow):
         edit_button.clicked.connect(self._edit_profile)
         delete_button.clicked.connect(self._delete_profile)
         save_button.clicked.connect(self._save_profiles)
+        self.setup_guide_button.clicked.connect(self._open_setup_guide)
         self.ssh_button.clicked.connect(self._start_ssh_test)
         self.local_up_button.clicked.connect(self._local_go_up)
         self.local_refresh_button.clicked.connect(self._refresh_local_tree)
@@ -1249,7 +1253,10 @@ class MainWindow(QMainWindow):
         return None
 
     def _new_profile(self) -> None:
-        dialog = ProfileDialog(parent=self)
+        self._create_profile()
+
+    def _create_profile(self, initial_profile: Profile | None = None) -> None:
+        dialog = ProfileDialog(initial_profile, self)
         if dialog.exec() == ProfileDialog.Accepted:
             profile = dialog.profile()
             if any(existing.name == profile.name for existing in self.profiles):
@@ -1259,6 +1266,11 @@ class MainWindow(QMainWindow):
             if self._persist_profiles(candidate):
                 self.profiles = candidate
                 self._load_profile_combo(profile.name)
+
+    def _open_setup_guide(self) -> None:
+        dialog = SetupGuideDialog(self)
+        if dialog.exec() == SetupGuideDialog.Accepted and dialog.create_profile_after_finish:
+            self._create_profile(dialog.profile_template())
 
     def _edit_profile(self) -> None:
         profile = self.current_profile()
@@ -2410,7 +2422,8 @@ class MainWindow(QMainWindow):
             return
         rsync_state = "found" if is_executable_file(profile.rsync_path) else "not found"
         ssh_state = "found" if is_executable_file(self.detected_ssh) else "not found"
-        self.status_label.setText(f"Tools: rsync {rsync_state} · SSH {ssh_state}")
+        setup_state = "profile needs a username" if not profile.username else "profile ready to test"
+        self.status_label.setText(f"Setup: {setup_state} | Tools: rsync {rsync_state} | SSH {ssh_state}")
         self.status_label.setToolTip(f"rsync: {profile.rsync_path}\nSSH: {self.detected_ssh}")
 
 

@@ -49,6 +49,8 @@ C:\msys64\usr\bin\rsync.exe
 C:\msys64\usr\bin\ssh.exe
 ```
 
+If you are unfamiliar with these tools, open the app and click **First-time setup**. The wizard checks whether both programs are present and explains the installation and verification steps.
+
 ### Option A: Install MSYS2 with winget
 
 Open PowerShell:
@@ -88,6 +90,10 @@ Install to the default location, `C:\msys64`, then run the same `pacman` command
 
 ## SSH Key Setup
 
+The instructions below assume you already have a QRIScloud/UQ account and that this account has been granted access to the Q collection. In the app, click **First-time setup** beside the profile controls for a beginner-friendly walkthrough covering rsync, SSH, the key pair, and a pre-filled profile form.
+
+Have your UQ username and collection ID (for example `Q0101`) ready. If you have both staff and student identities, use the exact identity that was granted collection access.
+
 Create a QRIScloud SSH key if you do not already have one:
 
 ```powershell
@@ -107,6 +113,10 @@ C:\Users\<you>\.ssh\qriscloud_ed25519.pub
 ```
 
 The app may ask for the SSH key passphrase. It keeps the passphrase in memory for the current app session only; it is not saved into the profile.
+
+Creating the key files does not register the key with the server. The in-app guide provides a PowerShell command that logs in once with your normal UQ password and adds only the public `.pub` key to your remote account. Never share the private key file.
+
+See the official [QRISdata collection guide](https://www.qriscloud.org.au/support/qriscloud-documentation/93-using-qrisdata-collections) for account, collection path, host, and support details, and [Microsoft's OpenSSH key guide](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_keymanagement) for Windows key-pair details.
 
 ## First Run
 
