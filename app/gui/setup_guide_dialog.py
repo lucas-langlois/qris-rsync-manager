@@ -204,8 +204,11 @@ class SetupGuideDialog(QWizard):
         layout = QVBoxLayout(page)
         layout.addWidget(
             _paragraph(
-                "<p>An SSH key is a pair of files:</p><ul>"
-                "<li><b>Private key</b>: <code>qriscloud_ed25519</code>. Treat it like a password. Never share it.</li>"
+                "<p>An SSH key is a pair of files. The command below uses <b>Ed25519</b>, which is simply "
+                "the name of the secure key type being created; you do not need to understand or configure it.</p><ul>"
+                "<li><b>Private key</b>: <code>qriscloud_ed25519</code>. This is a suggested filename meaning "
+                "&ldquo;the QRIScloud key&rdquo;; it is not an account name or a QRIScloud requirement. Treat the "
+                "file like a password and never share it.</li>"
                 "<li><b>Public key</b>: <code>qriscloud_ed25519.pub</code>. This is safe to register with QRIScloud.</li>"
                 "</ul><p>Open <b>PowerShell</b> from the Windows Start menu, paste the commands below, and press "
                 "Enter. Choose a memorable passphrase when asked. The cursor does not move while you type it; "

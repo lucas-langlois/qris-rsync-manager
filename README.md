@@ -94,7 +94,10 @@ The instructions below assume you already have a QRIScloud/UQ account and that t
 
 Have your UQ username and collection ID (for example `Q0101`) ready. If you have both staff and student identities, use the exact identity that was granted collection access.
 
-Create a QRIScloud SSH key if you do not already have one:
+Create a QRIScloud SSH key if you do not already have one. `Ed25519` is simply the
+secure type of SSH key being created; users do not need to configure or understand
+the cryptography. `qriscloud_ed25519` is a suggested descriptive filename, not a
+QRIScloud requirement:
 
 ```powershell
 ssh-keygen -t ed25519 -f "$env:USERPROFILE\.ssh\qriscloud_ed25519"

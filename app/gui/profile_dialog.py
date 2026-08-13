@@ -46,10 +46,15 @@ class ProfileDialog(QDialog):
         self.host_edit.setPlaceholderText(DEFAULT_HOST)
         self.collection_edit.setPlaceholderText("Example: Q0101")
         self.remote_path_edit.setPlaceholderText("Example: /data/Q0101")
-        self.key_path_edit.setPlaceholderText(r"C:\Users\you\.ssh\qriscloud_ed25519 (not .pub)")
+        self.key_path_edit.setPlaceholderText(
+            r"C:\Users\you\.ssh\qriscloud_ed25519 (suggested name; not .pub)"
+        )
         self.rsync_path_edit.setPlaceholderText(r"C:\msys64\usr\bin\rsync.exe")
         self.username_edit.setToolTip("Use the exact UQ identity that was granted access to this collection.")
-        self.key_path_edit.setToolTip("Choose the private key file. The public .pub file cannot authenticate the app.")
+        self.key_path_edit.setToolTip(
+            "Choose your private SSH key file. qriscloud_ed25519 is only the suggested filename; "
+            "Ed25519 is the secure key type. The public .pub file cannot authenticate the app."
+        )
         self.remote_path_edit.setToolTip("QRISdata collections are normally available at /data/Qnnnn.")
 
         self.collection_edit.textEdited.connect(self._collection_changed)

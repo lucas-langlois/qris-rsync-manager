@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtWidgets import QApplication, QTextEdit
+from PySide6.QtWidgets import QApplication, QLabel, QTextEdit
 
 from app.gui.profile_dialog import ProfileDialog
 from app.gui.setup_guide_dialog import (
@@ -42,6 +42,19 @@ def test_commands_keep_private_and_public_key_roles_separate() -> None:
     assert "qriscloud_ed25519.pub" in register
     assert "uqabcdef@ssh1.qriscloud.org.au" in register
     assert "password" not in register.lower()
+
+
+def test_key_page_explains_ed25519_and_suggested_filename() -> None:
+    _application()
+    dialog = SetupGuideDialog()
+    key_page_text = " ".join(
+        label.text() for label in dialog.page(2).findChildren(QLabel)
+    )
+
+    assert "name of the secure key type" in key_page_text
+    assert "suggested filename" in key_page_text
+    assert "not an account name or a QRIScloud requirement" in key_page_text
+    dialog.close()
 
 
 def test_msys2_commands_install_and_verify_required_tools() -> None:
@@ -132,4 +145,5 @@ def test_profile_rejects_public_key_and_explains_fields() -> None:
     assert any("private key" in error for error in dialog.validation_errors())
     assert "granted access" in dialog.username_edit.toolTip()
     assert "not .pub" in dialog.key_path_edit.placeholderText()
+    assert "suggested filename" in dialog.key_path_edit.toolTip()
     dialog.close()
