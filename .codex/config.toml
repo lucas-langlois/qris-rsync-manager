@@ -1,0 +1,10 @@
+# Repo-local Codex defaults. Keep the coordinating thread on the frontier model;
+# project-scoped agents in .codex/agents provide narrower task-specific routing.
+model = "gpt-5.6-sol"
+model_reasoning_effort = "medium"
+
+[agents]
+max_threads = 4
+max_depth = 1
+default_subagent_model = "gpt-5.6-luna"
+default_subagent_reasoning_effort = "high"

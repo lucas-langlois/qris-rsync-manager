@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import queue
-import shutil
 import subprocess
 import sys
 import threading
@@ -39,7 +38,8 @@ from PySide6.QtWidgets import (
 
 from app.core.askpass import build_askpass_environment, scrub_askpass_environment
 from app.core.logging_utils import new_log_file
-from app.core.file_scan import scan_folder
+from app.core.file_scan import FolderScan, scan_folder
+from app.core.local_delete import LocalDeleteResult, delete_local_paths
 from app.core.medici import build_recall_medici_files_command, medici_path_for_remote_path
 from app.core.paths import detect_ssh, is_executable_file
 from app.core.profiles import Profile, fallback_hosts, load_profiles, profile_with_host, save_profiles, upsert_profile
@@ -163,6 +163,93 @@ class FallbackCommandWorker(CommandWorker):
     def cancel(self) -> None:
         self._cancelled.set()
         self.runner.cancel()
+
+
+class FolderScanWorker(QObject):
+    output = Signal(str)
+    finished = Signal(int)
+
+    def __init__(self, path: str) -> None:
+        super().__init__()
+        self.path = path
+        self.result: FolderScan | None = None
+        self._cancelled = threading.Event()
+        self._last_progress = 0
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.result = scan_folder(
+                self.path,
+                cancel_event=self._cancelled,
+                progress_callback=self._report_progress,
+            )
+            if self.result.cancelled:
+                self.output.emit("Local folder scan cancelled.\n")
+                self.finished.emit(130)
+                return
+            self.output.emit(
+                f"Local scan: {self.result.file_count:,} files, {self.result.total_bytes:,} bytes, "
+                f"{self.result.tiny_file_count:,} files under 1 MB.\n"
+            )
+            self.finished.emit(0)
+        except Exception as exc:
+            self.output.emit(f"Local folder scan failed: {exc}\n")
+            self.finished.emit(1)
+
+    def _report_progress(self, result: FolderScan) -> None:
+        examined = result.file_count + result.directory_count + result.skipped_errors
+        if examined - self._last_progress >= 1000:
+            self._last_progress = examined
+            self.output.emit(f"Scanned {result.file_count:,} files in {result.directory_count:,} folders...\n")
+
+    @Slot()
+    def cancel(self) -> None:
+        self._cancelled.set()
+
+
+class LocalDeleteWorker(QObject):
+    output = Signal(str)
+    finished = Signal(int)
+
+    def __init__(self, paths: list[Path]) -> None:
+        super().__init__()
+        self.paths = list(paths)
+        self.result: LocalDeleteResult | None = None
+        self._cancelled = threading.Event()
+        self._last_progress = 0
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.result = delete_local_paths(
+                self.paths,
+                cancel_event=self._cancelled,
+                progress_callback=self._report_progress,
+            )
+            if self.result.cancelled:
+                self.output.emit("Local deletion cancelled; some selected items may already have been deleted.\n")
+                self.finished.emit(130)
+                return
+            if self.result.failures:
+                self.output.emit("Local deletion completed with errors:\n" + "\n".join(self.result.failures) + "\n")
+                self.finished.emit(1)
+                return
+            self.output.emit(f"Moved {self.result.recycled_items:,} selected item(s) to the Recycle Bin.\n")
+            self.finished.emit(0)
+        except Exception as exc:
+            self.output.emit(f"Local deletion failed: {exc}\n")
+            self.finished.emit(1)
+
+    def _report_progress(self, result: LocalDeleteResult) -> None:
+        processed = result.deleted_count + result.skipped_errors
+        if processed - self._last_progress >= 250:
+            self._last_progress = processed
+            self.output.emit(f"Deleted {result.deleted_count:,} local items...\n")
+
+    @Slot()
+    def cancel(self) -> None:
+        self._cancelled.set()
 
 
 class RecallMediciWorker(QObject):
@@ -562,11 +649,13 @@ class MainWindow(QMainWindow):
 
         self.profiles = load_profiles()
         self.current_thread: QThread | None = None
-        self.current_worker: CommandWorker | SshTestWorker | RecallMediciWorker | None = None
+        self.current_worker: CommandWorker | SshTestWorker | RecallMediciWorker | FolderScanWorker | LocalDeleteWorker | None = None
         self.current_label = ""
         self.current_finished_handled = False
         self.current_refresh_local = False
         self.current_refresh_remote = False
+        self.current_after_finish = None
+        self.current_exit_code: int | None = None
         self._current_operation_id = 0
         self.remote_thread: QThread | None = None
         self.remote_worker: RemoteListWorker | None = None
@@ -628,14 +717,17 @@ class MainWindow(QMainWindow):
         self.remote_new_folder_button = QPushButton("New folder")
         self.remote_rename_button = QPushButton("Rename/move")
         self.remote_delete_button = QPushButton("Delete")
+        self.transfer_scope_combo = QComboBox()
+        self.transfer_scope_combo.addItem("Current folders", "folder")
+        self.transfer_scope_combo.addItem("Selected files", "selected")
         self.dry_run_button = QPushButton("Compare / dry-run")
         self.download_dry_run_button = QPushButton("Compare download")
         self.build_selection_button = QPushButton("Build sync selection")
-        self.upload_selection_button = QPushButton("Upload selection")
+        self.upload_selection_button = QPushButton("Upload compared files")
         self.upload_selection_button.setEnabled(False)
-        self.upload_button = QPushButton("Upload")
+        self.upload_button = QPushButton("Upload folder")
         self.recall_button = QPushButton("Recall tape")
-        self.download_button = QPushButton("Download")
+        self.download_button = QPushButton("Download folder")
         self.stop_button = QPushButton("Stop")
         self.stop_button.setEnabled(False)
 
@@ -643,6 +735,7 @@ class MainWindow(QMainWindow):
         self._set_local_root(str(Path.home()))
         self._load_profile_combo()
         self._update_status()
+        self._update_transfer_scope_ui()
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -671,6 +764,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(browser, stretch=2)
 
         button_row = QHBoxLayout()
+        button_row.addWidget(QLabel("Transfer scope"))
+        button_row.addWidget(self.transfer_scope_combo)
         button_row.addWidget(self.ssh_button)
         button_row.addWidget(self.dry_run_button)
         button_row.addWidget(self.download_dry_run_button)
@@ -717,6 +812,9 @@ class MainWindow(QMainWindow):
         self.recall_button.clicked.connect(self._recall_medici)
         self.download_button.clicked.connect(lambda: self._start_rsync(dry_run=False, direction="download"))
         self.stop_button.clicked.connect(self._cancel_current)
+        self.transfer_scope_combo.currentIndexChanged.connect(self._update_transfer_scope_ui)
+        self.local_tree.selectionModel().selectionChanged.connect(self._update_transfer_scope_ui)
+        self.remote_table.itemSelectionChanged.connect(self._update_transfer_scope_ui)
 
     def _local_panel(self) -> QGroupBox:
         box = QGroupBox("Local")
@@ -849,8 +947,6 @@ class MainWindow(QMainWindow):
 
     def _selected_local_paths(self) -> list[Path]:
         indexes = self.local_tree.selectionModel().selectedRows(0)
-        if not indexes and self.local_tree.currentIndex().isValid():
-            indexes = [self.local_tree.currentIndex()]
         paths: list[Path] = []
         for index in indexes:
             path = Path(self.local_model.filePath(index)).expanduser()
@@ -913,30 +1009,31 @@ class MainWindow(QMainWindow):
         if not paths:
             self._show_errors(["Select one or more local files or folders to delete."])
             return
-        if (
-            QMessageBox.warning(
-                self,
-                "Delete local items",
-                f"Delete {len(paths):,} selected local item(s)?\n\nThis cannot be undone.",
-                QMessageBox.Yes | QMessageBox.No,
-            )
-            != QMessageBox.Yes
-        ):
+        root = Path(self.local_folder_edit.text()).expanduser().absolute()
+        unique: list[Path] = []
+        for path in sorted({item.absolute() for item in paths}, key=lambda item: len(item.parts)):
+            if path == root:
+                self._show_errors(["The displayed local folder itself cannot be deleted. Select items inside it instead."])
+                return
+            if any(path.is_relative_to(parent) for parent in unique):
+                continue
+            unique.append(path)
+        preview = "\n".join(str(path) for path in unique[:10])
+        if len(unique) > 10:
+            preview += f"\n... and {len(unique) - 10:,} more"
+        confirmation, accepted = QInputDialog.getText(
+            self,
+            "Delete local items",
+            f"Type DELETE to permanently delete {len(unique):,} selected item(s).\n\n{preview}\n\n"
+            "Items will be moved to the Recycle Bin in the background:",
+        )
+        if not accepted or confirmation.strip() != "DELETE":
             return
-        failures: list[str] = []
-        for path in paths:
-            try:
-                if path.is_dir():
-                    shutil.rmtree(path)
-                else:
-                    path.unlink()
-            except OSError as exc:
-                failures.append(f"{path}: {exc}")
-        if failures:
-            self._show_errors(failures)
-        else:
-            self._append_log(f"Deleted {len(paths):,} local item(s).\n")
-        self._refresh_local_tree()
+        self._start_worker(
+            LocalDeleteWorker(unique),
+            "Delete local items",
+            refresh_local=True,
+        )
 
     def _start_ssh_test(self) -> None:
         profile = self.current_profile()
@@ -1093,8 +1190,6 @@ class MainWindow(QMainWindow):
         rows = {index.row() for index in self.remote_table.selectionModel().selectedRows()}
         if not rows:
             rows = {item.row() for item in self.remote_table.selectedItems()}
-        if not rows and self.remote_table.currentRow() >= 0:
-            rows = {self.remote_table.currentRow()}
         rows = sorted(rows)
         entries: list[RemoteEntry] = []
         for row in rows:
@@ -1259,10 +1354,7 @@ class MainWindow(QMainWindow):
         path = new_log_file("upload_selected_files").with_suffix(".txt")
         lines: list[str] = []
         for file in files:
-            try:
-                relative = file.relative_to(root)
-            except ValueError:
-                relative = Path(file.name)
+            relative = file.relative_to(root)
             lines.append(relative.as_posix())
         path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
         return path
@@ -1317,7 +1409,8 @@ class MainWindow(QMainWindow):
         profile = self.current_profile()
         if not profile:
             return
-        if self.compare_thread:
+        if self.compare_thread or self.current_thread or self.remote_thread:
+            QMessageBox.information(self, "Operation running", "Wait for the current operation to finish.")
             return
         errors = self._profile_errors(profile, require_rsync=True)
         errors.extend(validate_transfer_inputs(profile, self.local_folder_edit.text(), self.remote_path_edit.text()))
@@ -1430,8 +1523,20 @@ class MainWindow(QMainWindow):
         profile = self.current_profile()
         if not profile:
             return
-        selected_local_files = self._selected_local_files() if direction == "upload" else []
-        selected_remote_files = self._selected_remote_files() if direction == "download" else []
+        scope = str(self.transfer_scope_combo.currentData())
+        selected_local_paths = self._selected_local_paths() if direction == "upload" and scope == "selected" else []
+        selected_remote_entries = self._selected_remote_entries() if direction == "download" and scope == "selected" else []
+        if scope == "selected":
+            selected_items = selected_local_paths if direction == "upload" else selected_remote_entries
+            if not selected_items:
+                self._show_errors([f"Select one or more {direction} files, or choose Current folders."])
+                return
+            directories = [item for item in selected_items if (item.is_dir() if isinstance(item, Path) else item.is_dir)]
+            if directories:
+                self._show_errors(["Selected-files transfers do not include folders. Select files only, or choose Current folders."])
+                return
+        selected_local_files = selected_local_paths
+        selected_remote_files = selected_remote_entries
         selected_local_file = selected_local_files[0] if len(selected_local_files) == 1 else None
         selected_remote_file = selected_remote_files[0] if len(selected_remote_files) == 1 else None
         local_transfer_path = str(selected_local_file) if selected_local_file else self.local_folder_edit.text()
@@ -1441,25 +1546,69 @@ class MainWindow(QMainWindow):
         if errors:
             self._show_errors(errors)
             return
-        selected_local_files_from = self._selected_local_file_list(selected_local_files) if len(selected_local_files) > 1 else None
+        try:
+            selected_local_files_from = self._selected_local_file_list(selected_local_files) if len(selected_local_files) > 1 else None
+        except ValueError:
+            self._show_errors(["Every selected local file must be inside the displayed local folder."])
+            return
         selected_remote_files_from = self._selected_remote_file_list(selected_remote_files) if len(selected_remote_files) > 1 else None
-        if not dry_run and direction == "upload" and not selected_local_files and not self._confirm_upload_scan():
+        if direction == "upload" and scope == "folder":
+            self._start_upload_scan(profile, dry_run)
+            return
+        self._start_resolved_rsync(
+            profile,
+            dry_run,
+            direction,
+            scope,
+            selected_local_files,
+            selected_remote_files,
+            selected_local_file,
+            selected_remote_file,
+            local_transfer_path,
+            remote_transfer_path,
+            selected_local_files_from,
+            selected_remote_files_from,
+        )
+
+    def _start_resolved_rsync(
+        self,
+        profile: Profile,
+        dry_run: bool,
+        direction: str,
+        scope: str,
+        selected_local_files: list[Path],
+        selected_remote_files: list[RemoteEntry],
+        selected_local_file: Path | None,
+        selected_remote_file: RemoteEntry | None,
+        local_transfer_path: str,
+        remote_transfer_path: str,
+        selected_local_files_from: Path | None,
+        selected_remote_files_from: Path | None,
+        scan: FolderScan | None = None,
+    ) -> None:
+        source = local_transfer_path if direction == "upload" else remote_transfer_path
+        destination = remote_transfer_path if direction == "upload" else local_transfer_path
+        item_count = len(selected_local_files) if direction == "upload" else len(selected_remote_files)
+        count_text = f"{item_count:,} selected file(s)" if scope == "selected" else "current folder (recursive)"
+        if scan is not None:
+            count_text = f"{scan.file_count:,} files ({scan.total_bytes:,} bytes; {scan.tiny_file_count:,} under 1 MB)"
+        warnings = ""
+        if scan and scan.warnings():
+            warnings = "\n\nWarnings:\n" + "\n".join(f"- {warning}" for warning in scan.warnings())
+        mode = "Dry run / compare (no files will be changed)" if dry_run else "Transfer (existing files may be updated; destination files are not deleted)"
+        if (
+            QMessageBox.question(
+                self,
+                f"Confirm {direction}",
+                f"Scope: {count_text}\nSource: {source}\nDestination: {destination}\nMode: {mode}{warnings}\n\nContinue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            != QMessageBox.Yes
+        ):
             return
         if direction == "download":
-            if selected_remote_files_from:
-                source_label = f"{len(selected_remote_files):,} selected files from {self.remote_path_edit.text()}"
-            else:
-                source_label = selected_remote_file.path if selected_remote_file else self.remote_path_edit.text()
-            if not dry_run and (
-                QMessageBox.question(
-                    self,
-                    "Download",
-                    f"Download from {source_label} into {self.local_folder_edit.text()}?",
-                )
-                != QMessageBox.Yes
-            ):
-                return
-            visible_files_from = selected_remote_files_from if selected_remote_files_from else (None if selected_remote_file else self._visible_remote_file_list())
+            visible_files_from = selected_remote_files_from if selected_remote_files_from else None
         else:
             visible_files_from = selected_local_files_from if direction == "upload" else None
         passphrase = self._get_session_passphrase(profile)
@@ -1508,6 +1657,31 @@ class MainWindow(QMainWindow):
         elif selected_remote_file:
             self._append_log(f"Downloading selected file: {selected_remote_file.path}\n")
 
+    def _start_upload_scan(self, profile: Profile, dry_run: bool) -> None:
+        local_path = self.local_folder_edit.text()
+        remote_path = self.remote_path_edit.text()
+
+        def continue_upload(worker: object, code: int) -> None:
+            if code != 0 or not isinstance(worker, FolderScanWorker) or worker.result is None:
+                return
+            self._start_resolved_rsync(
+                profile,
+                dry_run,
+                "upload",
+                "folder",
+                [],
+                [],
+                None,
+                None,
+                local_path,
+                remote_path,
+                None,
+                None,
+                scan=worker.result,
+            )
+
+        self._start_worker(FolderScanWorker(local_path), "Scan upload folder", after_finish=continue_upload)
+
     def _ask_passphrase(self, profile: Profile) -> str | None:
         if not profile.ssh_key_path:
             return ""
@@ -1531,27 +1705,16 @@ class MainWindow(QMainWindow):
             self.session_passphrase = passphrase
         return passphrase
 
-    def _confirm_upload_scan(self) -> bool:
-        self._append_log("Scanning local folder before upload...\n")
-        scan = scan_folder(self.local_folder_edit.text())
-        self._append_log(
-            f"Local scan: {scan.file_count:,} files, {scan.total_bytes:,} bytes, {scan.tiny_file_count:,} files under 1 MB.\n"
-        )
-        warnings = scan.warnings()
-        if not warnings:
-            return True
-        message = "\n\n".join(warnings) + "\n\nContinue upload?"
-        return QMessageBox.warning(self, "Large upload warning", message, QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes
-
     def _start_worker(
         self,
-        worker: CommandWorker | SshTestWorker | RecallMediciWorker,
+        worker: CommandWorker | SshTestWorker | RecallMediciWorker | FolderScanWorker | LocalDeleteWorker,
         label: str,
         refresh_local: bool = False,
         refresh_remote: bool = False,
+        after_finish=None,
     ) -> None:
-        if self.current_thread:
-            QMessageBox.information(self, "Transfer running", "A command is already running.")
+        if self.current_thread or self.remote_thread or self.compare_thread:
+            QMessageBox.information(self, "Operation running", "Another operation is already running.")
             return
         self.log_output.clear()
         thread = QThread(self)
@@ -1573,8 +1736,13 @@ class MainWindow(QMainWindow):
         self.current_finished_handled = False
         self.current_refresh_local = refresh_local
         self.current_refresh_remote = refresh_remote
+        self.current_after_finish = after_finish
+        self.current_exit_code = None
         self._set_running(True)
         self._reset_transfer_progress(label)
+        if isinstance(worker, LocalDeleteWorker):
+            self.stop_button.setEnabled(False)
+            self.transfer_status_label.setText("Moving items to the Recycle Bin (this OS operation cannot be interrupted safely)...")
         self._append_log(f"{label} started.\n")
         thread.start()
 
@@ -1587,6 +1755,7 @@ class MainWindow(QMainWindow):
         if operation_id != self._current_operation_id or self.current_finished_handled:
             return
         self.current_finished_handled = True
+        self.current_exit_code = code
         label = self.current_label or "Command"
         self._append_log(f"\n{label} finished with exit code {code}.\n")
         if code == 0 and any(word in label.lower() for word in ("upload", "download", "dry run", "recall")):
@@ -1608,11 +1777,18 @@ class MainWindow(QMainWindow):
             self.transfer_status_label.setText(f"{label} finished.")
         refresh_local = self.current_refresh_local
         refresh_remote = self.current_refresh_remote
+        worker = self.current_worker
+        exit_code = self.current_exit_code if self.current_exit_code is not None else 1
+        after_finish = self.current_after_finish
         self.current_thread = None
         self.current_worker = None
         self.current_label = ""
+        self.current_after_finish = None
+        self.current_exit_code = None
         self._set_running(False)
         self._run_post_worker_refresh(refresh_local, refresh_remote)
+        if after_finish and not self._close_after_stop:
+            after_finish(worker, exit_code)
 
     def _run_post_worker_refresh(self, refresh_local: bool, refresh_remote: bool) -> None:
         self.current_refresh_local = False
@@ -1623,7 +1799,11 @@ class MainWindow(QMainWindow):
             self._refresh_remote_table()
 
     def _cancel_current(self) -> None:
-        if isinstance(self.current_worker, (CommandWorker, SshTestWorker, RecallMediciWorker)):
+        if isinstance(self.current_worker, (CommandWorker, SshTestWorker, RecallMediciWorker, FolderScanWorker, LocalDeleteWorker)):
+            if isinstance(self.current_worker, LocalDeleteWorker):
+                self._append_log("\nThe current Recycle Bin operation cannot be interrupted safely.\n")
+                return
+            self.current_after_finish = None
             self._append_log("\nCancelling current command...\n")
             self.current_worker.cancel()
         elif isinstance(self.compare_worker, SyncCompareWorker):
@@ -1637,6 +1817,14 @@ class MainWindow(QMainWindow):
         if not active_threads:
             self._close_after_stop = False
             event.accept()
+            return
+        if isinstance(self.current_worker, LocalDeleteWorker):
+            QMessageBox.information(
+                self,
+                "Recycle Bin operation running",
+                "Please wait for the current Recycle Bin operation to finish before closing the app.",
+            )
+            event.ignore()
             return
         if self._close_after_stop:
             event.ignore()
@@ -1652,6 +1840,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self._close_after_stop = True
+        self.current_after_finish = None
         self.transfer_status_label.setText("Stopping active operations before closing...")
         if self.current_worker and hasattr(self.current_worker, "cancel"):
             self.current_worker.cancel()
@@ -1695,7 +1884,10 @@ class MainWindow(QMainWindow):
         self.upload_button.setEnabled(not running)
         self.recall_button.setEnabled(not running)
         self.download_button.setEnabled(not running)
+        self.transfer_scope_combo.setEnabled(not running)
         self.stop_button.setEnabled(running)
+        if not running:
+            self._update_transfer_scope_ui()
 
     def _set_remote_busy(self, busy: bool) -> None:
         self.profile_box.setEnabled(not busy and self.current_thread is None and self.compare_thread is None)
@@ -1707,6 +1899,22 @@ class MainWindow(QMainWindow):
         self.remote_new_folder_button.setEnabled(not busy and self.current_thread is None)
         self.remote_rename_button.setEnabled(not busy and self.current_thread is None)
         self.remote_delete_button.setEnabled(not busy and self.current_thread is None)
+        self.transfer_scope_combo.setEnabled(not busy and self.current_thread is None and self.compare_thread is None)
+        self.ssh_button.setEnabled(not busy and self.current_thread is None and self.compare_thread is None)
+        self.dry_run_button.setEnabled(not busy and self.current_thread is None and self.compare_thread is None)
+        self.download_dry_run_button.setEnabled(not busy and self.current_thread is None and self.compare_thread is None)
+        self.upload_button.setEnabled(not busy and self.current_thread is None and self.compare_thread is None)
+        self.download_button.setEnabled(not busy and self.current_thread is None and self.compare_thread is None)
+        self.build_selection_button.setEnabled(not busy and self.current_thread is None and self.compare_thread is None)
+        self.upload_selection_button.setEnabled(
+            not busy
+            and self.current_thread is None
+            and self.compare_thread is None
+            and bool(self.sync_selection and self.sync_selection.get("selected"))
+        )
+        self.recall_button.setEnabled(not busy and self.current_thread is None and self.compare_thread is None)
+        if not busy:
+            self._update_transfer_scope_ui()
 
     def _set_compare_running(self, running: bool) -> None:
         self.profile_box.setEnabled(not running and self.current_thread is None and self.remote_thread is None)
@@ -1715,17 +1923,39 @@ class MainWindow(QMainWindow):
         self.dry_run_button.setEnabled(not running and self.current_thread is None)
         self.download_dry_run_button.setEnabled(not running and self.current_thread is None)
         self.build_selection_button.setEnabled(not running and self.current_thread is None)
-        self.upload_selection_button.setEnabled(not running and bool(self.sync_selection and self.sync_selection.get("selected")))
+        self.upload_selection_button.setEnabled(not running and self.remote_thread is None and bool(self.sync_selection and self.sync_selection.get("selected")))
         self.upload_button.setEnabled(not running and self.current_thread is None)
         self.local_new_folder_button.setEnabled(not running and self.current_thread is None)
         self.local_rename_button.setEnabled(not running and self.current_thread is None)
         self.local_delete_button.setEnabled(not running and self.current_thread is None)
         self.recall_button.setEnabled(not running and self.current_thread is None)
-        self.remote_new_folder_button.setEnabled(not running and self.current_thread is None)
-        self.remote_rename_button.setEnabled(not running and self.current_thread is None)
-        self.remote_delete_button.setEnabled(not running and self.current_thread is None)
+        self.remote_new_folder_button.setEnabled(not running and self.current_thread is None and self.remote_thread is None)
+        self.remote_rename_button.setEnabled(not running and self.current_thread is None and self.remote_thread is None)
+        self.remote_delete_button.setEnabled(not running and self.current_thread is None and self.remote_thread is None)
         self.download_button.setEnabled(not running and self.current_thread is None)
+        self.transfer_scope_combo.setEnabled(not running and self.current_thread is None)
         self.stop_button.setEnabled(running or self.current_thread is not None)
+
+    def _update_transfer_scope_ui(self, *_args) -> None:
+        selected_scope = str(self.transfer_scope_combo.currentData()) == "selected"
+        local_files = self._selected_local_files() if selected_scope else []
+        remote_files = self._selected_remote_files() if selected_scope else []
+        if selected_scope:
+            self.upload_button.setText(f"Upload selected files ({len(local_files):,})")
+            self.download_button.setText(f"Download selected files ({len(remote_files):,})")
+            self.dry_run_button.setText(f"Compare selected files ({len(local_files):,})")
+            self.download_dry_run_button.setText(f"Compare selected files ({len(remote_files):,})")
+        else:
+            self.upload_button.setText("Upload folder")
+            self.download_button.setText("Download folder")
+            self.dry_run_button.setText("Compare upload folder")
+            self.download_dry_run_button.setText("Compare download folder")
+
+        idle = self.current_thread is None and self.compare_thread is None and self.remote_thread is None
+        self.upload_button.setEnabled(idle and (not selected_scope or bool(local_files)))
+        self.dry_run_button.setEnabled(idle and (not selected_scope or bool(local_files)))
+        self.download_button.setEnabled(idle and (not selected_scope or bool(remote_files)))
+        self.download_dry_run_button.setEnabled(idle and (not selected_scope or bool(remote_files)))
 
     def _clear_sync_selection(self) -> None:
         self.sync_selection = None

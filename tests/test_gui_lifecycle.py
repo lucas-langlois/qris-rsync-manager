@@ -8,7 +8,7 @@ from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from app.core.remote_dirs import RemoteEntry
-from app.gui.main_window import MainWindow
+from app.gui.main_window import FolderScanWorker, MainWindow
 from app.gui.remote_browser_dialog import RemoteListWorker
 
 
@@ -153,4 +153,130 @@ def test_close_decline_leaves_operation_running(monkeypatch, tmp_path) -> None:
     release.set()
     assert thread.wait(1000)
     window.current_thread = None
+    window.close()
+
+
+def test_selected_directory_is_not_silently_uploaded_as_folder(monkeypatch, tmp_path) -> None:
+    window = _window(monkeypatch, tmp_path)
+    window.transfer_scope_combo.setCurrentIndex(window.transfer_scope_combo.findData("selected"))
+    monkeypatch.setattr(window, "_selected_local_paths", lambda: [tmp_path])
+    errors: list[str] = []
+    monkeypatch.setattr(window, "_show_errors", lambda messages: errors.extend(messages))
+    started: list[object] = []
+    monkeypatch.setattr(window, "_start_worker", lambda *args, **kwargs: started.append(args[0]))
+
+    window._start_rsync(dry_run=False, direction="upload")
+
+    assert not started
+    assert any("do not include folders" in message for message in errors)
+    window.close()
+
+
+def test_folder_upload_starts_background_scan_before_transfer(monkeypatch, tmp_path) -> None:
+    window = _window(monkeypatch, tmp_path)
+    window.local_folder_edit.setText(str(tmp_path))
+    monkeypatch.setattr(window, "_profile_errors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("app.gui.main_window.validate_transfer_inputs", lambda *_args, **_kwargs: [])
+    started: list[tuple[object, str, object]] = []
+
+    def capture(worker, label, **kwargs) -> None:
+        started.append((worker, label, kwargs.get("after_finish")))
+
+    monkeypatch.setattr(window, "_start_worker", capture)
+
+    window._start_rsync(dry_run=False, direction="upload")
+
+    assert len(started) == 1
+    assert isinstance(started[0][0], FolderScanWorker)
+    assert started[0][1] == "Scan upload folder"
+    assert callable(started[0][2])
+    window.close()
+
+
+def test_transfer_confirmation_shows_scope_paths_and_dry_run(monkeypatch, tmp_path) -> None:
+    window = _window(monkeypatch, tmp_path)
+    profile = window.current_profile()
+    assert profile is not None
+    shown: dict[str, str] = {}
+
+    def decline(_parent, title, message, *_args) -> int:
+        shown["title"] = title
+        shown["message"] = message
+        return QMessageBox.No
+
+    monkeypatch.setattr(QMessageBox, "question", decline)
+    started: list[object] = []
+    monkeypatch.setattr(window, "_start_worker", lambda *args, **kwargs: started.append(args[0]))
+
+    window._start_resolved_rsync(
+        profile,
+        True,
+        "upload",
+        "folder",
+        [],
+        [],
+        None,
+        None,
+        str(tmp_path),
+        "/data/Q0101",
+        None,
+        None,
+    )
+
+    assert shown["title"] == "Confirm upload"
+    assert str(tmp_path) in shown["message"]
+    assert "/data/Q0101" in shown["message"]
+    assert "Dry run / compare" in shown["message"]
+    assert not started
+    window.close()
+
+
+def test_remote_listing_busy_disables_transfer_actions(monkeypatch, tmp_path) -> None:
+    window = _window(monkeypatch, tmp_path)
+
+    window._set_remote_busy(True)
+
+    assert not window.transfer_scope_combo.isEnabled()
+    assert not window.upload_button.isEnabled()
+    assert not window.download_button.isEnabled()
+    assert not window.dry_run_button.isEnabled()
+    assert not window.build_selection_button.isEnabled()
+    assert not window.recall_button.isEnabled()
+    window._set_remote_busy(False)
+    window.close()
+
+
+def test_build_sync_selection_refuses_remote_listing_overlap(monkeypatch, tmp_path) -> None:
+    window = _window(monkeypatch, tmp_path)
+    window.remote_thread = QThread()
+    shown: list[str] = []
+    monkeypatch.setattr(QMessageBox, "information", lambda _parent, _title, message, *_args: shown.append(message))
+
+    window._build_sync_selection()
+
+    assert window.compare_thread is None
+    assert shown == ["Wait for the current operation to finish."]
+    window.remote_thread = None
+    window.close()
+
+
+def test_close_suppresses_successful_scan_continuation(monkeypatch, tmp_path) -> None:
+    window = _window(monkeypatch, tmp_path)
+    called: list[bool] = []
+    worker = FolderScanWorker(str(tmp_path))
+    window.current_worker = worker
+    window.current_after_finish = lambda *_args: called.append(True)
+    window.current_exit_code = 0
+    window.current_finished_handled = True
+    window._close_after_stop = True
+    thread = QThread()
+    thread.operation_id = 1
+    window._current_operation_id = 1
+    window.current_thread = thread
+    thread.finished.connect(window._current_thread_finished)
+
+    thread.finished.emit()
+
+    assert not called
+    window._close_after_stop = False
     window.close()

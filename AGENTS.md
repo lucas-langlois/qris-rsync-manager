@@ -17,6 +17,23 @@ Always prioritize:
 
 Do not over-engineer. Keep the first working solution simple, testable, and resilient.
 
+## Model Routing
+
+Use the project-local Codex configuration in `.codex/config.toml` and choose the
+model according to task shape. Explicit agent files under `.codex/agents/`
+override these defaults.
+
+| Model | Use for | Default project roles |
+| --- | --- | --- |
+| `gpt-5.6-sol` | Complex code review, architecture, security, reliability analysis, ambiguous multi-step work, and release-risk decisions. Use `high` reasoning when tracing edge cases. | `reviewer`, `planner` |
+| `gpt-5.6-terra` | Balanced implementation, codebase exploration, execution tracing, test analysis, and other read-heavy work where speed and depth both matter. | `explorer`, `implementer` |
+| `gpt-5.6-luna` | Fast, narrowly scoped, deterministic, repeatable, or high-volume tasks with explicit inputs and acceptance criteria. Do not use it to choose architecture, scientific rules, security boundaries, or ambiguous behaviour. | `mechanical_worker`; project default for unassigned subagents |
+
+The coordinating agent should remain on `gpt-5.6-sol`. Keep subagent work
+read-only for review and planning unless implementation has been explicitly
+approved. Prefer `medium` reasoning for routine work and `high` for reviewers,
+security checks, and complex edge-case analysis.
+
 ## Technical Stack
 
 Use:
