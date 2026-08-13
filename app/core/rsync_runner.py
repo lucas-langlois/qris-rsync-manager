@@ -27,6 +27,7 @@ class RsyncRunner:
         passphrase: str = "",
         ssh_path: str | None = None,
         idle_timeout_seconds: int | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> int:
         log_file.parent.mkdir(parents=True, exist_ok=True)
         self._cancel_requested = False
@@ -36,6 +37,8 @@ class RsyncRunner:
         if sys.platform.startswith("win"):
             creationflags = subprocess.CREATE_NO_WINDOW
         try:
+            if cancel_event and cancel_event.is_set():
+                return 130
             with log_file.open("a", encoding="utf-8", errors="replace") as log:
                 self._emit(log, on_output, f"Running: {self._display_command(command)}\n")
                 with subprocess.Popen(
@@ -50,6 +53,9 @@ class RsyncRunner:
                 ) as process:
                     with self._lock:
                         self._process = process
+                    if cancel_event and cancel_event.is_set():
+                        self._cancel_requested = True
+                        process.terminate()
                     last_output = time.monotonic()
                     stop_watchdog = threading.Event()
 
@@ -91,6 +97,8 @@ class RsyncRunner:
                     elif self._cancel_requested:
                         self._emit(log, on_output, "\nProcess cancelled by user.\n")
                     self._emit(log, on_output, f"\nProcess exited with code {returncode}\n")
+                    if (cancel_event and cancel_event.is_set()) or self._cancel_requested:
+                        return 130
                     return returncode
         except FileNotFoundError as exc:
             message = f"Failed to start rsync. Executable not found: {exc}\n"

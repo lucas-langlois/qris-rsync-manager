@@ -8,7 +8,7 @@ import threading
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
+from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
@@ -96,14 +96,32 @@ class FallbackCommandWorker(CommandWorker):
         super().__init__([], log_prefix, passphrase=passphrase, ssh_path=ssh_path)
         self.profile = profile
         self.command_factory = command_factory
+        # This must not share RsyncRunner's flag: RsyncRunner resets it when a
+        # process starts, while this worker also has a potentially slow SSH
+        # preflight before that process exists.
+        self._cancelled = threading.Event()
 
     @Slot()
     def run(self) -> None:
         log_file = new_log_file(self.log_prefix)
         for host in fallback_hosts(self.profile):
+            if self._cancelled.is_set():
+                self.output.emit("Transfer was cancelled before rsync started.\n")
+                self.finished.emit(130)
+                return
             attempt_profile = profile_with_host(self.profile, host)
             self.output.emit(f"Checking {host} before transfer...\n")
-            result = run_ssh_test(attempt_profile, ssh_path=self.ssh_path, passphrase=self.passphrase, timeout=30)
+            result = run_ssh_test(
+                attempt_profile,
+                ssh_path=self.ssh_path,
+                passphrase=self.passphrase,
+                timeout=30,
+                cancel_event=self._cancelled,
+            )
+            if self._cancelled.is_set():
+                self.output.emit("Transfer was cancelled before rsync started.\n")
+                self.finished.emit(130)
+                return
             if result.returncode != 0:
                 self.output.emit(f"{host} unavailable for transfer: exit code {result.returncode}\n")
                 if result.output:
@@ -112,19 +130,39 @@ class FallbackCommandWorker(CommandWorker):
                         self.output.emit("\n")
                 continue
             self.output.emit(f"Using {host} for transfer.\n")
+            if self._cancelled.is_set():
+                self.output.emit("Transfer was cancelled before rsync started.\n")
+                self.finished.emit(130)
+                return
             try:
                 self.command = self.command_factory(attempt_profile)
             except Exception as exc:
                 self.output.emit(f"Could not build command: {exc}\n")
                 self.finished.emit(1)
                 return
+            if self._cancelled.is_set():
+                self.output.emit("Transfer was cancelled before rsync started.\n")
+                self.finished.emit(130)
+                return
             self.output.emit("Starting rsync. Large remote folders may spend time on the file list before file progress appears.\n")
-            code = self.runner.run(self.command, log_file, self.output.emit, passphrase=self.passphrase, ssh_path=self.ssh_path)
+            code = self.runner.run(
+                self.command,
+                log_file,
+                self.output.emit,
+                passphrase=self.passphrase,
+                ssh_path=self.ssh_path,
+                cancel_event=self._cancelled,
+            )
             self.output.emit(f"\nLog saved to: {log_file}\n")
             self.finished.emit(code)
             return
         self.output.emit("No QRIScloud SSH host was available for transfer.\n")
         self.finished.emit(124)
+
+    @Slot()
+    def cancel(self) -> None:
+        self._cancelled.set()
+        self.runner.cancel()
 
 
 class RecallMediciWorker(QObject):
@@ -370,6 +408,7 @@ class SshTestWorker(QObject):
         self.profile = profile
         self.ssh_path = ssh_path
         self.passphrase = passphrase
+        self._cancelled = threading.Event()
 
     @Slot()
     def run(self) -> None:
@@ -378,9 +417,22 @@ class SshTestWorker(QObject):
         log_parts: list[str] = []
         result = None
         for host in fallback_hosts(self.profile):
+            if self._cancelled.is_set():
+                self.output.emit("SSH test was cancelled.\n")
+                self.finished.emit(130)
+                return
             attempt_profile = profile_with_host(self.profile, host)
             self.output.emit(f"Trying {host}...\n")
-            result = run_ssh_test(attempt_profile, ssh_path=self.ssh_path, passphrase=self.passphrase)
+            result = run_ssh_test(
+                attempt_profile,
+                ssh_path=self.ssh_path,
+                passphrase=self.passphrase,
+                cancel_event=self._cancelled,
+            )
+            if self._cancelled.is_set():
+                self.output.emit("SSH test was cancelled.\n")
+                self.finished.emit(130)
+                return
             log_parts.append(f"=== {host} ===\n{result.output}\n")
             self.output.emit(result.output or "(SSH produced no output)\n")
             if result.returncode == 0:
@@ -392,6 +444,10 @@ class SshTestWorker(QObject):
         log_file.write_text("".join(log_parts), encoding="utf-8", errors="replace")
         self.output.emit(f"\nSSH test exited with code {result.returncode}\nLog saved to: {log_file}\n")
         self.finished.emit(result.returncode)
+
+    @Slot()
+    def cancel(self) -> None:
+        self._cancelled.set()
 
 
 class SyncCompareWorker(QObject):
@@ -511,14 +567,17 @@ class MainWindow(QMainWindow):
         self.current_finished_handled = False
         self.current_refresh_local = False
         self.current_refresh_remote = False
+        self._current_operation_id = 0
         self.remote_thread: QThread | None = None
         self.remote_worker: RemoteListWorker | None = None
+        self._remote_request_id = 0
         self.compare_thread: QThread | None = None
         self.compare_worker: SyncCompareWorker | None = None
         self.sync_selection: dict[str, object] | None = None
         self.remote_entries: list[RemoteEntry] = []
         self.remote_entries_path = ""
         self.session_passphrase: str | None = None
+        self._close_after_stop = False
 
         self.profile_combo = QComboBox()
         self.local_folder_edit = QLineEdit()
@@ -590,8 +649,8 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
 
-        profile_box = QGroupBox("Profile")
-        profile_layout = QGridLayout(profile_box)
+        self.profile_box = QGroupBox("Profile")
+        profile_layout = QGridLayout(self.profile_box)
         profile_layout.addWidget(QLabel("Profile"), 0, 0)
         profile_layout.addWidget(self.profile_combo, 0, 1)
         new_button = QPushButton("New")
@@ -603,7 +662,7 @@ class MainWindow(QMainWindow):
         profile_layout.addWidget(delete_button, 0, 4)
         profile_layout.addWidget(save_button, 0, 5)
         profile_layout.addWidget(self.status_label, 1, 0, 1, 6)
-        layout.addWidget(profile_box)
+        layout.addWidget(self.profile_box)
 
         browser = QSplitter()
         browser.addWidget(self._local_panel())
@@ -925,15 +984,29 @@ class MainWindow(QMainWindow):
             self._show_errors([str(exc)])
             return
 
+        requested_path = self.remote_path_edit.text().strip().rstrip("/") or "/"
+        request_context = (
+            profile.name,
+            profile.host,
+            profile.username,
+            profile.ssh_port,
+            profile.ssh_key_path,
+            requested_path,
+        )
+        self._remote_request_id += 1
+        request_id = self._remote_request_id
         self.remote_status_label.setText("Loading remote directory...")
         self._set_remote_busy(True)
         worker = RemoteListWorker(attempts[0][1], passphrase, attempts=attempts)
+        worker.request_id = request_id
+        worker.request_context = request_context
         thread = QThread(self)
         worker.moveToThread(thread)
         worker.finished.connect(self._remote_listing_finished)
-        worker.finished.connect(thread.quit)
+        worker.finished.connect(thread.quit, Qt.DirectConnection)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
+        thread.request_id = request_id
         thread.finished.connect(self._remote_thread_finished)
         thread.started.connect(worker.run)
         self.remote_thread = thread
@@ -942,8 +1015,32 @@ class MainWindow(QMainWindow):
 
     @Slot(object, str)
     def _remote_listing_finished(self, entries: object, error: str) -> None:
-        self._set_remote_busy(False)
+        worker = self.sender()
+        if not isinstance(worker, RemoteListWorker):
+            return
+        request_id = worker.request_id
+        request_context = worker.request_context
+        if request_id != self._remote_request_id:
+            return
+        profile = self.current_profile()
+        current_context = (
+            profile.name if profile else "",
+            profile.host if profile else "",
+            profile.username if profile else "",
+            profile.ssh_port if profile else 0,
+            profile.ssh_key_path if profile else "",
+            self.remote_path_edit.text().strip().rstrip("/") or "/",
+        )
+        if current_context != request_context:
+            self.remote_entries = []
+            self.remote_entries_path = ""
+            self.remote_table.setRowCount(0)
+            self.remote_status_label.setText("Remote directory changed while loading. Refresh to view it.")
+            return
         if error:
+            if "cancelled" in error.lower():
+                self.remote_status_label.setText("Remote listing cancelled.")
+                return
             self.remote_status_label.setText("Remote listing failed.")
             QMessageBox.warning(self, "Remote listing failed", error)
             return
@@ -953,9 +1050,17 @@ class MainWindow(QMainWindow):
         self._populate_remote_table(remote_entries)
         self.remote_status_label.setText(f"{len(remote_entries)} items in {self.remote_path_edit.text().strip()}")
 
+    @Slot()
     def _remote_thread_finished(self) -> None:
+        thread = self.sender()
+        if not isinstance(thread, QThread):
+            return
+        request_id = thread.request_id
+        if request_id != self._remote_request_id or self.remote_thread is not thread:
+            return
         self.remote_thread = None
         self.remote_worker = None
+        self._set_remote_busy(False)
 
     def _populate_remote_table(self, entries: list[RemoteEntry]) -> None:
         self.remote_table.setRowCount(len(entries))
@@ -1239,7 +1344,7 @@ class MainWindow(QMainWindow):
         worker.moveToThread(thread)
         worker.output.connect(self._append_log)
         worker.finished.connect(self._sync_compare_finished)
-        worker.finished.connect(thread.quit)
+        worker.finished.connect(thread.quit, Qt.DirectConnection)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._compare_thread_finished)
@@ -1452,8 +1557,12 @@ class MainWindow(QMainWindow):
         thread = QThread(self)
         worker.moveToThread(thread)
         worker.output.connect(self._append_log)
+        self._current_operation_id += 1
+        operation_id = self._current_operation_id
+        worker.operation_id = operation_id
+        thread.operation_id = operation_id
         worker.finished.connect(self._worker_finished)
-        worker.finished.connect(thread.quit)
+        worker.finished.connect(thread.quit, Qt.DirectConnection)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(self._current_thread_finished)
         thread.finished.connect(thread.deleteLater)
@@ -1471,7 +1580,11 @@ class MainWindow(QMainWindow):
 
     @Slot(int)
     def _worker_finished(self, code: int) -> None:
-        if self.current_finished_handled:
+        worker = self.sender()
+        if worker is None:
+            return
+        operation_id = getattr(worker, "operation_id", None)
+        if operation_id != self._current_operation_id or self.current_finished_handled:
             return
         self.current_finished_handled = True
         label = self.current_label or "Command"
@@ -1479,29 +1592,29 @@ class MainWindow(QMainWindow):
         if code == 0 and any(word in label.lower() for word in ("upload", "download", "dry run", "recall")):
             self.transfer_progress.setValue(100)
         self.transfer_status_label.setText(f"{label} finished with exit code {code}.")
-        self.current_thread = None
-        self.current_worker = None
-        self.current_label = ""
-        self._set_running(False)
-        self._run_post_worker_refresh()
 
     @Slot()
     def _current_thread_finished(self) -> None:
-        if self.current_finished_handled:
+        thread = self.sender()
+        if not isinstance(thread, QThread):
+            return
+        operation_id = getattr(thread, "operation_id", None)
+        if operation_id != self._current_operation_id or self.current_thread is not thread:
             return
         label = self.current_label or "Command"
-        self.current_finished_handled = True
-        self._append_log(f"\n{label} thread finished.\n")
-        self.transfer_status_label.setText(f"{label} finished.")
+        if not self.current_finished_handled:
+            self.current_finished_handled = True
+            self._append_log(f"\n{label} thread finished.\n")
+            self.transfer_status_label.setText(f"{label} finished.")
+        refresh_local = self.current_refresh_local
+        refresh_remote = self.current_refresh_remote
         self.current_thread = None
         self.current_worker = None
         self.current_label = ""
         self._set_running(False)
-        self._run_post_worker_refresh()
+        self._run_post_worker_refresh(refresh_local, refresh_remote)
 
-    def _run_post_worker_refresh(self) -> None:
-        refresh_local = self.current_refresh_local
-        refresh_remote = self.current_refresh_remote
+    def _run_post_worker_refresh(self, refresh_local: bool, refresh_remote: bool) -> None:
         self.current_refresh_local = False
         self.current_refresh_remote = False
         if refresh_local:
@@ -1510,7 +1623,7 @@ class MainWindow(QMainWindow):
             self._refresh_remote_table()
 
     def _cancel_current(self) -> None:
-        if isinstance(self.current_worker, (CommandWorker, RecallMediciWorker)):
+        if isinstance(self.current_worker, (CommandWorker, SshTestWorker, RecallMediciWorker)):
             self._append_log("\nCancelling current command...\n")
             self.current_worker.cancel()
         elif isinstance(self.compare_worker, SyncCompareWorker):
@@ -1519,7 +1632,51 @@ class MainWindow(QMainWindow):
         else:
             self._append_log("\nNothing cancellable is currently running.\n")
 
+    def closeEvent(self, event) -> None:
+        active_threads = [thread for thread in (self.current_thread, self.remote_thread, self.compare_thread) if thread and thread.isRunning()]
+        if not active_threads:
+            self._close_after_stop = False
+            event.accept()
+            return
+        if self._close_after_stop:
+            event.ignore()
+            return
+        answer = QMessageBox.question(
+            self,
+            "Operations running",
+            "An operation is still running. Cancel it and close QRIS Rsync Manager?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            event.ignore()
+            return
+        self._close_after_stop = True
+        self.transfer_status_label.setText("Stopping active operations before closing...")
+        if self.current_worker and hasattr(self.current_worker, "cancel"):
+            self.current_worker.cancel()
+        if self.remote_worker:
+            self.remote_worker.cancel()
+        if self.compare_worker:
+            self.compare_worker.cancel()
+        event.ignore()
+        QTimer.singleShot(100, self._close_when_operations_stop)
+
+    def _close_when_operations_stop(self) -> None:
+        if not self._close_after_stop:
+            return
+        active = any(
+            thread and thread.isRunning()
+            for thread in (self.current_thread, self.remote_thread, self.compare_thread)
+        )
+        if active:
+            QTimer.singleShot(100, self._close_when_operations_stop)
+            return
+        self.close()
+
     def _set_running(self, running: bool) -> None:
+        self.profile_box.setEnabled(not running and self.remote_thread is None and self.compare_thread is None)
+        self.remote_path_edit.setEnabled(not running and self.remote_thread is None and self.compare_thread is None)
         self.ssh_button.setEnabled(not running)
         self.remote_load_button.setEnabled(not running and self.remote_thread is None)
         self.remote_refresh_button.setEnabled(not running and self.remote_thread is None)
@@ -1541,6 +1698,8 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(running)
 
     def _set_remote_busy(self, busy: bool) -> None:
+        self.profile_box.setEnabled(not busy and self.current_thread is None and self.compare_thread is None)
+        self.remote_path_edit.setEnabled(not busy and self.current_thread is None and self.compare_thread is None)
         self.remote_load_button.setEnabled(not busy and self.current_thread is None)
         self.remote_refresh_button.setEnabled(not busy and self.current_thread is None)
         self.remote_up_button.setEnabled(not busy)
@@ -1550,6 +1709,8 @@ class MainWindow(QMainWindow):
         self.remote_delete_button.setEnabled(not busy and self.current_thread is None)
 
     def _set_compare_running(self, running: bool) -> None:
+        self.profile_box.setEnabled(not running and self.current_thread is None and self.remote_thread is None)
+        self.remote_path_edit.setEnabled(not running and self.current_thread is None and self.remote_thread is None)
         self.ssh_button.setEnabled(not running and self.current_thread is None)
         self.dry_run_button.setEnabled(not running and self.current_thread is None)
         self.download_dry_run_button.setEnabled(not running and self.current_thread is None)

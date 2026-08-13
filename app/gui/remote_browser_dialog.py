@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import threading
 
 from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
 from PySide6.QtWidgets import (
@@ -24,12 +25,15 @@ from app.core.remote_dirs import RemoteEntry, build_list_remote_entries_command,
 
 class RemoteListWorker(QObject):
     finished = Signal(object, str)
+    STOP_GRACE_SECONDS = 5.0
 
     def __init__(self, command: list[str], passphrase: str, attempts: list[tuple[str, list[str]]] | None = None) -> None:
         super().__init__()
         self.command = command
         self.passphrase = passphrase
         self.attempts = attempts or [("remote", command)]
+        self._cancelled = threading.Event()
+        self._process: subprocess.Popen[str] | None = None
 
     @Slot()
     def run(self) -> None:
@@ -38,29 +42,72 @@ class RemoteListWorker(QObject):
             creationflags = subprocess.CREATE_NO_WINDOW
         errors: list[str] = []
         for host, command in self.attempts:
+            if self._cancelled.is_set():
+                self.finished.emit([], "Remote listing was cancelled.")
+                return
             env = build_askpass_environment(self.passphrase, ssh_path=command[0])
             try:
-                completed = subprocess.run(
+                process = subprocess.Popen(
                     command,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
                     shell=False,
-                    timeout=60,
                     creationflags=creationflags,
                     env=env,
                 )
-                if completed.returncode == 0:
-                    self.finished.emit(parse_remote_entries(completed.stdout), "")
+                self._process = process
+                if self._cancelled.is_set():
+                    self._stop_process(process)
+                    self.finished.emit([], "Remote listing was cancelled.")
                     return
-                errors.append(f"{host}: {completed.stdout or f'exit code {completed.returncode}'}")
-            except subprocess.TimeoutExpired:
-                errors.append(f"{host}: remote listing timed out after 60 seconds.")
+                try:
+                    output, _ = process.communicate(timeout=60)
+                except subprocess.TimeoutExpired:
+                    output = self._stop_process(process)
+                    errors.append(f"{host}: remote listing timed out after 60 seconds.")
+                    continue
+                if self._cancelled.is_set():
+                    self.finished.emit([], "Remote listing was cancelled.")
+                    return
+                if process.returncode == 0:
+                    self.finished.emit(parse_remote_entries(output), "")
+                    return
+                errors.append(f"{host}: {output or f'exit code {process.returncode}'}")
             except OSError as exc:
                 errors.append(f"{host}: remote listing failed to start: {exc}")
             finally:
+                self._process = None
                 scrub_askpass_environment(env)
         self.finished.emit([], "\n".join(errors) or "Remote listing failed.")
+
+    @Slot()
+    def cancel(self) -> None:
+        self._cancelled.set()
+        process = self._process
+        if process and process.poll() is None:
+            process.terminate()
+            killer = threading.Timer(self.STOP_GRACE_SECONDS, self._kill_if_running, args=(process,))
+            killer.daemon = True
+            killer.start()
+
+    @staticmethod
+    def _kill_if_running(process: subprocess.Popen[str]) -> None:
+        if process.poll() is None:
+            process.kill()
+
+    @staticmethod
+    def _stop_process(process: subprocess.Popen[str]) -> str:
+        if process.poll() is not None:
+            output, _ = process.communicate()
+            return output or ""
+        process.terminate()
+        try:
+            output, _ = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            output, _ = process.communicate()
+        return output or ""
 
 
 class RemoteBrowserDialog(QDialog):
@@ -73,6 +120,7 @@ class RemoteBrowserDialog(QDialog):
         self.passphrase = passphrase
         self.selected_path = start_path.strip() or profile.remote_path
         self._thread: QThread | None = None
+        self._reject_when_stopped = False
         self._entries: list[RemoteEntry] = []
 
         self.path_edit = QLineEdit(self.selected_path)
@@ -149,12 +197,13 @@ class RemoteBrowserDialog(QDialog):
         self._set_busy(True)
         worker = RemoteListWorker(attempts[0][1], self.passphrase, attempts=attempts)
         thread = QThread(self)
+        thread.worker = worker
         worker.moveToThread(thread)
         worker.finished.connect(self._listing_finished)
-        worker.finished.connect(thread.quit)
+        worker.finished.connect(thread.quit, Qt.DirectConnection)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(lambda: setattr(self, "_thread", None))
+        thread.finished.connect(self._thread_finished)
         thread.started.connect(worker.run)
         self._thread = thread
         thread.start()
@@ -163,12 +212,33 @@ class RemoteBrowserDialog(QDialog):
     def _listing_finished(self, entries: object, error: str) -> None:
         self._set_busy(False)
         if error:
+            if "cancelled" in error.lower():
+                self.status_label.setText("Remote listing cancelled.")
+                return
             self.status_label.setText("Listing failed.")
             QMessageBox.warning(self, "Remote listing failed", error)
             return
         self._entries = list(entries)
         self._populate_table(self._entries)
         self.status_label.setText(f"{len(self._entries)} items in {self.selected_path}")
+
+    @Slot()
+    def _thread_finished(self) -> None:
+        self._thread = None
+        self._set_busy(False)
+        if self._reject_when_stopped:
+            self._reject_when_stopped = False
+            super().reject()
+
+    def reject(self) -> None:
+        if self._thread and self._thread.isRunning():
+            self._reject_when_stopped = True
+            self.status_label.setText("Cancelling remote listing...")
+            self.cancel_button.setEnabled(False)
+            if hasattr(self._thread, "worker"):
+                self._thread.worker.cancel()
+            return
+        super().reject()
 
     def _populate_table(self, entries: list[RemoteEntry]) -> None:
         self.table.setRowCount(len(entries))
