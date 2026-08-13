@@ -45,7 +45,7 @@ from app.core.file_scan import FolderScan, scan_folder
 from app.core.local_delete import LocalDeleteResult, delete_local_paths
 from app.core.medici import build_recall_medici_files_command, medici_path_for_remote_path
 from app.core.paths import app_data_dir, detect_ssh, is_executable_file
-from app.core.profiles import Profile, fallback_hosts, load_profiles, profile_with_host, save_profiles, upsert_profile
+from app.core.profiles import Profile, fallback_hosts, load_profiles_result, profile_with_host, save_profiles, upsert_profile
 from app.core.progress import parse_rsync_progress
 from app.core.remote_dirs import RemoteEntry, build_list_remote_entries_command
 from app.core.remote_ops import build_remote_delete_command, build_remote_mkdir_command, build_remote_move_command
@@ -967,9 +967,12 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("QRIS Rsync Manager")
-        self.resize(980, 720)
+        self.resize(1200, 800)
+        self.setMinimumSize(900, 650)
 
-        self.profiles = load_profiles()
+        profile_load = load_profiles_result()
+        self.profiles = profile_load.profiles
+        self._profile_load_diagnostics = profile_load.diagnostics
         self.current_thread: QThread | None = None
         self.current_worker: CommandWorker | SshTestWorker | RecallMediciWorker | FolderScanWorker | LocalDeleteWorker | None = None
         self.current_label = ""
@@ -1042,22 +1045,31 @@ class MainWindow(QMainWindow):
         self.transfer_scope_combo = QComboBox()
         self.transfer_scope_combo.addItem("Current folders", "folder")
         self.transfer_scope_combo.addItem("Selected files", "selected")
-        self.dry_run_button = QPushButton("Compare / dry-run")
+        self.dry_run_button = QPushButton("Compare upload")
         self.download_dry_run_button = QPushButton("Compare download")
-        self.build_selection_button = QPushButton("Build sync selection")
-        self.upload_selection_button = QPushButton("Upload compared files")
+        self.build_selection_button = QPushButton("Find changed files")
+        self.upload_selection_button = QPushButton("Upload changed files")
         self.upload_selection_button.setEnabled(False)
         self.upload_button = QPushButton("Upload folder")
-        self.recall_button = QPushButton("Recall tape")
+        self.recall_button = QPushButton("Recall from tape")
         self.download_button = QPushButton("Download folder")
         self.stop_button = QPushButton("Stop")
         self.stop_button.setEnabled(False)
+        self.selection_status_label = QLabel("Current folders")
+
+        self.dry_run_button.setToolTip("Compare upload changes only; does not transfer or delete files.")
+        self.download_dry_run_button.setToolTip("Compare download changes only; does not transfer or delete files.")
+        self.build_selection_button.setToolTip("Create a list of local files that are missing or changed remotely.")
+        self.upload_selection_button.setToolTip("Upload the missing or changed files found by Find changed files.")
+        self.recall_button.setToolTip("Request retrieval from Medici tape; this does not download files.")
 
         self._build_ui()
         self._set_local_root(str(Path.home()))
         self._load_profile_combo()
         self._update_status()
         self._update_transfer_scope_ui()
+        for diagnostic in self._profile_load_diagnostics:
+            self._append_log(f"Profile settings: {diagnostic}\n")
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -1085,19 +1097,20 @@ class MainWindow(QMainWindow):
         browser.setSizes([480, 480])
         layout.addWidget(browser, stretch=2)
 
-        button_row = QHBoxLayout()
-        button_row.addWidget(QLabel("Transfer scope"))
-        button_row.addWidget(self.transfer_scope_combo)
-        button_row.addWidget(self.ssh_button)
-        button_row.addWidget(self.dry_run_button)
-        button_row.addWidget(self.download_dry_run_button)
-        button_row.addWidget(self.build_selection_button)
-        button_row.addWidget(self.upload_selection_button)
-        button_row.addWidget(self.upload_button)
-        button_row.addWidget(self.recall_button)
-        button_row.addWidget(self.download_button)
-        button_row.addStretch()
-        button_row.addWidget(self.stop_button)
+        button_row = QGridLayout()
+        button_row.addWidget(QLabel("Transfer scope"), 0, 0)
+        button_row.addWidget(self.transfer_scope_combo, 0, 1)
+        button_row.addWidget(self.selection_status_label, 0, 2)
+        button_row.addWidget(self.ssh_button, 0, 3)
+        button_row.addWidget(self.dry_run_button, 0, 4)
+        button_row.addWidget(self.download_dry_run_button, 0, 5)
+        button_row.addWidget(self.build_selection_button, 0, 6)
+        button_row.addWidget(self.upload_selection_button, 1, 3)
+        button_row.addWidget(self.upload_button, 1, 4)
+        button_row.addWidget(self.recall_button, 1, 5)
+        button_row.addWidget(self.download_button, 1, 6)
+        button_row.addWidget(self.stop_button, 1, 7)
+        button_row.setColumnStretch(2, 1)
         layout.addLayout(button_row)
 
         progress_row = QHBoxLayout()
@@ -1153,37 +1166,51 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.remote_status_label)
         return box
 
-    def _folder_row(self) -> QHBoxLayout:
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Path"))
-        row.addWidget(self.local_folder_edit)
+    def _folder_row(self) -> QVBoxLayout:
+        rows = QVBoxLayout()
+        path_row = QHBoxLayout()
+        path_row.addWidget(QLabel("Path"))
+        path_row.addWidget(self.local_folder_edit, stretch=1)
         button = QPushButton("Browse")
         button.clicked.connect(self._browse_local_folder)
-        row.addWidget(button)
-        row.addWidget(self.local_up_button)
-        row.addWidget(self.local_refresh_button)
-        row.addWidget(self.local_new_folder_button)
-        row.addWidget(self.local_rename_button)
-        row.addWidget(self.local_delete_button)
-        return row
+        path_row.addWidget(button)
+        action_row = QHBoxLayout()
+        action_row.addWidget(self.local_up_button)
+        action_row.addWidget(self.local_refresh_button)
+        action_row.addWidget(self.local_new_folder_button)
+        action_row.addWidget(self.local_rename_button)
+        action_row.addWidget(self.local_delete_button)
+        action_row.addStretch()
+        rows.addLayout(path_row)
+        rows.addLayout(action_row)
+        return rows
 
-    def _remote_path_row(self) -> QHBoxLayout:
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Path"))
-        row.addWidget(self.remote_path_edit)
-        row.addWidget(self.remote_load_button)
-        row.addWidget(self.remote_up_button)
-        row.addWidget(self.remote_refresh_button)
-        row.addWidget(self.remote_new_folder_button)
-        row.addWidget(self.remote_rename_button)
-        row.addWidget(self.remote_delete_button)
-        return row
+    def _remote_path_row(self) -> QVBoxLayout:
+        rows = QVBoxLayout()
+        path_row = QHBoxLayout()
+        path_row.addWidget(QLabel("Path"))
+        path_row.addWidget(self.remote_path_edit, stretch=1)
+        path_row.addWidget(self.remote_load_button)
+        action_row = QHBoxLayout()
+        action_row.addWidget(self.remote_up_button)
+        action_row.addWidget(self.remote_refresh_button)
+        action_row.addWidget(self.remote_new_folder_button)
+        action_row.addWidget(self.remote_rename_button)
+        action_row.addWidget(self.remote_delete_button)
+        action_row.addStretch()
+        rows.addLayout(path_row)
+        rows.addLayout(action_row)
+        return rows
 
-    def _load_profile_combo(self) -> None:
+    def _load_profile_combo(self, selected_name: str | None = None) -> None:
         self.profile_combo.blockSignals(True)
         self.profile_combo.clear()
         for profile in self.profiles:
             self.profile_combo.addItem(profile.name)
+        if selected_name:
+            index = self.profile_combo.findText(selected_name)
+            if index >= 0:
+                self.profile_combo.setCurrentIndex(index)
         self.profile_combo.blockSignals(False)
         self._profile_changed()
 
@@ -1204,9 +1231,14 @@ class MainWindow(QMainWindow):
     def _new_profile(self) -> None:
         dialog = ProfileDialog(parent=self)
         if dialog.exec() == ProfileDialog.Accepted:
-            self.profiles = upsert_profile(self.profiles, dialog.profile())
-            save_profiles(self.profiles)
-            self._load_profile_combo()
+            profile = dialog.profile()
+            if any(existing.name == profile.name for existing in self.profiles):
+                self._show_errors([f"A profile named '{profile.name}' already exists. Choose a unique name."])
+                return
+            candidate = upsert_profile(self.profiles, profile)
+            if self._persist_profiles(candidate):
+                self.profiles = candidate
+                self._load_profile_combo(profile.name)
 
     def _edit_profile(self) -> None:
         profile = self.current_profile()
@@ -1214,9 +1246,16 @@ class MainWindow(QMainWindow):
             return
         dialog = ProfileDialog(profile, self)
         if dialog.exec() == ProfileDialog.Accepted:
-            self.profiles = upsert_profile(self.profiles, dialog.profile())
-            save_profiles(self.profiles)
-            self._load_profile_combo()
+            updated = dialog.profile()
+            index = self.profile_combo.currentIndex()
+            if any(position != index and existing.name == updated.name for position, existing in enumerate(self.profiles)):
+                self._show_errors([f"A profile named '{updated.name}' already exists. Choose a unique name."])
+                return
+            candidate = list(self.profiles)
+            candidate[index] = updated
+            if self._persist_profiles(candidate):
+                self.profiles = candidate
+                self._load_profile_combo(updated.name)
 
     def _delete_profile(self) -> None:
         index = self.profile_combo.currentIndex()
@@ -1227,13 +1266,26 @@ class MainWindow(QMainWindow):
             return
         removed = self.profiles[index]
         if QMessageBox.question(self, "Delete profile", f"Delete profile '{removed.name}'?") == QMessageBox.Yes:
-            del self.profiles[index]
-            save_profiles(self.profiles)
-            self._load_profile_combo()
+            candidate = [profile for position, profile in enumerate(self.profiles) if position != index]
+            if self._persist_profiles(candidate):
+                self.profiles = candidate
+                self._load_profile_combo(candidate[min(index, len(candidate) - 1)].name)
 
     def _save_profiles(self) -> None:
-        save_profiles(self.profiles)
-        self._append_log("Profiles saved.\n")
+        if self._persist_profiles(self.profiles):
+            self._append_log("Profiles saved.\n")
+
+    def _persist_profiles(self, candidate: list[Profile]) -> bool:
+        try:
+            save_profiles(candidate)
+        except OSError as exc:
+            QMessageBox.critical(
+                self,
+                "Could not save profiles",
+                f"Profile changes were not saved. Check that the settings folder is writable and has free space.\n\n{exc}",
+            )
+            return False
+        return True
 
     def _browse_local_folder(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Select local folder", str(Path.home()))
@@ -2267,11 +2319,15 @@ class MainWindow(QMainWindow):
             self.download_button.setText(f"Download selected files ({len(remote_files):,})")
             self.dry_run_button.setText(f"Compare selected files ({len(local_files):,})")
             self.download_dry_run_button.setText(f"Compare selected files ({len(remote_files):,})")
+            self.selection_status_label.setText(
+                f"Selected: {len(local_files):,} local · {len(remote_files):,} remote"
+            )
         else:
             self.upload_button.setText("Upload folder")
             self.download_button.setText("Download folder")
             self.dry_run_button.setText("Compare upload folder")
             self.download_dry_run_button.setText("Compare download folder")
+            self.selection_status_label.setText("Current folders")
 
         idle = self.current_thread is None and self.compare_thread is None and self.remote_thread is None
         self.upload_button.setEnabled(idle and (not selected_scope or bool(local_files)))
@@ -2334,9 +2390,8 @@ class MainWindow(QMainWindow):
             return
         rsync_state = "found" if is_executable_file(profile.rsync_path) else "not found"
         ssh_state = "found" if is_executable_file(self.detected_ssh) else "not found"
-        self.status_label.setText(
-            f"rsync: {rsync_state} ({profile.rsync_path}) | ssh: {ssh_state} ({self.detected_ssh})"
-        )
+        self.status_label.setText(f"Tools: rsync {rsync_state} · SSH {ssh_state}")
+        self.status_label.setToolTip(f"rsync: {profile.rsync_path}\nSSH: {self.detected_ssh}")
 
 
 def show() -> int:

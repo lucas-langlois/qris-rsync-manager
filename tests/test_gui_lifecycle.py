@@ -280,3 +280,30 @@ def test_close_suppresses_successful_scan_continuation(monkeypatch, tmp_path) ->
     assert not called
     window._close_after_stop = False
     window.close()
+
+
+def test_profile_save_failure_preserves_in_memory_profiles(monkeypatch, tmp_path) -> None:
+    window = _window(monkeypatch, tmp_path)
+    original = list(window.profiles)
+    messages: list[str] = []
+    monkeypatch.setattr("app.gui.main_window.save_profiles", lambda _profiles: (_ for _ in ()).throw(OSError("disk full")))
+    monkeypatch.setattr(QMessageBox, "critical", lambda _parent, _title, message, *_args: messages.append(message))
+
+    saved = window._persist_profiles([*original, original[0]])
+
+    assert not saved
+    assert window.profiles == original
+    assert "disk full" in messages[0]
+    window.close()
+
+
+def test_path_fields_keep_useful_width_at_normal_window_size(monkeypatch, tmp_path) -> None:
+    app = _application()
+    window = _window(monkeypatch, tmp_path)
+    window.resize(1200, 800)
+    window.show()
+    app.processEvents()
+
+    assert window.local_folder_edit.width() >= 300
+    assert window.remote_path_edit.width() >= 300
+    window.close()

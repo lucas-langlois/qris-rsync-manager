@@ -115,7 +115,7 @@ The app may ask for the SSH key passphrase. It keeps the passphrase in memory fo
 3. Click **Test SSH**.
 4. Select a local folder in the left pane.
 5. Load and browse the remote folder in the right pane.
-6. Use **Compare / dry-run** before upload.
+6. Use **Compare upload** before upload.
 7. Use **Upload** to upload the local folder contents to the remote path.
 8. Use **Compare download** before download.
 9. Use **Download** to download remote contents into the selected local folder.
@@ -137,7 +137,7 @@ If the host is `ssh1.qriscloud.org.au` or `ssh2.qriscloud.org.au`, the app autom
 
 ## Sync Selection
 
-Use **Build sync selection** to compare the current local folder against the current remote path.
+Use **Find changed files** to compare the current local folder against the current remote path.
 
 The comparison checks:
 
@@ -147,7 +147,7 @@ The comparison checks:
 
 It creates a temporary rsync `--files-from` list containing files that are missing remotely or appear changed.
 
-Use **Upload selection** to upload only those files.
+Use **Upload changed files** to upload only those files. This differs from **Compare upload**: it creates a reusable list of missing or changed files for a selective upload.
 
 Notes:
 
@@ -211,7 +211,7 @@ Check:
 
 The app uses rsync `--outbuf=N` and `--info=progress2`, but rsync may still spend time building the incremental file list before progress begins.
 
-### Build sync selection seems slow
+### Find changed files seems slow
 
 The remote manifest step recursively scans the selected remote path. This can be slow for large QRIScloud folders. Use **Stop** to cancel it.
 

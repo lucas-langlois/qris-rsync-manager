@@ -1,8 +1,20 @@
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 
-from app.core.profiles import Profile, fallback_hosts, load_profiles, profile_with_host, save_profiles, upsert_profile
+import pytest
+
+from app.core.profiles import (
+    Profile,
+    fallback_hosts,
+    load_profiles,
+    load_profiles_result,
+    profile_with_host,
+    save_profiles,
+    upsert_profile,
+)
 
 
 def test_profile_save_load_round_trip(tmp_path: Path) -> None:
@@ -54,3 +66,128 @@ def test_profile_with_host_preserves_profile_fields() -> None:
     assert updated.name == "Q8940"
     assert updated.username == "lucas"
     assert updated.host == "ssh2.qriscloud.org.au"
+
+
+def test_load_skips_malformed_records_and_reports_diagnostics(tmp_path: Path) -> None:
+    path = tmp_path / "profiles.json"
+    good = Profile(name="Good", username="alice", rsync_path="rsync.exe")
+    path.write_text(
+        json.dumps([good.__dict__, {"name": "Missing fields"}, "not a record", {**good.__dict__, "name": "Bad port", "ssh_port": "22"}]),
+        encoding="utf-8",
+    )
+
+    result = load_profiles_result(path)
+
+    assert [profile.name for profile in result.profiles] == ["Good"]
+    assert result.source == "primary"
+    assert len(result.diagnostics) == 3
+    assert "ssh_port" in result.diagnostics[-1]
+
+
+def test_load_rejects_out_of_range_port(tmp_path: Path) -> None:
+    path = tmp_path / "profiles.json"
+    path.write_text(json.dumps([{**Profile(rsync_path="rsync.exe").__dict__, "ssh_port": 70000}]), encoding="utf-8")
+
+    result = load_profiles_result(path)
+
+    assert result.source == "default"
+    assert any("ssh_port" in message for message in result.diagnostics)
+
+
+def test_save_replaces_file_atomically_and_keeps_previous_backup(tmp_path: Path) -> None:
+    path = tmp_path / "profiles.json"
+    save_profiles([Profile(name="Old", rsync_path="rsync.exe")], path)
+
+    save_profiles([Profile(name="New", rsync_path="rsync.exe")], path)
+
+    assert [profile.name for profile in load_profiles(path)] == ["New"]
+    assert [profile.name for profile in load_profiles(path.with_name("profiles.json.bak"))] == ["Old"]
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_failed_replace_leaves_prior_data_recoverable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "profiles.json"
+    save_profiles([Profile(name="Old", rsync_path="rsync.exe")], path)
+    actual_replace = os.replace
+
+    def fail_primary_replace(source: str | Path, destination: str | Path) -> None:
+        if Path(destination) == path:
+            raise OSError("simulated replace failure")
+        actual_replace(source, destination)
+
+    monkeypatch.setattr("app.core.profiles.os.replace", fail_primary_replace)
+
+    with pytest.raises(OSError, match="simulated"):
+        save_profiles([Profile(name="New", rsync_path="rsync.exe")], path)
+
+    assert [profile.name for profile in load_profiles(path)] == ["Old"]
+    assert [profile.name for profile in load_profiles(path.with_name("profiles.json.bak"))] == ["Old"]
+
+
+def test_failed_temporary_write_leaves_prior_data_recoverable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "profiles.json"
+    save_profiles([Profile(name="Old", rsync_path="rsync.exe")], path)
+
+    def fail_write(*_args: object, **_kwargs: object) -> Path:
+        raise OSError("simulated write failure")
+
+    monkeypatch.setattr("app.core.profiles._write_temporary", fail_write)
+
+    with pytest.raises(OSError, match="simulated"):
+        save_profiles([Profile(name="New", rsync_path="rsync.exe")], path)
+
+    assert [profile.name for profile in load_profiles(path)] == ["Old"]
+    assert [profile.name for profile in load_profiles(path.with_name("profiles.json.bak"))] == ["Old"]
+
+
+def test_load_uses_backup_when_primary_is_malformed(tmp_path: Path) -> None:
+    path = tmp_path / "profiles.json"
+    save_profiles([Profile(name="Recover", rsync_path="rsync.exe")], path)
+    path.write_text("{not JSON", encoding="utf-8")
+
+    result = load_profiles_result(path)
+
+    assert result.source == "backup"
+    assert [profile.name for profile in result.profiles] == ["Recover"]
+    assert any("Could not read primary" in message for message in result.diagnostics)
+
+
+def test_missing_profile_file_uses_default_without_false_warning(tmp_path: Path) -> None:
+    result = load_profiles_result(tmp_path / "missing.json")
+
+    assert result.source == "default"
+    assert result.diagnostics == ()
+
+
+def test_save_after_backup_recovery_preserves_good_backup_on_primary_replace_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "profiles.json"
+    save_profiles([Profile(name="Recover", rsync_path="rsync.exe")], path)
+    path.write_text("{corrupt", encoding="utf-8")
+    actual_replace = os.replace
+
+    def fail_primary_replace(source: str | Path, destination: str | Path) -> None:
+        if Path(destination) == path:
+            raise OSError("primary replace failed")
+        actual_replace(source, destination)
+
+    monkeypatch.setattr("app.core.profiles.os.replace", fail_primary_replace)
+
+    with pytest.raises(OSError, match="primary replace failed"):
+        save_profiles([Profile(name="New", rsync_path="rsync.exe")], path)
+
+    result = load_profiles_result(path)
+    assert result.source == "backup"
+    assert [profile.name for profile in result.profiles] == ["Recover"]
+
+
+def test_successful_save_after_backup_recovery_keeps_prior_good_backup(tmp_path: Path) -> None:
+    path = tmp_path / "profiles.json"
+    save_profiles([Profile(name="Recover", rsync_path="rsync.exe")], path)
+    path.write_text("{corrupt", encoding="utf-8")
+
+    save_profiles([Profile(name="New", rsync_path="rsync.exe")], path)
+
+    assert [profile.name for profile in load_profiles(path)] == ["New"]
+    assert [profile.name for profile in load_profiles(path.with_name("profiles.json.bak"))] == ["Recover"]
