@@ -106,7 +106,7 @@ class UploadPackage:
 
     def cleanup(self) -> str | None:
         try:
-            shutil.rmtree(self.work_dir)
+            shutil.rmtree(_windows_io_path(self.work_dir))
         except FileNotFoundError:
             return None
         except OSError as exc:
@@ -244,7 +244,7 @@ def build_upload_package(
                 for group in folder_plan.groups:
                     members = member_map[group.category]
                     destination = payload_dir / Path(group.relative_folder) if group.relative_folder else payload_dir
-                    destination.mkdir(parents=True, exist_ok=True)
+                    os.makedirs(_windows_io_path(destination), exist_ok=True)
                     archive_path = destination / group.archive_name
                     inventory_path = destination / group.inventory_name
                     _emit(progress_callback, f"Creating {group.category} archive: {archive_path.name}")
@@ -258,8 +258,8 @@ def build_upload_package(
                     )
                     _write_inventory(inventory_path, group, members)
                     stable_mtime = max(item.modified_ns for item in members) / 1_000_000_000
-                    os.utime(archive_path, (stable_mtime, stable_mtime))
-                    os.utime(inventory_path, (stable_mtime, stable_mtime))
+                    os.utime(_windows_io_path(archive_path), (stable_mtime, stable_mtime))
+                    os.utime(_windows_io_path(inventory_path), (stable_mtime, stable_mtime))
                     archive_count += 1
                     inventory_count += 1
                     for member in members:
@@ -407,7 +407,10 @@ def _write_tar(
                     now = time.monotonic()
                     if now - last_report >= 2.0:
                         last_report = now
-                        written = destination.stat().st_size if destination.exists() else 0
+                        try:
+                            written = os.stat(_windows_io_path(destination)).st_size
+                        except FileNotFoundError:
+                            written = 0
                         percent = min(99, int(written * 100 / total_bytes))
                         if percent >= last_percent + 5:
                             last_percent = percent
@@ -428,7 +431,7 @@ def _write_tar(
         if process is not None and process.poll() is None:
             _stop_native_tar(process)
         try:
-            destination.unlink()
+            os.unlink(_windows_io_path(destination))
         except FileNotFoundError:
             pass
         raise
@@ -514,7 +517,7 @@ def _stop_native_tar(process: subprocess.Popen[str]) -> None:
 
 
 def _write_inventory(destination: Path, group: ArchiveGroupPlan, members: list[FileSnapshot]) -> None:
-    with destination.open("w", encoding="utf-8", newline="\n") as inventory:
+    with open(_windows_io_path(destination), "w", encoding="utf-8", newline="\n") as inventory:
         inventory.write("# QRIS Rsync Manager archive inventory v1\n")
         inventory.write(f"# archive: {group.archive_name}\n")
         inventory.write(f"# category: {group.category}\n")
@@ -523,6 +526,16 @@ def _write_inventory(destination: Path, group: ArchiveGroupPlan, members: list[F
         for member in members:
             modified = datetime.fromtimestamp(member.modified_ns / 1_000_000_000, timezone.utc)
             inventory.write(f"{member.path.name}\t{member.size}\t{modified.isoformat()}\n")
+
+
+def _windows_io_path(path: str | Path) -> str:
+    """Return an extended Windows path so packaged builds can exceed MAX_PATH."""
+    raw = os.path.abspath(os.fspath(path))
+    if not sys.platform.startswith("win") or raw.startswith("\\\\?\\"):
+        return raw
+    if raw.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + raw[2:]
+    return "\\\\?\\" + raw
 
 
 def _validate_root(root: Path) -> None:

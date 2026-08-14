@@ -301,6 +301,7 @@ class PackagedUploadWorker(QObject):
         self.include_source_directory = include_source_directory
         self.runner = RsyncRunner()
         self._cancelled = threading.Event()
+        self._log_file: Path | None = None
 
     @Slot()
     def run(self) -> None:
@@ -309,23 +310,24 @@ class PackagedUploadWorker(QObject):
         code = 1
         try:
             log_file = new_log_file(f"packaged_upload_{self.profile.name}")
+            self._log_file = log_file
             attempt_profile = self._available_profile()
             if attempt_profile is None:
                 code = 130 if self._cancelled.is_set() else 124
                 return
-            self.output.emit(
+            self._emit(
                 "Preparing uncompressed media archives. Source files will not be changed; "
                 "press Stop to cancel.\n"
             )
             package = build_upload_package(
                 self.plan,
                 cancel_event=self._cancelled,
-                progress_callback=lambda message: self.output.emit(message + "\n"),
+                progress_callback=lambda message: self._emit(message + "\n"),
             )
             if self._cancelled.is_set():
                 code = 130
                 return
-            self.output.emit(
+            self._emit(
                 f"Prepared {package.archive_count:,} TAR archive(s) and "
                 f"{package.inventory_count:,} inventory file(s).\n"
             )
@@ -358,31 +360,31 @@ class PackagedUploadWorker(QObject):
             )
             code = self._run_command(payload_command, log_file, "Uploading TAR archives and inventories")
         except ArchiveCancelled:
-            self.output.emit("Archive preparation was cancelled.\n")
+            self._emit("Archive preparation was cancelled.\n")
             code = 130
         except Exception as exc:
-            self.output.emit(f"Packaged upload failed: {exc}\n")
+            self._emit(f"Packaged upload failed: {exc}\n")
             code = 1
         finally:
             if package is not None:
                 cleanup_error = package.cleanup()
                 if cleanup_error:
-                    self.output.emit(cleanup_error + "\nPlease ask local IT to remove that folder after closing the app.\n")
+                    self._emit(cleanup_error + "\nPlease ask local IT to remove that folder after closing the app.\n")
                     if code == 0:
                         code = 1
                 else:
-                    self.output.emit("Removed temporary archive files.\n")
-            if log_file is not None:
+                    self._emit("Removed temporary archive files.\n")
+            if log_file is not None and log_file.exists():
                 self.output.emit(f"\nLog saved to: {log_file}\n")
             self.finished.emit(code)
 
     def _available_profile(self) -> Profile | None:
         for host in fallback_hosts(self.profile):
             if self._cancelled.is_set():
-                self.output.emit("Upload cancelled before packaging started.\n")
+                self._emit("Upload cancelled before packaging started.\n")
                 return None
             attempt = profile_with_host(self.profile, host)
-            self.output.emit(f"Checking {host} before packaged upload...\n")
+            self._emit(f"Checking {host} before packaged upload...\n")
             result = run_ssh_test(
                 attempt,
                 ssh_path=self.ssh_path,
@@ -391,21 +393,21 @@ class PackagedUploadWorker(QObject):
                 cancel_event=self._cancelled,
             )
             if self._cancelled.is_set():
-                self.output.emit("Upload cancelled before packaging started.\n")
+                self._emit("Upload cancelled before packaging started.\n")
                 return None
             if result.returncode == 0:
-                self.output.emit(f"Using {host} for packaged upload.\n")
+                self._emit(f"Using {host} for packaged upload.\n")
                 return attempt
-            self.output.emit(f"{host} unavailable: exit code {result.returncode}\n")
+            self._emit(f"{host} unavailable: exit code {result.returncode}\n")
             if result.output:
-                self.output.emit(result.output + ("" if result.output.endswith("\n") else "\n"))
-        self.output.emit("No QRIScloud SSH host was available for packaged upload.\n")
+                self._emit(result.output + ("" if result.output.endswith("\n") else "\n"))
+        self._emit("No QRIScloud SSH host was available for packaged upload.\n")
         return None
 
     def _run_command(self, command: list[str], log_file: Path, message: str) -> int:
         if self._cancelled.is_set():
             return 130
-        self.output.emit(message + "...\n")
+        self._emit(message + "...\n")
         return self.runner.run(
             command,
             log_file,
@@ -414,6 +416,16 @@ class PackagedUploadWorker(QObject):
             ssh_path=self.ssh_path,
             cancel_event=self._cancelled,
         )
+
+    def _emit(self, message: str) -> None:
+        if self._log_file is not None:
+            try:
+                self._log_file.parent.mkdir(parents=True, exist_ok=True)
+                with self._log_file.open("a", encoding="utf-8", errors="replace") as log:
+                    log.write(message)
+            except OSError:
+                pass
+        self.output.emit(message)
 
     @Slot()
     def cancel(self) -> None:

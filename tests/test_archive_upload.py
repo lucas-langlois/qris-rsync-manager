@@ -3,6 +3,7 @@ from __future__ import annotations
 import tarfile
 import threading
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,7 @@ from app.core.archive_upload import (
     FileSnapshot,
     _native_tar_command,
     _native_tar_commands,
+    _windows_io_path,
     analyze_upload_tree,
     build_upload_package,
 )
@@ -244,3 +246,24 @@ def test_build_refuses_exact_tree_change_after_confirmation(tmp_path: Path) -> N
         build_upload_package(plan)
 
     assert not list(tmp_path.glob(".survey.qris-upload-*"))
+
+
+@pytest.mark.skipif(not sys.platform.startswith("win"), reason="Windows extended-path regression")
+def test_package_writes_inventory_beyond_windows_max_path(tmp_path: Path) -> None:
+    root = tmp_path / "survey"
+    long_folder = root / ("D" * 80)
+    _write(long_folder / "one.jpg", b"123")
+    _write(long_folder / "two.jpg", b"456")
+    plan = analyze_upload_tree(root, min_flat_files=1, min_folder_bytes=5)
+
+    package = build_upload_package(plan)
+    try:
+        inventory = package.payload_dir / long_folder.name / f"{long_folder.name}__photos.tar.inventory.txt"
+        assert len(str(inventory)) > 260
+        with open(_windows_io_path(inventory), encoding="utf-8") as inventory_file:
+            contents = inventory_file.read()
+        assert "one.jpg" in contents
+        assert "two.jpg" in contents
+    finally:
+        cleanup_error = package.cleanup()
+    assert cleanup_error is None

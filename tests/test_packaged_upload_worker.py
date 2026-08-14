@@ -92,3 +92,23 @@ def test_packaged_worker_preserves_source_folder_for_both_upload_phases(monkeypa
     assert not commands[0][-2].endswith("/")
     assert commands[0][-1] == "user@ssh1.qriscloud.org.au:/data/Q0101/"
     assert commands[1][-1] == "user@ssh1.qriscloud.org.au:/data/Q0101/source/"
+
+
+def test_packaging_failure_is_written_to_its_own_log(monkeypatch, tmp_path: Path) -> None:
+    plan = _plan(tmp_path)
+    profile = Profile(name="Q0101", username="user", host="host", rsync_path="rsync.exe")
+    worker = PackagedUploadWorker(profile, plan, "/data/Q0101", dry_run=False)
+    log_file = tmp_path / "packaged_failure.log"
+    monkeypatch.setattr(worker, "_available_profile", lambda: profile)
+    monkeypatch.setattr("app.gui.main_window.new_log_file", lambda _prefix: log_file)
+    monkeypatch.setattr(
+        "app.gui.main_window.build_upload_package",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(FileNotFoundError("inventory path failed")),
+    )
+    results: list[int] = []
+    worker.finished.connect(results.append)
+
+    worker.run()
+
+    assert results == [1]
+    assert "Packaged upload failed: inventory path failed" in log_file.read_text(encoding="utf-8")
