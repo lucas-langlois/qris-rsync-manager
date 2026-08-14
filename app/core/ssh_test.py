@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 
 from .askpass import build_askpass_environment, scrub_askpass_environment
-from .paths import detect_ssh
+from .paths import detect_ssh, ssh_host_key_options
 from .profiles import Profile
 from .rsync_command import SSH_KEEPALIVE_OPTIONS
 
@@ -20,11 +20,13 @@ class CommandResult:
 
 def build_ssh_test_command(profile: Profile, ssh_path: str | None = None, batch_mode: bool = True) -> list[str]:
     clean = profile.normalized()
+    executable = ssh_path or detect_ssh()
     command = [
-        ssh_path or detect_ssh(),
+        executable,
         "-p",
         str(clean.ssh_port),
         *SSH_KEEPALIVE_OPTIONS,
+        *ssh_host_key_options(executable),
         "-o",
         "ConnectTimeout=15",
         "-o",

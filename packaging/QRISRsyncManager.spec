@@ -1,16 +1,30 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 from pathlib import Path
+import os
+import sys
 
 
 project_root = Path(SPECPATH).parent
 runtime_hook = project_root / "packaging" / "pyinstaller_runtime_hook.py"
+conda_prefix = Path(os.environ.get("CONDA_PREFIX", sys.prefix))
+
+# PyInstaller does not always discover transitive dependencies of Python's
+# conda-built extension modules. Bundle these next to the executable payload so
+# _ctypes and _bz2 work on machines that do not have this conda environment.
+required_conda_dlls = [
+    conda_prefix / "Library" / "bin" / "ffi-8.dll",
+    conda_prefix / "Library" / "bin" / "libbz2.dll",
+]
+missing_conda_dlls = [str(path) for path in required_conda_dlls if not path.is_file()]
+if missing_conda_dlls:
+    raise RuntimeError("Required conda runtime DLLs are missing: " + ", ".join(missing_conda_dlls))
 
 
 a = Analysis(
     [str(project_root / "app" / "main.py")],
     pathex=[str(project_root)],
-    binaries=[],
+    binaries=[(str(path), ".") for path in required_conda_dlls],
     datas=[],
     hiddenimports=[
         "PySide6",

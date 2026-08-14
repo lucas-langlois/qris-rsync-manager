@@ -282,6 +282,8 @@ class SetupGuideDialog(QWizard):
             _paragraph(
                 "<ol><li>Review and save the profile form.</li><li>Select it and click <b>Test SSH</b>.</li>"
                 "<li>Enter the SSH-key passphrase you created. It stays in memory only for this app session.</li>"
+                "<li>On the first connection, the app securely records the QRIScloud server identity for "
+                "your Windows account. Future connections reject an unexpected identity change.</li>"
                 "<li>After the test succeeds, click <b>Load</b> in the Remote panel.</li>"
                 "<li>Confirm the path is your collection and use <b>Compare upload</b> or "
                 "<b>Compare download</b> before the first transfer.</li></ol>"

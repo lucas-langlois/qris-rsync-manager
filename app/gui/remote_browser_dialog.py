@@ -4,7 +4,7 @@ import subprocess
 import sys
 import threading
 
-from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
+from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
@@ -20,7 +20,12 @@ from PySide6.QtWidgets import (
 
 from app.core.askpass import build_askpass_environment, scrub_askpass_environment
 from app.core.profiles import Profile, fallback_hosts, profile_with_host
-from app.core.remote_dirs import RemoteEntry, build_list_remote_entries_command, parse_remote_entries
+from app.core.remote_dirs import (
+    RemoteDirectoryCache,
+    RemoteEntry,
+    build_list_remote_entries_command,
+    parse_remote_entries,
+)
 
 
 class RemoteListWorker(QObject):
@@ -122,8 +127,11 @@ class RemoteBrowserDialog(QDialog):
         self.passphrase = passphrase
         self.selected_path = start_path.strip() or profile.remote_path
         self._thread: QThread | None = None
+        self._pending_path: str | None = None
+        self._pending_force = False
         self._reject_when_stopped = False
         self._entries: list[RemoteEntry] = []
+        self._directory_cache = RemoteDirectoryCache()
 
         self.path_edit = QLineEdit(self.selected_path)
         self.status_label = QLabel()
@@ -168,14 +176,33 @@ class RemoteBrowserDialog(QDialog):
 
     def _connect(self) -> None:
         self.up_button.clicked.connect(self.go_up)
-        self.refresh_button.clicked.connect(self.refresh)
+        self.refresh_button.clicked.connect(lambda: self.refresh(force=True))
         self.open_button.clicked.connect(self.open_selected)
         self.use_button.clicked.connect(self.use_path)
         self.cancel_button.clicked.connect(self.reject)
-        self.path_edit.returnPressed.connect(self.refresh)
+        self.path_edit.returnPressed.connect(lambda: self.refresh(force=True))
 
-    def refresh(self) -> None:
+    def refresh(self, force: bool = False) -> None:
+        requested_path = self.path_edit.text().strip().rstrip("/") or "/"
         if self._thread:
+            self._pending_path = requested_path
+            self._pending_force = self._pending_force or force
+            cached = None if force else self._directory_cache.get(self.profile, requested_path)
+            if cached is not None:
+                self._entries = cached
+                self._populate_table(cached)
+                self.status_label.setText(f"Showing cached {requested_path}. Use Refresh to reload.")
+                self.table.setEnabled(True)
+                self.up_button.setEnabled(True)
+            else:
+                self.status_label.setText(f"Waiting to open {requested_path}...")
+            return
+        cached = None if force else self._directory_cache.get(self.profile, requested_path)
+        if cached is not None:
+            self.selected_path = requested_path
+            self._entries = cached
+            self._populate_table(cached)
+            self.status_label.setText(f"Showing cached {requested_path}. Use Refresh to reload.")
             return
         path = self.path_edit.text().strip()
         try:
@@ -194,35 +221,46 @@ class RemoteBrowserDialog(QDialog):
         except ValueError as exc:
             QMessageBox.warning(self, "Remote path", str(exc))
             return
-        self.selected_path = path.rstrip("/") or "/"
+        self.selected_path = requested_path
         self.status_label.setText("Loading...")
         self._set_busy(True)
         worker = RemoteListWorker(attempts[0][1], self.passphrase, attempts=attempts)
+        worker.cache_profile = self.profile
+        worker.cache_path = requested_path
         thread = QThread(self)
         thread.worker = worker
         worker.moveToThread(thread)
         worker.finished.connect(self._listing_finished)
-        worker.finished.connect(thread.quit, Qt.DirectConnection)
-        worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._thread_finished)
+        thread.finished.connect(thread.deleteLater)
         thread.started.connect(worker.run)
         self._thread = thread
         thread.start()
 
     @Slot(object, str)
     def _listing_finished(self, entries: object, error: str) -> None:
-        self._set_busy(False)
-        if error:
-            if "cancelled" in error.lower():
-                self.status_label.setText("Remote listing cancelled.")
-                return
-            self.status_label.setText("Listing failed.")
-            QMessageBox.warning(self, "Remote listing failed", error)
+        worker = self.sender()
+        if not isinstance(worker, RemoteListWorker):
             return
-        self._entries = list(entries)
-        self._populate_table(self._entries)
-        self.status_label.setText(f"{len(self._entries)} items in {self.selected_path}")
+        try:
+            current_path = self.path_edit.text().strip().rstrip("/") or "/"
+            if current_path != worker.cache_path:
+                return
+            if error:
+                if "cancelled" in error.lower():
+                    self.status_label.setText("Remote listing cancelled.")
+                    return
+                self.status_label.setText("Listing failed.")
+                QMessageBox.warning(self, "Remote listing failed", error)
+                return
+            self._entries = list(entries)
+            self._directory_cache.put(worker.cache_profile, worker.cache_path, self._entries)
+            self._populate_table(self._entries)
+            self.status_label.setText(f"{len(self._entries)} items in {worker.cache_path}")
+        finally:
+            if self._thread is not None and getattr(self._thread, "worker", None) is worker:
+                worker.deleteLater()
+                self._thread.quit()
 
     @Slot()
     def _thread_finished(self) -> None:
@@ -231,10 +269,20 @@ class RemoteBrowserDialog(QDialog):
         if self._reject_when_stopped:
             self._reject_when_stopped = False
             super().reject()
+            return
+        pending_path = self._pending_path
+        pending_force = self._pending_force
+        self._pending_path = None
+        self._pending_force = False
+        if pending_path:
+            self.path_edit.setText(pending_path)
+            self.refresh(force=pending_force)
 
     def reject(self) -> None:
         if self._thread and self._thread.isRunning():
             self._reject_when_stopped = True
+            self._pending_path = None
+            self._pending_force = False
             self.status_label.setText("Cancelling remote listing...")
             self.cancel_button.setEnabled(False)
             if hasattr(self._thread, "worker"):
@@ -257,8 +305,12 @@ class RemoteBrowserDialog(QDialog):
 
     def _open_row(self, item: QTableWidgetItem) -> None:
         if item.data(Qt.UserRole + 1):
-            self.path_edit.setText(str(item.data(Qt.UserRole)))
-            self.refresh()
+            path = str(item.data(Qt.UserRole))
+            QTimer.singleShot(0, lambda path=path: self._navigate_to(path))
+
+    def _navigate_to(self, path: str) -> None:
+        self.path_edit.setText(path)
+        self.refresh()
 
     def open_selected(self) -> None:
         item = self._selected_name_item()

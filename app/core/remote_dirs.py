@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import shlex
+from collections import OrderedDict
 from dataclasses import dataclass
 
-from .paths import detect_ssh
+from .paths import detect_ssh, ssh_host_key_options
 from .profiles import Profile
 from .rsync_command import SSH_KEEPALIVE_OPTIONS
 
@@ -35,13 +36,79 @@ class RemoteEntry:
         return format_bytes(self.size)
 
 
+class RemoteDirectoryCache:
+    """Bounded, session-only cache of remote directory listings."""
+
+    def __init__(self, max_directories: int = 64, max_entries: int = 50_000) -> None:
+        if max_directories < 1 or max_entries < 1:
+            raise ValueError("Remote directory cache limits must be positive.")
+        self.max_directories = max_directories
+        self.max_entries = max_entries
+        self._items: OrderedDict[tuple[tuple[object, ...], str], tuple[RemoteEntry, ...]] = OrderedDict()
+        self._entry_count = 0
+
+    def get(self, profile: Profile, remote_path: str) -> list[RemoteEntry] | None:
+        key = (remote_cache_namespace(profile), _clean_remote_path(remote_path))
+        entries = self._items.get(key)
+        if entries is None:
+            return None
+        self._items.move_to_end(key)
+        return list(entries)
+
+    def put(self, profile: Profile, remote_path: str, entries: list[RemoteEntry]) -> None:
+        key = (remote_cache_namespace(profile), _clean_remote_path(remote_path))
+        previous = self._items.pop(key, None)
+        if previous is not None:
+            self._entry_count -= len(previous)
+        if len(entries) > self.max_entries:
+            return
+        stored = tuple(entries)
+        self._items[key] = stored
+        self._entry_count += len(stored)
+        while len(self._items) > self.max_directories or self._entry_count > self.max_entries:
+            _, removed = self._items.popitem(last=False)
+            self._entry_count -= len(removed)
+
+    def invalidate(self, profile: Profile, remote_path: str, subdirectories: bool = False) -> None:
+        namespace = remote_cache_namespace(profile)
+        path = _clean_remote_path(remote_path)
+        prefix = path.rstrip("/") + "/"
+        keys = [
+            key
+            for key in self._items
+            if key[0] == namespace and (key[1] == path or (subdirectories and key[1].startswith(prefix)))
+        ]
+        for key in keys:
+            self._entry_count -= len(self._items.pop(key))
+
+    def clear_profile(self, profile: Profile) -> None:
+        namespace = remote_cache_namespace(profile)
+        keys = [key for key in self._items if key[0] == namespace]
+        for key in keys:
+            self._entry_count -= len(self._items.pop(key))
+
+    def clear(self) -> None:
+        self._items.clear()
+        self._entry_count = 0
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+
+def remote_cache_namespace(profile: Profile) -> tuple[object, ...]:
+    clean = profile.normalized()
+    return (clean.name, clean.username, clean.host, clean.ssh_port, clean.ssh_key_path)
+
+
 def build_remote_ssh_base(profile: Profile, ssh_path: str | None = None, batch_mode: bool = True) -> list[str]:
     clean = profile.normalized()
+    executable = ssh_path or detect_ssh()
     command = [
-        ssh_path or detect_ssh(),
+        executable,
         "-p",
         str(clean.ssh_port),
         *SSH_KEEPALIVE_OPTIONS,
+        *ssh_host_key_options(executable),
         "-o",
         "ConnectTimeout=15",
     ]
@@ -62,7 +129,7 @@ def build_list_remote_entries_command(
     clean_path = _clean_remote_path(remote_path)
     remote_command = (
         f"find {shlex.quote(clean_path)} -mindepth 1 -maxdepth 1 "
-        "-printf '%y\\t%f\\t%s\\t%TY-%Tm-%Td %TH:%TM\\t%p\\n' | sort -k1,1 -k2,2f"
+        "-printf '%y\\t%f\\t%s\\t%TY-%Tm-%Td %TH:%TM\\t%p\\n'"
     )
     return [*build_remote_ssh_base(profile, ssh_path=ssh_path, batch_mode=batch_mode), remote_command]
 

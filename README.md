@@ -28,6 +28,7 @@ On first launch, Windows may show a security warning because this is not yet a c
 
 - Windows desktop GUI
 - Side-by-side local and remote directory browser
+- Confirmed drag-and-drop moves within the local pane or within the active remote collection
 - QRIScloud connection profiles
 - SSH key authentication with in-app passphrase prompt
 - Session-only passphrase reuse; passphrases are not saved
@@ -117,6 +118,8 @@ C:\Users\<you>\.ssh\qriscloud_ed25519.pub
 
 The app may ask for the SSH key passphrase. It keeps the passphrase in memory for the current app session only; it is not saved into the profile.
 
+On the first connection, the app automatically records the QRIScloud server identity in a per-user file under `%APPDATA%\QRISRsyncManager`. A new host is trusted once; an unexpected identity change is rejected. Users do not need to configure MSYS2 `known_hosts` manually, including on shared Windows servers.
+
 Creating the key files does not register the key with the server. The in-app guide provides a PowerShell command that logs in once with your normal UQ password and adds only the public `.pub` key to your remote account. Never share the private key file.
 
 See the official [QRISdata collection guide](https://www.qriscloud.org.au/support/qriscloud-documentation/93-using-qrisdata-collections) for account, collection path, host, and support details, and [Microsoft's OpenSSH key guide](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_keymanagement) for Windows key-pair details.
@@ -129,9 +132,14 @@ See the official [QRISdata collection guide](https://www.qriscloud.org.au/suppor
 4. Select a local folder in the left pane.
 5. Load and browse the remote folder in the right pane.
 6. Use **Compare upload** before upload.
-7. Use **Upload** to upload the local folder contents to the remote path.
+7. Use **Upload** to upload the local folder, preserving its name under the remote path.
 8. Use **Compare download** before download.
 9. Use **Download** to download remote contents into the selected local folder.
+
+Within either browser pane, selected items can be dragged onto a folder to move
+them. The app shows the exact source and destination before moving. Dragging
+between the local and remote panes is intentionally disabled; uploads and
+downloads remain explicit button actions.
 
 ## Profile Setup
 
@@ -147,6 +155,34 @@ Create or edit a profile with:
 - rsync executable path, usually `C:\msys64\usr\bin\rsync.exe`
 
 If the host is `ssh1.qriscloud.org.au` or `ssh2.qriscloud.org.au`, the app automatically tries the other host as a fallback.
+
+## Automatic Media Archives
+
+When **Upload folder** or **Compare upload folder** scans a directory tree, each
+folder is checked independently. A folder is automatically packaged when either
+of these conditions is true:
+
+- it contains more than 200 regular files directly inside that folder; or
+- those direct files total more than 10 GB.
+
+Photos and videos are placed into separate, uncompressed TAR archives. Files
+whose names clearly match a media filename, such as an XMP or JSON sidecar, are
+kept with that media file. Ambiguous or unrelated files stay outside the TAR and
+are uploaded normally. Each TAR has a UTF-8 `.inventory.txt` file listing its
+filenames, sizes, and modification times.
+
+The confirmation window shows the proposed archives before work begins. The
+source files are never modified or deleted. TAR files are built in a temporary
+folder beside the upload source, uploaded with rsync, and removed locally after
+success, failure, or cancellation. Because media files are normally already
+compressed, the app uses `.tar` rather than `.tar.gz` to avoid costly compression
+with little storage benefit.
+
+Automatic packaging applies to the current folder and to one explicitly selected
+folder. Uploading individually selected files remains an exact selected-file
+operation and does not package them. Folder uploads preserve the selected or
+displayed folder name under the chosen remote destination.
+Existing individual files already stored remotely are not deleted automatically.
 
 ## Sync Selection
 

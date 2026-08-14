@@ -3,12 +3,20 @@ from __future__ import annotations
 import threading
 import time
 
-from PySide6.QtCore import QThread
+from PySide6.QtCore import QItemSelectionModel, QThread, Qt
 from PySide6.QtGui import QCloseEvent
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QMessageBox, QTableWidgetItem
 
+from app.core.archive_upload import analyze_upload_tree
 from app.core.remote_dirs import RemoteEntry
-from app.gui.main_window import FolderScanWorker, MainWindow
+from app.gui.main_window import (
+    FallbackCommandWorker,
+    FolderScanWorker,
+    LocalMoveWorker,
+    MainWindow,
+    PackagedUploadWorker,
+    UploadAnalysisWorker,
+)
 from app.gui.remote_browser_dialog import RemoteListWorker
 
 
@@ -50,6 +58,176 @@ def test_stale_remote_listing_is_not_applied_to_changed_path(monkeypatch, tmp_pa
     assert window.remote_entries_path == ""
     assert window.remote_table.rowCount() == 0
     assert "changed while loading" in window.remote_status_label.text().lower()
+    window.close()
+
+
+def test_remote_double_click_queues_folder_until_previous_listing_thread_clears(monkeypatch, tmp_path) -> None:
+    app = _application()
+    window = _window(monkeypatch, tmp_path)
+    release = threading.Event()
+    thread = _BlockingThread(release)
+    thread.request_id = 1
+    window._remote_request_id = 1
+    window.remote_thread = thread
+    thread.finished.connect(window._remote_thread_finished)
+    thread.start()
+    item = QTableWidgetItem("child")
+    item.setData(Qt.UserRole, "/data/Q9560/child")
+    item.setData(Qt.UserRole + 1, True)
+
+    window._remote_double_clicked(item)
+    app.processEvents()
+
+    assert window.remote_path_edit.text() == "/data/Q9560/child"
+    assert window._pending_remote_path == "/data/Q9560/child"
+    assert "Waiting to open" in window.remote_status_label.text()
+
+    refreshed: list[str] = []
+    monkeypatch.setattr(window, "_refresh_remote_table", lambda force=False: refreshed.append(window.remote_path_edit.text()))
+    release.set()
+    deadline = time.monotonic() + 2
+    while thread.isRunning() and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+    assert thread.wait(1000)
+    app.processEvents()
+
+    assert refreshed == ["/data/Q9560/child"]
+    assert window._pending_remote_path is None
+    assert window.remote_thread is None
+    window.close()
+
+
+def test_remote_double_click_defers_navigation_until_signal_returns(monkeypatch, tmp_path) -> None:
+    app = _application()
+    window = _window(monkeypatch, tmp_path)
+    navigated: list[str] = []
+    monkeypatch.setattr(window, "_navigate_remote_path", navigated.append)
+    item = QTableWidgetItem("child")
+    item.setData(Qt.UserRole, "/data/Q9560/child")
+    item.setData(Qt.UserRole + 1, True)
+
+    window._remote_double_clicked(item)
+
+    assert navigated == []
+    app.processEvents()
+    assert navigated == ["/data/Q9560/child"]
+    window.close()
+
+
+def test_repeated_cached_double_click_navigation_keeps_table_items_valid(monkeypatch, tmp_path) -> None:
+    app = _application()
+    window = _window(monkeypatch, tmp_path)
+    profile = window.current_profile()
+    assert profile is not None
+    paths = ("/data/Q9560/one", "/data/Q9560/two")
+    for current, target in ((paths[0], paths[1]), (paths[1], paths[0])):
+        window.remote_directory_cache.put(
+            profile,
+            current,
+            [RemoteEntry(kind="d", name=target.rsplit("/", 1)[-1], size=0, modified="now", path=target)],
+        )
+    window.remote_path_edit.setText(paths[0])
+    window._refresh_remote_table()
+
+    for _ in range(100):
+        item = window.remote_table.item(0, 0)
+        assert item is not None
+        window._remote_double_clicked(item)
+        app.processEvents()
+        assert window.remote_table.rowCount() == 1
+
+    assert window.remote_thread is None
+    window.close()
+
+
+def test_repeated_threaded_remote_navigation_keeps_workers_alive_until_result_delivery(monkeypatch, tmp_path) -> None:
+    app = _application()
+    window = _window(monkeypatch, tmp_path)
+    monkeypatch.setattr(window, "_profile_errors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(window, "_get_session_passphrase", lambda *_args: "")
+
+    class FakeProcess:
+        returncode = 0
+
+        def __init__(self, command: list[str]) -> None:
+            remote_path = command[-1].split(" -mindepth", 1)[0].removeprefix("find ").strip("'")
+            child_path = f"{remote_path.rstrip('/')}/child"
+            self.output = f"d\tchild\t0\t2026-01-01 00:00\t{child_path}\n"
+
+        def poll(self):
+            return self.returncode
+
+        def communicate(self, timeout=None):
+            return self.output, None
+
+    monkeypatch.setattr(
+        "app.gui.remote_browser_dialog.subprocess.Popen",
+        lambda command, **_kwargs: FakeProcess(command),
+    )
+    window.remote_path_edit.setText("/data/Q9560")
+
+    for _ in range(30):
+        window._refresh_remote_table(force=True)
+        deadline = time.monotonic() + 2
+        while window.remote_thread is not None and time.monotonic() < deadline:
+            app.processEvents()
+            time.sleep(0.001)
+        assert window.remote_thread is None
+        item = window.remote_table.item(0, 0)
+        assert item is not None
+        window._remote_double_clicked(item)
+        app.processEvents()
+
+    deadline = time.monotonic() + 2
+    while window.remote_thread is not None and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.001)
+    assert window.remote_thread is None
+    window.close()
+
+
+def test_cached_remote_navigation_does_not_start_ssh(monkeypatch, tmp_path) -> None:
+    window = _window(monkeypatch, tmp_path)
+    profile = window.current_profile()
+    assert profile is not None
+    target = "/data/Q0101/cached"
+    entries = [RemoteEntry(kind="f", name="ready.txt", size=1, modified="now", path=f"{target}/ready.txt")]
+    window.remote_directory_cache.put(profile, target, entries)
+    window.remote_path_edit.setText(target)
+    monkeypatch.setattr(
+        window,
+        "_get_session_passphrase",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("cache hit attempted SSH authentication")),
+    )
+
+    window._refresh_remote_table()
+
+    assert window.remote_thread is None
+    assert window.remote_entries == entries
+    assert "cached" in window.remote_status_label.text().lower()
+    window.close()
+
+
+def test_cached_remote_navigation_populates_immediately_while_previous_refresh_finishes(monkeypatch, tmp_path) -> None:
+    window = _window(monkeypatch, tmp_path)
+    profile = window.current_profile()
+    assert profile is not None
+    target = "/data/Q0101/cached"
+    entries = [RemoteEntry(kind="f", name="ready.txt", size=1, modified="now", path=f"{target}/ready.txt")]
+    window.remote_directory_cache.put(profile, target, entries)
+    window.remote_thread = QThread()
+    window.remote_path_edit.setText(target)
+
+    window._refresh_remote_table()
+
+    assert window.remote_entries == entries
+    assert window.remote_entries_path == target
+    assert window.remote_table.rowCount() == 1
+    assert window.remote_table.isEnabled()
+    assert window._pending_remote_path == target
+    assert "cached" in window.remote_status_label.text().lower()
+    window.remote_thread = None
     window.close()
 
 
@@ -156,19 +334,118 @@ def test_close_decline_leaves_operation_running(monkeypatch, tmp_path) -> None:
     window.close()
 
 
-def test_selected_directory_is_not_silently_uploaded_as_folder(monkeypatch, tmp_path) -> None:
+def test_selected_directory_starts_background_archive_scan(monkeypatch, tmp_path) -> None:
     window = _window(monkeypatch, tmp_path)
     window.transfer_scope_combo.setCurrentIndex(window.transfer_scope_combo.findData("selected"))
     monkeypatch.setattr(window, "_selected_local_paths", lambda: [tmp_path])
-    errors: list[str] = []
-    monkeypatch.setattr(window, "_show_errors", lambda messages: errors.extend(messages))
+    monkeypatch.setattr(window, "_profile_errors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("app.gui.main_window.validate_transfer_inputs", lambda *_args, **_kwargs: [])
     started: list[object] = []
     monkeypatch.setattr(window, "_start_worker", lambda *args, **kwargs: started.append(args[0]))
 
     window._start_rsync(dry_run=False, direction="upload")
 
-    assert not started
-    assert any("do not include folders" in message for message in errors)
+    assert len(started) == 1
+    assert isinstance(started[0], UploadAnalysisWorker)
+    assert started[0].path == str(tmp_path)
+    window.close()
+
+
+def test_selected_local_folder_is_counted_as_an_item(monkeypatch, tmp_path) -> None:
+    window = _window(monkeypatch, tmp_path)
+    window.transfer_scope_combo.setCurrentIndex(window.transfer_scope_combo.findData("selected"))
+    monkeypatch.setattr(window, "_selected_local_paths", lambda: [tmp_path])
+
+    window._update_transfer_scope_ui()
+
+    assert window.upload_button.text() == "Upload selected items (1)"
+    assert window.upload_button.isEnabled()
+    assert "1 local item(s)" in window.selection_status_label.text()
+    window.close()
+
+
+def test_real_local_tree_folder_selection_updates_transfer_scope(monkeypatch, tmp_path) -> None:
+    folder = tmp_path / "Lucinda"
+    folder.mkdir()
+    app = _application()
+    window = _window(monkeypatch, tmp_path)
+    window._set_local_root(str(tmp_path))
+    deadline = time.monotonic() + 2
+    index = window.local_model.index(str(folder))
+    while not index.isValid() and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+        index = window.local_model.index(str(folder))
+    assert index.isValid()
+
+    window.transfer_scope_combo.setCurrentIndex(window.transfer_scope_combo.findData("selected"))
+    window.local_tree.selectionModel().select(
+        index,
+        QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows,
+    )
+    app.processEvents()
+
+    assert window._selected_local_paths() == [folder]
+    assert window.upload_button.text() == "Upload selected items (1)"
+    assert window.upload_button.isEnabled()
+    window.close()
+
+
+def test_local_drag_move_confirms_and_starts_background_worker(monkeypatch, tmp_path) -> None:
+    source = tmp_path / "photo.jpg"
+    source.write_bytes(b"photo")
+    destination = tmp_path / "archive"
+    destination.mkdir()
+    window = _window(monkeypatch, tmp_path)
+    window.local_folder_edit.setText(str(tmp_path))
+    shown: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda _parent, _title, message, *_args: shown.append(message) or QMessageBox.Yes,
+    )
+    started: list[tuple[object, str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        window,
+        "_start_worker",
+        lambda worker, label, **kwargs: started.append((worker, label, kwargs)),
+    )
+
+    window._move_local_items_by_drop([str(source)], str(destination))
+
+    assert str(source) in shown[0]
+    assert str(destination / source.name) in shown[0]
+    assert isinstance(started[0][0], LocalMoveWorker)
+    assert started[0][1] == "Move local items"
+    assert started[0][2]["refresh_local"] is True
+    window.close()
+
+
+def test_remote_drag_move_is_collection_bound_and_starts_fallback_worker(monkeypatch, tmp_path) -> None:
+    window = _window(monkeypatch, tmp_path)
+    profile = window.current_profile()
+    assert profile is not None
+    root = f"/data/{profile.collection_id}"
+    source = f"{root}/photo.jpg"
+    destination = f"{root}/archive"
+    window.remote_entries = [RemoteEntry("f", "photo.jpg", 1, "now", source)]
+    monkeypatch.setattr(window, "_profile_errors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(window, "_get_session_passphrase", lambda _profile: "")
+    monkeypatch.setattr(QMessageBox, "question", lambda *_args, **_kwargs: QMessageBox.Yes)
+    started: list[tuple[object, str, dict[str, object]]] = []
+    monkeypatch.setattr(
+        window,
+        "_start_worker",
+        lambda worker, label, **kwargs: started.append((worker, label, kwargs)),
+    )
+
+    window._move_remote_items_by_drop([source], destination)
+
+    assert isinstance(started[0][0], FallbackCommandWorker)
+    command = started[0][0].command_factory(profile)
+    assert f"mv -n -- {source} {destination}/photo.jpg" in command[-1]
+    assert started[0][1] == "Move remote items"
+    assert started[0][2]["refresh_remote"] is True
     window.close()
 
 
@@ -187,9 +464,20 @@ def test_folder_upload_starts_background_scan_before_transfer(monkeypatch, tmp_p
     window._start_rsync(dry_run=False, direction="upload")
 
     assert len(started) == 1
-    assert isinstance(started[0][0], FolderScanWorker)
-    assert started[0][1] == "Scan upload folder"
+    assert isinstance(started[0][0], UploadAnalysisWorker)
+    assert started[0][1] == "Analyse upload folder"
     assert callable(started[0][2])
+    resolved: list[tuple[tuple[object, ...], dict[str, object]]] = []
+    monkeypatch.setattr(
+        window,
+        "_start_resolved_rsync",
+        lambda *args, **kwargs: resolved.append((args, kwargs)),
+    )
+    started[0][0].result = analyze_upload_tree(tmp_path)
+    started[0][2](started[0][0], 0)
+    assert resolved[0][0][3] == "folder"
+    assert resolved[0][0][8] == str(tmp_path)
+    assert resolved[0][1]["include_source_directory"] is True
     window.close()
 
 
@@ -228,6 +516,53 @@ def test_transfer_confirmation_shows_scope_paths_and_dry_run(monkeypatch, tmp_pa
     assert "/data/Q0101" in shown["message"]
     assert "Dry run / compare" in shown["message"]
     assert not started
+    window.close()
+
+
+def test_packaged_upload_confirmation_explains_archives_and_starts_packaged_worker(monkeypatch, tmp_path) -> None:
+    window = _window(monkeypatch, tmp_path)
+    profile = window.current_profile()
+    assert profile is not None
+    source = tmp_path / "survey"
+    source.mkdir()
+    (source / "one.jpg").write_bytes(b"123")
+    (source / "two.jpg").write_bytes(b"456")
+    plan = analyze_upload_tree(source, min_flat_files=1, min_folder_bytes=5)
+    shown: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda _parent, _title, message, *_args: shown.append(message) or QMessageBox.Yes,
+    )
+    monkeypatch.setattr(window, "_get_session_passphrase", lambda _profile: "")
+    started: list[tuple[object, str]] = []
+    monkeypatch.setattr(window, "_start_worker", lambda worker, label, **_kwargs: started.append((worker, label)))
+
+    window._start_resolved_rsync(
+        profile,
+        False,
+        "upload",
+        "folder",
+        [],
+        [],
+        None,
+        None,
+        str(source),
+        "/data/Q0101",
+        None,
+        None,
+        scan=plan.scan,
+        archive_plan=plan,
+    )
+
+    assert "Automatic media archiving" in shown[0]
+    assert "more than 200 direct files or more than 10 GB" in shown[0]
+    assert "separate uncompressed TAR archives" in shown[0]
+    assert "source folder will not be changed" in shown[0]
+    assert "will not be deleted automatically" in shown[0]
+    assert "survey__photos.tar" in shown[0]
+    assert isinstance(started[0][0], PackagedUploadWorker)
+    assert started[0][1] == "Packaged upload"
     window.close()
 
 

@@ -3,7 +3,13 @@ from __future__ import annotations
 import shlex
 from pathlib import Path
 
-from .paths import detect_ssh, directory_source_for_rsync, file_source_for_rsync, path_for_rsync
+from .paths import (
+    detect_ssh,
+    directory_source_for_rsync,
+    file_source_for_rsync,
+    path_for_rsync,
+    ssh_host_key_options,
+)
 from .profiles import Profile
 
 
@@ -52,12 +58,14 @@ def local_destination(path: str | Path, rsync_path: str | Path | None = None) ->
 
 def build_ssh_transport(profile: Profile, ssh_path: str | None = None, batch_mode: bool = True) -> str:
     clean = profile.normalized()
-    executable = path_for_rsync(ssh_path or detect_ssh(), clean.rsync_path)
+    source_executable = ssh_path or detect_ssh()
+    executable = path_for_rsync(source_executable, clean.rsync_path)
     args = [
         executable,
         "-p",
         str(clean.ssh_port),
         *SSH_KEEPALIVE_OPTIONS,
+        *ssh_host_key_options(source_executable),
     ]
     if batch_mode:
         args.extend(["-o", "BatchMode=yes"])
@@ -102,8 +110,10 @@ def build_rsync_command(
     ssh_path: str | None = None,
     batch_mode: bool = True,
     files_from: str | Path | None = None,
+    exclude_from: str | Path | None = None,
     direction: str = "upload",
     remote_is_file: bool = False,
+    include_source_directory: bool = False,
 ) -> list[str]:
     clean = profile.normalized()
     local_path = Path(local_folder).expanduser()
@@ -113,9 +123,13 @@ def build_rsync_command(
         command.extend(DRY_RUN_COMPARE_OPTIONS)
     if files_from:
         command.append(f"--files-from={path_for_rsync(files_from, clean.rsync_path)}")
+    if exclude_from:
+        command.append(f"--exclude-from={path_for_rsync(exclude_from, clean.rsync_path)}")
     command.extend(["-e", build_ssh_transport(clean, ssh_path=ssh_path, batch_mode=batch_mode)])
     if direction == "upload":
         if local_path.is_file() and not files_from:
+            command.append(file_source_for_rsync(local_path, clean.rsync_path))
+        elif include_source_directory and not files_from:
             command.append(file_source_for_rsync(local_path, clean.rsync_path))
         else:
             command.append(directory_source_for_rsync(local_folder, clean.rsync_path))

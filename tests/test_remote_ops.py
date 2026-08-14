@@ -7,6 +7,7 @@ from app.core.remote_ops import (
     build_remote_delete_command,
     build_remote_mkdir_command,
     build_remote_move_command,
+    build_remote_move_into_command,
     is_dangerous_remote_path,
     remote_child_path,
 )
@@ -78,3 +79,40 @@ def test_remote_move_quotes_apostrophe_in_destination_message() -> None:
     )
 
     assert "researcher'\"'\"'s file.txt" in command[-1]
+
+
+def test_remote_drag_move_preflights_all_destinations_before_moves() -> None:
+    command = build_remote_move_into_command(
+        Profile(username="user"),
+        ["/data/Q8940/a file.txt", "/data/Q8940/photos"],
+        "/data/Q8940/archive",
+        "/data/Q8940",
+        ssh_path="ssh.exe",
+    )
+
+    remote = command[-1]
+    assert "[ -e '/data/Q8940/archive/a file.txt' ]" in remote
+    assert "[ -e /data/Q8940/archive/photos ]" in remote
+    assert remote.index("[ -e") < remote.index("mv -n --")
+    assert "mv -n -- '/data/Q8940/a file.txt' '/data/Q8940/archive/a file.txt'" in remote
+    assert "[ -L '/data/Q8940/a file.txt' ]" in remote
+
+
+@pytest.mark.parametrize(
+    ("source", "destination"),
+    [
+        ("/data/Q8940", "/data/Q8940/archive"),
+        ("/data/Q9999/file.txt", "/data/Q8940/archive"),
+        ("/data/Q8940/photos", "/data/Q8940/photos/inside"),
+        ("/data/Q8940/file.txt", "/data/Q9999"),
+    ],
+)
+def test_remote_drag_move_stays_inside_collection(source: str, destination: str) -> None:
+    with pytest.raises(ValueError):
+        build_remote_move_into_command(
+            Profile(username="user"),
+            [source],
+            destination,
+            "/data/Q8940",
+            ssh_path="ssh.exe",
+        )

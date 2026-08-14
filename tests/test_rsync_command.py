@@ -59,6 +59,18 @@ def test_upload_command_can_use_files_from(tmp_path: Path) -> None:
     assert any(part.startswith("--files-from=/") for part in command)
 
 
+def test_upload_command_can_exclude_archived_source_files(tmp_path: Path) -> None:
+    local = tmp_path / "data"
+    local.mkdir()
+    exclusions = tmp_path / "archived files.exclude"
+    exclusions.write_text("/photos/image.jpg\n", encoding="utf-8")
+    profile = Profile(username="user", rsync_path=r"C:\msys64\usr\bin\rsync.exe")
+
+    command = build_rsync_command(profile, local, exclude_from=exclusions)
+
+    assert any(part.startswith("--exclude-from=/") for part in command)
+
+
 def test_upload_command_can_send_single_file(tmp_path: Path) -> None:
     local = tmp_path / "image one.JPG"
     local.write_text("data", encoding="utf-8")
@@ -69,6 +81,18 @@ def test_upload_command_can_send_single_file(tmp_path: Path) -> None:
     assert command[-2].endswith("image one.JPG")
     assert not command[-2].endswith("/")
     assert command[-1] == "user@ssh1.qriscloud.org.au:/data/Q8940/images/"
+
+
+def test_upload_command_can_preserve_selected_folder_name(tmp_path: Path) -> None:
+    local = tmp_path / "Girringun_Drone_Aug2026"
+    local.mkdir()
+    profile = Profile(username="user", remote_path="/data/Q9560", rsync_path=r"C:\msys64\usr\bin\rsync.exe")
+
+    command = build_rsync_command(profile, local, include_source_directory=True)
+
+    assert command[-2].endswith("Girringun_Drone_Aug2026")
+    assert not command[-2].endswith("/")
+    assert command[-1] == "user@ssh1.qriscloud.org.au:/data/Q9560/"
 
 
 def test_download_command_reverses_source_and_destination(tmp_path: Path) -> None:
@@ -124,7 +148,8 @@ def test_validate_download_requires_local_folder(tmp_path: Path) -> None:
     assert "Local download folder must exist." in errors
 
 
-def test_ssh_transport_has_keepalive_and_no_checksum_flag(tmp_path: Path) -> None:
+def test_ssh_transport_has_keepalive_and_no_checksum_flag(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
     profile = Profile(
         username="user",
         ssh_port=2222,
@@ -139,6 +164,8 @@ def test_ssh_transport_has_keepalive_and_no_checksum_flag(tmp_path: Path) -> Non
     assert "BatchMode=yes" in transport
     assert "-p 2222" in transport
     assert "id key" in transport
+    assert "StrictHostKeyChecking=accept-new" in transport
+    assert "UserKnownHostsFile=/" in transport
 
 
 def test_ssh_transport_can_allow_passphrase_prompt(tmp_path: Path) -> None:

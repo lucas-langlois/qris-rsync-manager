@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 from pathlib import Path
 
 
@@ -25,6 +26,11 @@ def logs_dir() -> Path:
     path = app_data_dir() / "logs"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def ssh_known_hosts_path() -> Path:
+    """Return the app-owned, per-Windows-user SSH host key store."""
+    return app_data_dir() / "known_hosts"
 
 
 def is_executable_file(path: str | Path | None) -> bool:
@@ -59,6 +65,21 @@ def detect_ssh() -> str:
     return str(MSYS2_SSH_PATH)
 
 
+def detect_tar() -> str:
+    """Prefer Windows' native libarchive tar for high-throughput packaging."""
+    system_root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+    candidates = [
+        system_root / "System32" / "tar.exe",
+        Path.cwd() / "tools" / "tar.exe",
+        Path(r"C:\msys64\usr\bin\tar.exe"),
+    ]
+    for candidate in candidates:
+        if is_executable_file(candidate):
+            return str(candidate)
+    discovered = shutil.which("tar.exe") or shutil.which("tar")
+    return discovered or str(candidates[0])
+
+
 def is_msys2_executable(path: str | Path | None) -> bool:
     if not path:
         return False
@@ -77,6 +98,24 @@ def windows_path_to_msys(path: str | Path) -> str:
     if raw.startswith("//"):
         return raw
     return raw
+
+
+def path_for_ssh(path: str | Path, ssh_path: str | Path | None = None) -> str:
+    if is_msys2_executable(ssh_path):
+        return windows_path_to_msys(path)
+    return str(Path(path).expanduser())
+
+
+def ssh_host_key_options(ssh_path: str | Path | None = None) -> list[str]:
+    """Trust new hosts once while continuing to reject changed host keys."""
+    executable = ssh_path or detect_ssh()
+    known_hosts = path_for_ssh(ssh_known_hosts_path(), executable)
+    return [
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        "-o",
+        f"UserKnownHostsFile={known_hosts}",
+    ]
 
 
 def path_for_rsync(path: str | Path, rsync_path: str | Path | None = None) -> str:
