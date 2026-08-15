@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from hashlib import sha256
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -103,6 +104,7 @@ class UploadPackage:
     exclude_file: Path
     archive_count: int
     inventory_count: int
+    planned_groups: tuple[ArchiveGroupPlan, ...] = ()
 
     def cleanup(self) -> str | None:
         try:
@@ -140,6 +142,12 @@ def analyze_upload_tree(
     while pending:
         _raise_if_cancelled(cancel_event)
         folder = pending.pop()
+        try:
+            _validate_folder(folder, source)
+        except (OSError, ValueError):
+            scan.skipped_errors += 1
+            _report(progress_callback, scan)
+            continue
         snapshots: list[FileSnapshot] = []
         scan.directory_count += 1
         try:
@@ -192,80 +200,97 @@ def build_upload_package(
     progress_callback: BuildProgressCallback | None = None,
     *,
     tar_path: str | Path | None = None,
+    include_source_directory: bool = False,
 ) -> UploadPackage:
     """Build TAR/inventory payload and an rsync exclusion list.
 
     Source files are never modified. The temporary work directory is created
     beside the upload root so its free-space characteristics are predictable.
     """
+    return prepare_upload_package(
+        plan,
+        cancel_event,
+        progress_callback,
+        tar_path=tar_path,
+        build_archives=True,
+        include_source_directory=include_source_directory,
+    )
+
+
+def prepare_upload_package(
+    plan: UploadArchivePlan,
+    cancel_event: CancelSignal | None = None,
+    progress_callback: BuildProgressCallback | None = None,
+    *,
+    tar_path: str | Path | None = None,
+    build_archives: bool = True,
+    include_source_directory: bool = False,
+) -> UploadPackage:
+    """Prepare archive exclusions and, optionally, the TAR payload.
+
+    With ``build_archives=False`` this is a lightweight dry-run preparation:
+    it creates only the exclusion file and returns the planned archive groups.
+    """
     if not plan.groups:
         raise ValueError("The upload plan contains no archive groups.")
-    tar_executable = str(Path(tar_path).expanduser()) if tar_path else detect_tar()
-    if not is_executable_file(tar_executable):
-        raise FileNotFoundError(
-            f"Native tar.exe was not found at {tar_executable}. "
-            "Windows Server 2022 normally provides C:\\Windows\\System32\\tar.exe."
-        )
+    revalidate_upload_plan(plan, cancel_event)
+    tar_executable: str | None = None
+    if build_archives:
+        tar_executable = str(Path(tar_path).expanduser()) if tar_path else detect_tar()
+        if not is_executable_file(tar_executable):
+            raise FileNotFoundError(
+                f"Native tar.exe was not found at {tar_executable}. "
+                "Windows Server 2022 normally provides C:\\Windows\\System32\\tar.exe."
+            )
     source_parent = plan.root.parent
     if source_parent == plan.root:
         source_parent = Path(tempfile.gettempdir()).resolve()
-    required = plan.archived_bytes + max(1_073_741_824, plan.archived_bytes // 20)
-    free = shutil.disk_usage(source_parent).free
-    if free < required:
-        raise OSError(
-            f"Not enough temporary disk space beside the upload folder. "
-            f"Required about {required:,} bytes; available {free:,} bytes."
-        )
+    if build_archives:
+        required = plan.archived_bytes + max(1_073_741_824, plan.archived_bytes // 20)
+        free = shutil.disk_usage(source_parent).free
+        if free < required:
+            raise OSError(
+                f"Not enough temporary disk space beside the upload folder. "
+                f"Required about {required:,} bytes; available {free:,} bytes."
+            )
 
-    work_dir = Path(tempfile.mkdtemp(prefix=f".{plan.root.name}.qris-upload-", dir=source_parent))
+    work_dir = Path(tempfile.mkdtemp(prefix=_work_directory_prefix(plan.root), dir=source_parent))
     payload_dir = work_dir / "payload"
     exclude_file = work_dir / "archived-files.exclude"
     payload_dir.mkdir()
-    package = UploadPackage(work_dir, payload_dir, exclude_file, 0, 0)
+    package = UploadPackage(work_dir, payload_dir, exclude_file, 0, 0, tuple(plan.groups))
     try:
         with exclude_file.open("w", encoding="utf-8", newline="\n") as exclusions:
             archive_count = 0
             inventory_count = 0
             for folder_plan in plan.folders:
                 _raise_if_cancelled(cancel_event)
-                snapshots = _snapshot_flat_files(folder_plan.folder, cancel_event)
-                if _snapshot_signature(snapshots) != folder_plan.snapshot_signature:
-                    raise RuntimeError(
-                        f"{folder_plan.folder} changed after it was scanned. Start the upload again so it can be rechecked."
-                    )
-                current_groups = _group_snapshots(plan.root, folder_plan.folder, snapshots)
-                expected = {(group.category, group.media_count, group.member_count, group.member_bytes) for group in folder_plan.groups}
-                actual = {(group.category, group.media_count, group.member_count, group.member_bytes) for group in current_groups}
-                if actual != expected:
-                    raise RuntimeError(
-                        f"{folder_plan.folder} changed after it was scanned. Start the upload again so it can be rechecked."
-                    )
+                snapshots = _validated_folder_snapshots(plan, folder_plan, cancel_event)
                 member_map = _members_by_category(snapshots)
                 for group in folder_plan.groups:
                     members = member_map[group.category]
-                    destination = payload_dir / Path(group.relative_folder) if group.relative_folder else payload_dir
-                    os.makedirs(_windows_io_path(destination), exist_ok=True)
-                    archive_path = destination / group.archive_name
-                    inventory_path = destination / group.inventory_name
-                    _emit(progress_callback, f"Creating {group.category} archive: {archive_path.name}")
-                    _write_tar(
-                        archive_path,
-                        folder_plan.folder,
-                        members,
-                        cancel_event,
-                        progress_callback,
-                        tar_executable,
-                    )
-                    _write_inventory(inventory_path, group, members)
-                    stable_mtime = max(item.modified_ns for item in members) / 1_000_000_000
-                    os.utime(_windows_io_path(archive_path), (stable_mtime, stable_mtime))
-                    os.utime(_windows_io_path(inventory_path), (stable_mtime, stable_mtime))
-                    archive_count += 1
-                    inventory_count += 1
+                    if build_archives:
+                        destination = payload_dir / Path(group.relative_folder) if group.relative_folder else payload_dir
+                        os.makedirs(_windows_io_path(destination), exist_ok=True)
+                        archive_path = destination / group.archive_name
+                        inventory_path = destination / group.inventory_name
+                        staged_archive_path = work_dir / f"archive-{archive_count:06d}.tar"
+                        _emit(progress_callback, f"Creating {group.category} archive: {archive_path.name}")
+                        _write_tar(staged_archive_path, folder_plan.folder, members, cancel_event,
+                                   progress_callback, tar_executable or "", display_name=archive_path.name)
+                        os.replace(_windows_io_path(staged_archive_path), _windows_io_path(archive_path))
+                        _write_inventory(inventory_path, group, members)
+                        stable_mtime = max(item.modified_ns for item in members) / 1_000_000_000
+                        os.utime(_windows_io_path(archive_path), (stable_mtime, stable_mtime))
+                        os.utime(_windows_io_path(inventory_path), (stable_mtime, stable_mtime))
+                        archive_count += 1
+                        inventory_count += 1
                     for member in members:
                         relative = _relative_posix(member.path, plan.root)
+                        if include_source_directory:
+                            relative = f"{plan.root.name}/{relative}"
                         exclusions.write(f"/{_escape_rsync_pattern(relative)}\n")
-        return UploadPackage(work_dir, payload_dir, exclude_file, archive_count, inventory_count)
+        return UploadPackage(work_dir, payload_dir, exclude_file, archive_count, inventory_count, tuple(plan.groups))
     except Exception as exc:
         cleanup_error = package.cleanup()
         if cleanup_error:
@@ -277,7 +302,7 @@ def _group_snapshots(root: Path, folder: Path, snapshots: list[FileSnapshot]) ->
     members = _members_by_category(snapshots)
     groups: list[ArchiveGroupPlan] = []
     relative_folder = _relative_posix(folder, root)
-    safe_base = folder.name or root.name or "folder"
+    safe_base = _archive_basename(folder.name or root.name or "folder")
     existing_names = {item.path.name.casefold() for item in snapshots}
     media_by_category = _media_by_category(snapshots)
     for category in ("photos", "videos"):
@@ -322,19 +347,25 @@ def _members_by_category(snapshots: list[FileSnapshot]) -> dict[str, list[FileSn
     assigned: dict[str, str] = {}
     ambiguous: set[str] = set()
     lookup: dict[str, FileSnapshot] = {item.path.name.casefold(): item for item in snapshots}
+    categories_by_stem: dict[str, set[str]] = {}
+    categories_by_full_name: dict[str, set[str]] = {}
     for category, items in media.items():
         for item in items:
-            assigned[item.path.name.casefold()] = category
-    media_names = [(item.path.name.casefold(), item.path.stem.casefold(), category) for category, items in media.items() for item in items]
+            full_name = item.path.name.casefold()
+            assigned[full_name] = category
+            categories_by_stem.setdefault(item.path.stem.casefold(), set()).add(category)
+            categories_by_full_name.setdefault(full_name, set()).add(category)
     for candidate in snapshots:
         key = candidate.path.name.casefold()
         if key in assigned:
             continue
-        matches = {
-            category
-            for full_name, stem, category in media_names
-            if candidate.path.stem.casefold() == stem or key.startswith(full_name + ".")
-        }
+        matches = set(categories_by_stem.get(candidate.path.stem.casefold(), ()))
+        # A sidecar may extend a media filename (for example ``clip.mp4.json``).
+        # Walking its suffixes makes dictionary lookups rather than rescanning all media.
+        prefix = key
+        while "." in prefix:
+            prefix = prefix.rsplit(".", 1)[0]
+            matches.update(categories_by_full_name.get(prefix, ()))
         if len(matches) == 1:
             assigned[key] = next(iter(matches))
         elif len(matches) > 1:
@@ -348,7 +379,12 @@ def _members_by_category(snapshots: list[FileSnapshot]) -> dict[str, list[FileSn
     return result
 
 
-def _snapshot_flat_files(folder: Path, cancel_event: CancelSignal | None) -> list[FileSnapshot]:
+def _snapshot_flat_files(
+    folder: Path,
+    cancel_event: CancelSignal | None,
+    root: Path | None = None,
+) -> list[FileSnapshot]:
+    _validate_folder(folder, root)
     snapshots: list[FileSnapshot] = []
     with os.scandir(folder) as entries:
         for entry in entries:
@@ -359,6 +395,52 @@ def _snapshot_flat_files(folder: Path, cancel_event: CancelSignal | None) -> lis
     return snapshots
 
 
+def revalidate_upload_plan(
+    plan: UploadArchivePlan,
+    cancel_event: CancelSignal | None = None,
+) -> None:
+    """Confirm every selected source folder still exactly matches *plan*.
+
+    Call immediately before an upload phase.  This is intentionally separate
+    from TAR construction so callers can reject source changes before any
+    transfer command is started.
+    """
+    try:
+        _validate_root(plan.root)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"{plan.root} changed after it was scanned. Start the upload again so it can be rechecked."
+        ) from exc
+    for folder_plan in plan.folders:
+        _raise_if_cancelled(cancel_event)
+        _validated_folder_snapshots(plan, folder_plan, cancel_event)
+
+
+def _validated_folder_snapshots(
+    plan: UploadArchivePlan,
+    folder_plan: EligibleFolderPlan,
+    cancel_event: CancelSignal | None,
+) -> list[FileSnapshot]:
+    try:
+        snapshots = _snapshot_flat_files(folder_plan.folder, cancel_event, plan.root)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"{folder_plan.folder} changed after it was scanned. Start the upload again so it can be rechecked."
+        ) from exc
+    if _snapshot_signature(snapshots) != folder_plan.snapshot_signature:
+        raise RuntimeError(
+            f"{folder_plan.folder} changed after it was scanned. Start the upload again so it can be rechecked."
+        )
+    current_groups = _group_snapshots(plan.root, folder_plan.folder, snapshots)
+    expected = {(group.category, group.media_count, group.member_count, group.member_bytes) for group in folder_plan.groups}
+    actual = {(group.category, group.media_count, group.member_count, group.member_bytes) for group in current_groups}
+    if actual != expected:
+        raise RuntimeError(
+            f"{folder_plan.folder} changed after it was scanned. Start the upload again so it can be rechecked."
+        )
+    return snapshots
+
+
 def _write_tar(
     destination: Path,
     source_folder: Path,
@@ -366,11 +448,13 @@ def _write_tar(
     cancel_event: CancelSignal | None,
     progress_callback: BuildProgressCallback | None,
     tar_path: str,
+    display_name: str | None = None,
 ) -> None:
     for member in members:
         _raise_if_cancelled(cancel_event)
         _validate_archive_member(member)
     commands = _native_tar_commands(tar_path, destination, source_folder, members)
+    progress_name = display_name or destination.name
     creationflags = subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") else 0
     process: subprocess.Popen[str] | None = None
     try:
@@ -414,7 +498,7 @@ def _write_tar(
                         percent = min(99, int(written * 100 / total_bytes))
                         if percent >= last_percent + 5:
                             last_percent = percent
-                            _emit(progress_callback, f"Creating {destination.name}: approximately {percent}% written")
+                            _emit(progress_callback, f"Creating {progress_name}: approximately {percent}% written")
             if process.returncode != 0:
                 details = (output or "").strip()
                 raise RuntimeError(
@@ -426,7 +510,7 @@ def _write_tar(
         _raise_if_cancelled(cancel_event)
         for member in members:
             _validate_archive_member(member)
-        _emit(progress_callback, f"Archived {len(members):,} files into {destination.name}")
+        _emit(progress_callback, f"Archived {len(members):,} files into {progress_name}")
     except Exception:
         if process is not None and process.poll() is None:
             _stop_native_tar(process)
@@ -538,10 +622,63 @@ def _windows_io_path(path: str | Path) -> str:
     return "\\\\?\\" + raw
 
 
+def _work_directory_prefix(root: Path) -> str:
+    """Keep temporary-directory components safely below Windows' name limit."""
+    label = root.name or "upload"
+    if len(label) > 48:
+        label = f"{label[:31]}-{sha256(label.encode('utf-8')).hexdigest()[:16]}"
+    return f".{label}.qris-upload-"
+
+
+def _archive_basename(name: str) -> str:
+    """Return a deterministic component that leaves room for archive suffixes."""
+    # The longest generated component is ``__photos.tar.inventory.txt``.
+    max_units = 255 - _utf16_units("__photos.tar.inventory.txt")
+    if _utf16_units(name) <= max_units:
+        return name
+    digest = sha256(name.encode("utf-8")).hexdigest()[:16]
+    suffix = f"-{digest}"
+    return f"{_truncate_utf16(name, max_units - _utf16_units(suffix))}{suffix}"
+
+
+def _utf16_units(value: str) -> int:
+    """Return the Windows filename-unit length without writing a BOM."""
+    return len(value.encode("utf-16-le")) // 2
+
+
+def _truncate_utf16(value: str, max_units: int) -> str:
+    """Truncate at a Unicode boundary while respecting an NTFS component cap."""
+    result: list[str] = []
+    used = 0
+    for character in value:
+        units = _utf16_units(character)
+        if used + units > max_units:
+            break
+        result.append(character)
+        used += units
+    return "".join(result)
+
+
 def _validate_root(root: Path) -> None:
     info = root.stat(follow_symlinks=False)
     if _is_reparse(info) or not stat_module.S_ISDIR(info.st_mode):
         raise ValueError("The upload folder must be a normal directory, not a symbolic link or junction.")
+
+
+def _validate_folder(folder: Path, root: Path | None = None) -> None:
+    """Require selected folders (and their source ancestry) to stay normal dirs."""
+    components = [folder]
+    if root is not None:
+        relative = folder.relative_to(root)
+        components = [root]
+        current = root
+        for part in relative.parts:
+            current = current / part
+            components.append(current)
+    for component in components:
+        info = component.stat(follow_symlinks=False)
+        if _is_reparse(info) or not stat_module.S_ISDIR(info.st_mode):
+            raise ValueError(f"The selected upload folder is no longer a normal directory: {component}")
 
 
 def _relative_posix(path: Path, root: Path) -> str:

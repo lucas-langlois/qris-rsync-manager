@@ -95,6 +95,28 @@ def test_upload_command_can_preserve_selected_folder_name(tmp_path: Path) -> Non
     assert command[-1] == "user@ssh1.qriscloud.org.au:/data/Q9560/"
 
 
+def test_upload_command_quotes_remote_destination_spaces_and_can_force_payload_transfer(tmp_path: Path) -> None:
+    local = tmp_path / "data"
+    local.mkdir()
+    profile = Profile(username="user", remote_path="/data/Q9560/archive payload", rsync_path=r"C:\\msys64\\usr\\bin\\rsync.exe")
+
+    command = build_rsync_command(profile, local, ignore_times=True)
+
+    assert command[-1] == "user@ssh1.qriscloud.org.au:/data/Q9560/archive payload/"
+    assert "--protect-args" in command
+    assert "--ignore-times" in command
+
+
+def test_standard_remote_path_does_not_require_protected_args(tmp_path: Path) -> None:
+    local = tmp_path / "data"
+    local.mkdir()
+    profile = Profile(username="user", remote_path="/data/Q9560", rsync_path="rsync.exe")
+
+    command = build_rsync_command(profile, local)
+
+    assert "--protect-args" not in command
+
+
 def test_download_command_reverses_source_and_destination(tmp_path: Path) -> None:
     local = tmp_path / "download target"
     local.mkdir()

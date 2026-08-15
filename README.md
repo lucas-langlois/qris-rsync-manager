@@ -28,18 +28,31 @@ On first launch, Windows may show a security warning because this is not yet a c
 
 - Windows desktop GUI
 - Side-by-side local and remote directory browser
+- Fast repeat navigation with a bounded, session-only remote directory cache
+- Current-folder or multi-item selection for uploads, downloads, and comparisons
 - Confirmed drag-and-drop moves within the local pane or within the active remote collection
+- Create folders, rename/move items, and safely remove selected items in either pane
+- Local deletion uses the Windows Recycle Bin; remote deletion requires typed confirmation
 - QRIScloud connection profiles
+- Atomic profile saving, backup recovery, and isolation of malformed profile records
 - SSH key authentication with in-app passphrase prompt
 - Session-only passphrase reuse; passphrases are not saved
+- First-time setup guide for MSYS2, rsync, SSH keys, QRIScloud key registration, and profiles
+- Per-user QRIScloud host-key trust with protection against unexpected server identity changes
 - Automatic fallback between `ssh1.qriscloud.org.au` and `ssh2.qriscloud.org.au`
 - Upload and download with rsync
 - Compare/dry-run for upload and download
 - WinSCP-style upload selection for missing/changed files
+- Automatic, uncompressed TAR packaging for large flat photo/video folders, with inventory sidecars
+- QRIScloud Medici tape-recall requests for visible remote files
 - Live rsync log panel
 - Progress bar with speed and ETA where rsync reports it
-- Stop/cancel for transfers and sync-selection scans
+- Responsive background scanning plus Stop/cancel for transfers, listings, archive preparation, recall, and sync selection
+- Safe shutdown that cancels active operations and cleans up child processes
+- Unicode and long Windows/UNC path support for packaged uploads
 - Logs saved to `%APPDATA%\QRISRsyncManager\logs`
+
+See [the v1.0.0 release notes](RELEASE_NOTES_v1.0.0.md) for the complete list of changes since v0.2.0.
 
 ## Install MSYS2, rsync, and SSH
 
@@ -78,6 +91,16 @@ Check from PowerShell:
 & "C:\msys64\usr\bin\rsync.exe" --version
 & "C:\msys64\usr\bin\ssh.exe" -V
 ```
+
+### Shared Windows servers and VMs
+
+IT can install MSYS2 once at `C:\msys64` for all users of a shared Windows
+machine. The `rsync.exe` and `ssh.exe` programs can be shared, but each user must
+create and register their own SSH key and will have their own app profiles and
+host-trust file. Package installation and updates may require IT or an
+administrator to run the MSYS2 terminal; ordinary users can receive
+`Permission denied` errors from `pacman` when the shared installation is not
+writable.
 
 ### Option B: Install from the MSYS2 website
 
@@ -131,10 +154,11 @@ See the official [QRISdata collection guide](https://www.qriscloud.org.au/suppor
 3. Click **Test SSH**.
 4. Select a local folder in the left pane.
 5. Load and browse the remote folder in the right pane.
-6. Use **Compare upload** before upload.
-7. Use **Upload** to upload the local folder, preserving its name under the remote path.
-8. Use **Compare download** before download.
-9. Use **Download** to download remote contents into the selected local folder.
+6. Choose **Current folder** or **Selected items** under **Transfer scope**.
+7. Use **Compare upload** before uploading.
+8. Use **Upload folder** or **Upload selected items** to transfer data without deleting destination files.
+9. Use **Compare download** before downloading.
+10. Use **Download folder** or **Download selected files** to transfer data into the displayed local folder.
 
 Within either browser pane, selected items can be dragged onto a folder to move
 them. The app shows the exact source and destination before moving. Dragging
@@ -178,11 +202,46 @@ success, failure, or cancellation. Because media files are normally already
 compressed, the app uses `.tar` rather than `.tar.gz` to avoid costly compression
 with little storage benefit.
 
+**Compare upload folder** does not build the potentially very large TAR files.
+It compares the non-archived files and reports every planned TAR and inventory
+as a payload that the real upload will create. During a real upload, archived
+originals are excluded from the loose-file phase, the source is revalidated
+before the payload phase, and generated TAR/inventory files are always refreshed
+without an expensive remote checksum.
+
 Automatic packaging applies to the current folder and to one explicitly selected
 folder. Uploading individually selected files remains an exact selected-file
 operation and does not package them. Folder uploads preserve the selected or
 displayed folder name under the chosen remote destination.
 Existing individual files already stored remotely are not deleted automatically.
+
+Archive creation prefers Windows' built-in native `tar.exe`, with MSYS2 tar as a
+fallback, for much faster streaming of large media collections. The packaged
+build supports long local and UNC paths beyond the traditional Windows
+260-character limit. Packaging progress and failures are recorded in the
+operation log even if rsync has not started.
+
+## Remote File Management
+
+The remote browser supports double-click navigation, **Up**, **Refresh**, and a
+session-only cache that makes revisiting directories immediate. **Refresh**
+always requests a new listing from QRIScloud.
+
+You can create folders, rename or move selected items, and delete selected
+remote items. Remote moves are constrained to the active collection and require
+confirmation. Remote deletion requires typing `DELETE`; collection roots and
+unsafe paths are protected. Drag and drop moves items only within the same pane.
+It never starts an upload or download.
+
+Local deletion moves explicitly selected files or folders to the Windows
+Recycle Bin.
+
+## Recall from Tape
+
+Use **Recall from tape** when visible files have been migrated from QRIScloud
+disk cache to Medici tape. The action requests retrieval; it does not download
+the files. Recall runs in cancellable batches, reports periodic status, and can
+fall back between the two QRIScloud SSH hosts.
 
 ## Sync Selection
 
@@ -246,6 +305,15 @@ ssh -o ServerAliveInterval=60 -o ServerAliveCountMax=10
 ### SSH test times out
 
 Try again, or switch between `ssh1.qriscloud.org.au` and `ssh2.qriscloud.org.au`. The app also attempts automatic fallback between these hosts.
+
+### Connection reset by peer
+
+First confirm that WinSCP or MSYS2 SSH can connect from the same machine. A
+temporary QRIScloud connection limit can cause the first attempt to reset; wait
+briefly and try **Test SSH** again. The app automatically tries both QRIScloud
+SSH hosts. If MSYS2 SSH has never connected for this Windows user, use
+**First-time setup** to register the key and let the app establish its per-user
+host trust.
 
 ### Permission denied
 
@@ -330,9 +398,9 @@ dist\QRISRsyncManager.exe
 After building the executable:
 
 ```powershell
-git tag v0.1.0
+git tag v1.0.0
 git push origin main --tags
-gh release create v0.1.0 .\dist\QRISRsyncManager.exe --title "QRIS Rsync Manager v0.1.0" --notes "Initial MVP release."
+gh release create v1.0.0 .\dist\QRISRsyncManager.exe --title "QRIS Rsync Manager v1.0.0" --notes-file .\RELEASE_NOTES_v1.0.0.md
 ```
 
 If GitHub CLI is not authenticated:

@@ -26,6 +26,8 @@ DEFAULT_RSYNC_OPTIONS = [
     "--human-readable",
 ]
 
+REMOTE_SHELL_SPECIALS = frozenset(" \t'\"\\$`;&|<>*?[](){}!#~")
+
 SSH_KEEPALIVE_OPTIONS = [
     "-o",
     "ServerAliveInterval=60",
@@ -40,13 +42,13 @@ DRY_RUN_COMPARE_OPTIONS = [
 
 def remote_target(profile: Profile, remote_path: str | None = None) -> str:
     clean = profile.normalized()
-    path = (remote_path or clean.remote_path).strip() or f"/data/{clean.collection_id}"
+    path = _validated_remote_path((remote_path or clean.remote_path).strip() or f"/data/{clean.collection_id}")
     return f"{clean.username}@{clean.host}:{path.rstrip('/')}/"
 
 
 def remote_source(profile: Profile, remote_path: str | None = None, is_file: bool = False) -> str:
     clean = profile.normalized()
-    path = (remote_path or clean.remote_path).strip() or f"/data/{clean.collection_id}"
+    path = _validated_remote_path((remote_path or clean.remote_path).strip() or f"/data/{clean.collection_id}")
     if is_file:
         return f"{clean.username}@{clean.host}:{path.rstrip('/')}"
     return remote_target(clean, remote_path=path)
@@ -114,13 +116,23 @@ def build_rsync_command(
     direction: str = "upload",
     remote_is_file: bool = False,
     include_source_directory: bool = False,
+    ignore_times: bool = False,
 ) -> list[str]:
     clean = profile.normalized()
     local_path = Path(local_folder).expanduser()
     command = [clean.rsync_path, *DEFAULT_RSYNC_OPTIONS]
+    effective_remote_path = _validated_remote_path(
+        (remote_path or clean.remote_path).strip() or f"/data/{clean.collection_id}"
+    )
+    if any(character in REMOTE_SHELL_SPECIALS for character in effective_remote_path):
+        # Keep normal collection paths compatible with older rsync receivers,
+        # and request protected argument transport only when the path needs it.
+        command.append("--protect-args")
     if dry_run:
         command.append("--dry-run")
         command.extend(DRY_RUN_COMPARE_OPTIONS)
+    if ignore_times:
+        command.append("--ignore-times")
     if files_from:
         command.append(f"--files-from={path_for_rsync(files_from, clean.rsync_path)}")
     if exclude_from:
@@ -140,3 +152,9 @@ def build_rsync_command(
     else:
         raise ValueError("direction must be 'upload' or 'download'.")
     return command
+
+
+def _validated_remote_path(path: str) -> str:
+    if any(ord(character) < 32 or ord(character) == 127 for character in path):
+        raise ValueError("Remote paths cannot contain control characters.")
+    return path

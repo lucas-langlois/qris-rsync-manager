@@ -45,7 +45,8 @@ from app.core.archive_upload import (
     UploadArchivePlan,
     UploadPackage,
     analyze_upload_tree,
-    build_upload_package,
+    prepare_upload_package,
+    revalidate_upload_plan,
 )
 from app.core.logging_utils import new_log_file
 from app.core.file_scan import FolderScan, scan_folder
@@ -311,26 +312,37 @@ class PackagedUploadWorker(QObject):
         try:
             log_file = new_log_file(f"packaged_upload_{self.profile.name}")
             self._log_file = log_file
-            attempt_profile = self._available_profile()
-            if attempt_profile is None:
+            # Fail fast before source-sized archive work, then select a host
+            # again after packaging because preparation can take hours.
+            if self._available_profile() is None:
                 code = 130 if self._cancelled.is_set() else 124
                 return
             self._emit(
                 "Preparing uncompressed media archives. Source files will not be changed; "
                 "press Stop to cancel.\n"
             )
-            package = build_upload_package(
+            package = prepare_upload_package(
                 self.plan,
                 cancel_event=self._cancelled,
                 progress_callback=lambda message: self._emit(message + "\n"),
+                build_archives=not self.dry_run,
+                include_source_directory=self.include_source_directory,
             )
             if self._cancelled.is_set():
                 code = 130
                 return
+            archive_count = len(package.planned_groups) if self.dry_run else package.archive_count
+            inventory_count = len(package.planned_groups) if self.dry_run else package.inventory_count
             self._emit(
-                f"Prepared {package.archive_count:,} TAR archive(s) and "
-                f"{package.inventory_count:,} inventory file(s).\n"
+                f"{'Would create' if self.dry_run else 'Prepared'} {archive_count:,} TAR archive(s) and "
+                f"{inventory_count:,} inventory file(s).\n"
             )
+            if self.dry_run:
+                self._emit_planned_payload(package)
+            attempt_profile = self._available_profile()
+            if attempt_profile is None:
+                code = 130 if self._cancelled.is_set() else 124
+                return
             loose_command = build_rsync_command(
                 attempt_profile,
                 self.plan.root,
@@ -345,6 +357,19 @@ class PackagedUploadWorker(QObject):
             code = self._run_command(loose_command, log_file, "Uploading non-archived files and folders")
             if code != 0:
                 return
+            if self.dry_run:
+                # No TAR is materialised for comparisons: the loose dry-run
+                # covers retained files, while planned archive payload is logged.
+                code = 0
+                return
+            revalidate_upload_plan(self.plan, cancel_event=self._cancelled)
+            if self._cancelled.is_set():
+                code = 130
+                return
+            attempt_profile = self._available_profile()
+            if attempt_profile is None:
+                code = 130 if self._cancelled.is_set() else 124
+                return
             payload_command = build_rsync_command(
                 attempt_profile,
                 package.payload_dir,
@@ -357,6 +382,10 @@ class PackagedUploadWorker(QObject):
                 ssh_path=self.ssh_path,
                 batch_mode=not bool(self.passphrase),
                 direction="upload",
+                # TARs and inventories deliberately use source-derived mtimes.
+                # They must be sent even if an older payload happens to match
+                # their size and timestamp at the remote destination.
+                ignore_times=True,
             )
             code = self._run_command(payload_command, log_file, "Uploading TAR archives and inventories")
         except ArchiveCancelled:
@@ -378,13 +407,13 @@ class PackagedUploadWorker(QObject):
                 self.output.emit(f"\nLog saved to: {log_file}\n")
             self.finished.emit(code)
 
-    def _available_profile(self) -> Profile | None:
+    def _available_profile(self, phase: str = "before packaged upload") -> Profile | None:
         for host in fallback_hosts(self.profile):
             if self._cancelled.is_set():
-                self._emit("Upload cancelled before packaging started.\n")
+                self._emit(f"Upload cancelled {phase}.\n")
                 return None
             attempt = profile_with_host(self.profile, host)
-            self._emit(f"Checking {host} before packaged upload...\n")
+            self._emit(f"Checking {host} {phase}...\n")
             result = run_ssh_test(
                 attempt,
                 ssh_path=self.ssh_path,
@@ -393,16 +422,26 @@ class PackagedUploadWorker(QObject):
                 cancel_event=self._cancelled,
             )
             if self._cancelled.is_set():
-                self._emit("Upload cancelled before packaging started.\n")
+                self._emit(f"Upload cancelled {phase}.\n")
                 return None
             if result.returncode == 0:
-                self._emit(f"Using {host} for packaged upload.\n")
+                self._emit(f"Using {host} {phase}.\n")
                 return attempt
             self._emit(f"{host} unavailable: exit code {result.returncode}\n")
             if result.output:
                 self._emit(result.output + ("" if result.output.endswith("\n") else "\n"))
-        self._emit("No QRIScloud SSH host was available for packaged upload.\n")
+        self._emit(f"No QRIScloud SSH host was available {phase}.\n")
         return None
+
+    def _emit_planned_payload(self, package: UploadPackage) -> None:
+        """Describe dry-run TAR/inventory output without creating archive data."""
+        for group in package.planned_groups or tuple(self.plan.groups):
+            relative = f"{group.relative_folder}/" if group.relative_folder else ""
+            self._emit(
+                f"Would create and upload {relative}{group.archive_name} "
+                f"from {group.member_count:,} files ({group.member_bytes:,} member bytes), "
+                f"with {relative}{group.inventory_name}.\n"
+            )
 
     def _run_command(self, command: list[str], log_file: Path, message: str) -> int:
         if self._cancelled.is_set():

@@ -14,9 +14,13 @@ from app.core.archive_upload import (
     FileSnapshot,
     _native_tar_command,
     _native_tar_commands,
+    _group_snapshots,
+    _members_by_category,
     _windows_io_path,
     analyze_upload_tree,
     build_upload_package,
+    prepare_upload_package,
+    revalidate_upload_plan,
 )
 
 
@@ -248,22 +252,117 @@ def test_build_refuses_exact_tree_change_after_confirmation(tmp_path: Path) -> N
     assert not list(tmp_path.glob(".survey.qris-upload-*"))
 
 
+def test_revalidate_refuses_selected_folder_replaced_by_symlink(tmp_path: Path) -> None:
+    root = tmp_path / "survey"
+    selected = root / "camera"
+    _write(selected / "one.jpg", b"123")
+    _write(selected / "two.jpg", b"456")
+    plan = analyze_upload_tree(root, min_flat_files=1, min_folder_bytes=5)
+    replacement = tmp_path / "replacement"
+    _write(replacement / "one.jpg", b"123")
+    _write(replacement / "two.jpg", b"456")
+    selected.rename(root / "camera-original")
+    try:
+        selected.symlink_to(replacement, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+
+    with pytest.raises(RuntimeError, match="changed after it was scanned"):
+        revalidate_upload_plan(plan)
+
+
+def test_dry_preparation_writes_only_exclusions_and_exposes_planned_groups(tmp_path: Path) -> None:
+    root = tmp_path / "survey"
+    _write(root / "one.jpg", b"123")
+    _write(root / "two.jpg", b"456")
+    plan = analyze_upload_tree(root, min_flat_files=1, min_folder_bytes=5)
+
+    package = prepare_upload_package(plan, build_archives=False, include_source_directory=True)
+    try:
+        assert package.archive_count == package.inventory_count == 0
+        assert package.planned_groups == tuple(plan.groups)
+        assert package.payload_dir.exists()
+        assert not list(package.payload_dir.rglob("*.tar"))
+        assert "/survey/one.jpg" in package.exclude_file.read_text(encoding="utf-8")
+    finally:
+        package.cleanup()
+
+    contents_package = prepare_upload_package(plan, build_archives=False, include_source_directory=False)
+    try:
+        exclusions = contents_package.exclude_file.read_text(encoding="utf-8")
+        assert "/one.jpg" in exclusions
+        assert "/survey/one.jpg" not in exclusions
+    finally:
+        contents_package.cleanup()
+
+
+def test_indexed_sidecar_matching_handles_large_synthetic_folder() -> None:
+    folder = Path("synthetic")
+    snapshots = [
+        FileSnapshot(folder / f"frame-{index:05d}.jpg", 1, 1)
+        for index in range(2_000)
+    ] + [
+        FileSnapshot(folder / f"frame-{index:05d}.jpg.xmp", 1, 1)
+        for index in range(2_000)
+    ]
+
+    members = _members_by_category(snapshots)
+
+    assert len(members["photos"]) == 4_000
+    assert not members["videos"]
+
+
+def test_long_source_component_generates_bounded_unique_archive_names() -> None:
+    root = Path("root")
+    folder = root / ("camera-" + "x" * 400)
+    snapshots = [
+        FileSnapshot(folder / "one.jpg", 1, 1),
+        FileSnapshot(folder / "two.jpg", 1, 1),
+    ]
+
+    groups = _group_snapshots(root, folder, snapshots)
+
+    assert len(groups) == 1
+    assert len(groups[0].archive_name) <= 255
+    assert len(groups[0].inventory_name) <= 255
+    assert groups[0].archive_name.endswith("__photos.tar")
+
+
+def test_astral_source_component_respects_windows_utf16_component_limit() -> None:
+    root = Path("root")
+    folder = root / ("camera-" + "\U0001f4f7" * 140)
+    snapshots = [
+        FileSnapshot(folder / "one.jpg", 1, 1),
+        FileSnapshot(folder / "two.jpg", 1, 1),
+    ]
+
+    group = _group_snapshots(root, folder, snapshots)[0]
+
+    assert len(group.archive_name.encode("utf-16-le")) // 2 <= 255
+    assert len(group.inventory_name.encode("utf-16-le")) // 2 <= 255
+
+
 @pytest.mark.skipif(not sys.platform.startswith("win"), reason="Windows extended-path regression")
 def test_package_writes_inventory_beyond_windows_max_path(tmp_path: Path) -> None:
     root = tmp_path / "survey"
-    long_folder = root / ("D" * 80)
-    _write(long_folder / "one.jpg", b"123")
-    _write(long_folder / "two.jpg", b"456")
+    long_folder = root / ("D" * 50)
+    expected = [f"{index:04d}-{'x' * 24}.jpg" for index in range(950)]
+    for name in expected:
+        _write(long_folder / name, b"x")
     plan = analyze_upload_tree(root, min_flat_files=1, min_folder_bytes=5)
 
     package = build_upload_package(plan)
     try:
         inventory = package.payload_dir / long_folder.name / f"{long_folder.name}__photos.tar.inventory.txt"
+        archive = package.payload_dir / long_folder.name / f"{long_folder.name}__photos.tar"
         assert len(str(inventory)) > 260
+        assert len(str(archive)) > 260
         with open(_windows_io_path(inventory), encoding="utf-8") as inventory_file:
             contents = inventory_file.read()
-        assert "one.jpg" in contents
-        assert "two.jpg" in contents
+        assert expected[0] in contents
+        assert expected[-1] in contents
+        with tarfile.open(_windows_io_path(archive)) as tar:
+            assert tar.getnames() == expected
     finally:
         cleanup_error = package.cleanup()
     assert cleanup_error is None
