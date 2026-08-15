@@ -117,10 +117,17 @@ def build_rsync_command(
     remote_is_file: bool = False,
     include_source_directory: bool = False,
     ignore_times: bool = False,
+    resume_partial: bool = False,
 ) -> list[str]:
     clean = profile.normalized()
     local_path = Path(local_folder).expanduser()
-    command = [clean.rsync_path, *DEFAULT_RSYNC_OPTIONS]
+    options = [option for option in DEFAULT_RSYNC_OPTIONS if not (resume_partial and option == "-W")]
+    command = [clean.rsync_path, *options]
+    if resume_partial:
+        # Force rsync's block-matching algorithm on recovery attempts. Unlike
+        # --append-verify, this also repairs a stale destination that is already
+        # the same size as, or larger than, the source.
+        command.append("--no-whole-file")
     effective_remote_path = _validated_remote_path(
         (remote_path or clean.remote_path).strip() or f"/data/{clean.collection_id}"
     )

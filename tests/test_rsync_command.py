@@ -117,6 +117,20 @@ def test_standard_remote_path_does_not_require_protected_args(tmp_path: Path) ->
     assert "--protect-args" not in command
 
 
+def test_resumable_transfer_uses_delta_matching_without_whole_file(tmp_path: Path) -> None:
+    local = tmp_path / "payload"
+    local.mkdir()
+    profile = Profile(username="user", remote_path="/data/Q9560", rsync_path="rsync.exe")
+
+    command = build_rsync_command(profile, local, ignore_times=True, resume_partial=True)
+
+    assert "--no-whole-file" in command
+    assert "--append-verify" not in command
+    assert "--partial" in command
+    assert "--ignore-times" in command
+    assert "-W" not in command
+
+
 def test_download_command_reverses_source_and_destination(tmp_path: Path) -> None:
     local = tmp_path / "download target"
     local.mkdir()

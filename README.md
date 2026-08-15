@@ -52,7 +52,7 @@ On first launch, Windows may show a security warning because this is not yet a c
 - Unicode and long Windows/UNC path support for packaged uploads
 - Logs saved to `%APPDATA%\QRISRsyncManager\logs`
 
-See [the v1.0.0 release notes](RELEASE_NOTES_v1.0.0.md) for the complete list of changes since v0.2.0.
+See [the v1.0.1 release notes](RELEASE_NOTES_v1.0.1.md) for the latest transfer-recovery improvements and [the v1.0.0 release notes](RELEASE_NOTES_v1.0.0.md) for the complete feature list since v0.2.0.
 
 ## Install MSYS2, rsync, and SSH
 
@@ -197,10 +197,11 @@ filenames, sizes, and modification times.
 
 The confirmation window shows the proposed archives before work begins. The
 source files are never modified or deleted. TAR files are built in a temporary
-folder beside the upload source, uploaded with rsync, and removed locally after
-success, failure, or cancellation. Because media files are normally already
-compressed, the app uses `.tar` rather than `.tar.gz` to avoid costly compression
-with little storage benefit.
+folder beside the upload source and uploaded with rsync. Successful and cancelled
+operations remove the temporary package. If recovery from a transfer failure is
+exhausted, the package is retained and its location is shown in the log. Because
+media files are normally already compressed, the app uses `.tar` rather than
+`.tar.gz` to avoid costly compression with little storage benefit.
 
 **Compare upload folder** does not build the potentially very large TAR files.
 It compares the non-archived files and reports every planned TAR and inventory
@@ -208,6 +209,12 @@ as a payload that the real upload will create. During a real upload, archived
 originals are excluded from the loose-file phase, the source is revalidated
 before the payload phase, and generated TAR/inventory files are always refreshed
 without an expensive remote checksum.
+
+If QRIScloud resets a connection during a packaged upload, the app keeps the
+partial remote file and retries automatically with increasing delays. It tries
+the other QRIScloud SSH host first and uses rsync block matching on recovery so
+matching data already received can be reused. Authentication failures are not
+automatically retried.
 
 Automatic packaging applies to the current folder and to one explicitly selected
 folder. Uploading individually selected files remains an exact selected-file
@@ -398,9 +405,9 @@ dist\QRISRsyncManager.exe
 After building the executable:
 
 ```powershell
-git tag v1.0.0
+git tag v1.0.1
 git push origin main --tags
-gh release create v1.0.0 .\dist\QRISRsyncManager.exe --title "QRIS Rsync Manager v1.0.0" --notes-file .\RELEASE_NOTES_v1.0.0.md
+gh release create v1.0.1 .\dist\QRISRsyncManager.exe --title "QRIS Rsync Manager v1.0.1" --notes-file .\RELEASE_NOTES_v1.0.1.md
 ```
 
 If GitHub CLI is not authenticated:

@@ -281,6 +281,11 @@ class PackagedUploadWorker(QObject):
     output = Signal(str)
     finished = Signal(int)
 
+    # Do not include SSH's generic 255: it can mean an authentication failure,
+    # and repeatedly retrying a rejected key can trigger QRIScloud throttling.
+    RETRYABLE_RSYNC_EXIT_CODES = frozenset({10, 12, 30, 35})
+    RETRY_DELAYS_SECONDS = (10, 30, 60)
+
     def __init__(
         self,
         profile: Profile,
@@ -339,22 +344,22 @@ class PackagedUploadWorker(QObject):
             )
             if self.dry_run:
                 self._emit_planned_payload(package)
-            attempt_profile = self._available_profile()
-            if attempt_profile is None:
-                code = 130 if self._cancelled.is_set() else 124
-                return
-            loose_command = build_rsync_command(
-                attempt_profile,
-                self.plan.root,
-                remote_path=self.remote_path,
-                dry_run=self.dry_run,
-                ssh_path=self.ssh_path,
-                batch_mode=not bool(self.passphrase),
-                exclude_from=package.exclude_file,
-                direction="upload",
-                include_source_directory=self.include_source_directory,
+            code = self._run_transfer_with_retries(
+                lambda attempt_profile, is_retry: build_rsync_command(
+                    attempt_profile,
+                    self.plan.root,
+                    remote_path=self.remote_path,
+                    dry_run=self.dry_run,
+                    ssh_path=self.ssh_path,
+                    batch_mode=not bool(self.passphrase),
+                    exclude_from=package.exclude_file,
+                    direction="upload",
+                    include_source_directory=self.include_source_directory,
+                    resume_partial=is_retry and not self.dry_run,
+                ),
+                log_file,
+                "Uploading non-archived files and folders",
             )
-            code = self._run_command(loose_command, log_file, "Uploading non-archived files and folders")
             if code != 0:
                 return
             if self.dry_run:
@@ -366,28 +371,28 @@ class PackagedUploadWorker(QObject):
             if self._cancelled.is_set():
                 code = 130
                 return
-            attempt_profile = self._available_profile()
-            if attempt_profile is None:
-                code = 130 if self._cancelled.is_set() else 124
-                return
-            payload_command = build_rsync_command(
-                attempt_profile,
-                package.payload_dir,
-                remote_path=(
-                    f"{self.remote_path.rstrip('/')}/{self.plan.root.name}"
-                    if self.include_source_directory
-                    else self.remote_path
+            code = self._run_transfer_with_retries(
+                lambda attempt_profile, is_retry: build_rsync_command(
+                    attempt_profile,
+                    package.payload_dir,
+                    remote_path=(
+                        f"{self.remote_path.rstrip('/')}/{self.plan.root.name}"
+                        if self.include_source_directory
+                        else self.remote_path
+                    ),
+                    dry_run=self.dry_run,
+                    ssh_path=self.ssh_path,
+                    batch_mode=not bool(self.passphrase),
+                    direction="upload",
+                    # TARs and inventories deliberately use source-derived mtimes.
+                    # They must be sent even if an older payload happens to match
+                    # their size and timestamp at the remote destination.
+                    ignore_times=True,
+                    resume_partial=is_retry,
                 ),
-                dry_run=self.dry_run,
-                ssh_path=self.ssh_path,
-                batch_mode=not bool(self.passphrase),
-                direction="upload",
-                # TARs and inventories deliberately use source-derived mtimes.
-                # They must be sent even if an older payload happens to match
-                # their size and timestamp at the remote destination.
-                ignore_times=True,
+                log_file,
+                "Uploading TAR archives and inventories",
             )
-            code = self._run_command(payload_command, log_file, "Uploading TAR archives and inventories")
         except ArchiveCancelled:
             self._emit("Archive preparation was cancelled.\n")
             code = 130
@@ -395,7 +400,8 @@ class PackagedUploadWorker(QObject):
             self._emit(f"Packaged upload failed: {exc}\n")
             code = 1
         finally:
-            if package is not None:
+            should_cleanup_package = package is not None and (code in {0, 130} or self.dry_run)
+            if should_cleanup_package and package is not None:
                 cleanup_error = package.cleanup()
                 if cleanup_error:
                     self._emit(cleanup_error + "\nPlease ask local IT to remove that folder after closing the app.\n")
@@ -403,12 +409,25 @@ class PackagedUploadWorker(QObject):
                         code = 1
                 else:
                     self._emit("Removed temporary archive files.\n")
+            elif package is not None:
+                self._emit(
+                    "Packaged upload did not complete after automatic recovery attempts. "
+                    f"Temporary archive files were retained at: {package.work_dir}\n"
+                    "Keep this folder until the upload problem is resolved; it may use substantial disk space.\n"
+                )
             if log_file is not None and log_file.exists():
                 self.output.emit(f"\nLog saved to: {log_file}\n")
             self.finished.emit(code)
 
-    def _available_profile(self, phase: str = "before packaged upload") -> Profile | None:
-        for host in fallback_hosts(self.profile):
+    def _available_profile(
+        self,
+        phase: str = "before packaged upload",
+        avoid_host: str | None = None,
+    ) -> Profile | None:
+        hosts = fallback_hosts(self.profile)
+        if avoid_host and len(hosts) > 1:
+            hosts = [host for host in hosts if host != avoid_host] + [host for host in hosts if host == avoid_host]
+        for host in hosts:
             if self._cancelled.is_set():
                 self._emit(f"Upload cancelled {phase}.\n")
                 return None
@@ -432,6 +451,53 @@ class PackagedUploadWorker(QObject):
                 self._emit(result.output + ("" if result.output.endswith("\n") else "\n"))
         self._emit(f"No QRIScloud SSH host was available {phase}.\n")
         return None
+
+    def _run_transfer_with_retries(self, command_builder, log_file: Path, message: str) -> int:
+        last_code: int | None = None
+        previous_host: str | None = None
+        attempt_count = len(self.RETRY_DELAYS_SECONDS) + 1
+        for attempt_index in range(attempt_count):
+            if self._cancelled.is_set():
+                return 130
+            phase = (
+                f"before {message.lower()}"
+                if attempt_index == 0
+                else f"before retry {attempt_index + 1} of {attempt_count} for {message.lower()}"
+            )
+            attempt_profile = self._available_profile(phase=phase, avoid_host=previous_host)
+            if attempt_profile is None:
+                if self._cancelled.is_set():
+                    return 130
+                return last_code if last_code is not None else 124
+            if attempt_index:
+                self._emit(
+                    f"Retrying with {attempt_profile.host} "
+                    f"(attempt {attempt_index + 1} of {attempt_count}).\n"
+                )
+            last_code = self._run_command(
+                command_builder(attempt_profile, attempt_index > 0),
+                log_file,
+                message,
+            )
+            if last_code == 0 or last_code == 130 or self._cancelled.is_set():
+                return 130 if self._cancelled.is_set() else last_code
+            if last_code not in self.RETRYABLE_RSYNC_EXIT_CODES:
+                return last_code
+            previous_host = attempt_profile.host
+            if attempt_index == attempt_count - 1:
+                self._emit(
+                    f"{message} failed with recoverable rsync exit code {last_code}, "
+                    "but all automatic retry attempts have been used.\n"
+                )
+                return last_code
+            delay = self.RETRY_DELAYS_SECONDS[attempt_index]
+            self._emit(
+                f"Connection interrupted with rsync exit code {last_code}. "
+                f"The partial transfer was kept; retrying in {delay} seconds.\n"
+            )
+            if self._cancelled.wait(delay):
+                return 130
+        return last_code if last_code is not None else 1
 
     def _emit_planned_payload(self, package: UploadPackage) -> None:
         """Describe dry-run TAR/inventory output without creating archive data."""
