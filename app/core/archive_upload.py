@@ -535,7 +535,11 @@ def _native_tar_commands(
     for name in names:
         candidate = [*current, name]
         probe = _native_tar_command(tar_path, destination, source_folder, candidate, append=bool(batches))
-        if current and len(subprocess.list2cmdline(probe)) > command_limit:
+        # CreateProcess counts UTF-16 code units, not Python characters.
+        if _utf16_units(subprocess.list2cmdline(probe)) > command_limit:
+            single = _native_tar_command(tar_path, destination, source_folder, [name], append=bool(batches or current))
+            if _utf16_units(subprocess.list2cmdline(single)) > command_limit:
+                raise ValueError(f"Archive member exceeds the Windows command-line limit: {name}")
             batches.append(current)
             current = [name]
         else:

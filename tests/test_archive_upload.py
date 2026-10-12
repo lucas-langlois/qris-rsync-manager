@@ -121,21 +121,53 @@ def test_native_tar_command_uses_one_mib_block_and_nul_member_list(tmp_path: Pat
 def test_native_tar_splits_long_windows_commands_into_create_then_append_batches(tmp_path: Path) -> None:
     root = tmp_path / "source"
     members = [FileSnapshot(root / f"very-long-photo-name-{index:03d}.jpg", 1, 1) for index in range(10)]
+    two_members = _native_tar_command(
+        "tar.exe", tmp_path / "output.tar", root,
+        [member.path.name for member in members[:2]], append=False,
+    )
+    command_limit = len(subprocess.list2cmdline(two_members).encode("utf-16-le")) // 2
 
     commands = _native_tar_commands(
         "tar.exe",
         tmp_path / "output.tar",
         root,
         members,
-        command_limit=180,
+        command_limit=command_limit,
     )
 
     assert len(commands) > 1
     assert commands[0][1] == "-c"
     assert all(command[1] == "-r" for command in commands[1:])
+    assert all(len(subprocess.list2cmdline(command).encode("utf-16-le")) // 2 <= command_limit for command in commands)
     assert [name for command in commands for name in command[command.index("--") + 1 :]] == [
         member.path.name for member in members
     ]
+
+
+def test_native_tar_batches_astral_names_within_windows_limit(tmp_path: Path) -> None:
+    root = tmp_path / "source"
+    names = ["\U0001f4f7" * 100 + f"{index}.jpg" for index in range(220)]
+    members = [FileSnapshot(root / name, 1, 1) for name in names]
+
+    commands = _native_tar_commands("tar.exe", tmp_path / "output.tar", root, members)
+
+    assert len(commands) > 1
+    assert commands[0][1] == "-c"
+    assert all(command[1] == "-r" for command in commands[1:])
+    assert all(len(subprocess.list2cmdline(command).encode("utf-16-le")) // 2 <= 30_000 for command in commands)
+    assert [name for command in commands for name in command[command.index("--") + 1:]] == names
+
+
+def test_native_tar_rejects_single_member_exceeding_command_limit(tmp_path: Path) -> None:
+    root = tmp_path / "source"
+    member = FileSnapshot(root / ("\U0001f4f7" * 100 + ".jpg"), 1, 1)
+    command = _native_tar_command("tar.exe", tmp_path / "output.tar", root, [member.path.name], append=False)
+
+    with pytest.raises(ValueError, match="command-line limit"):
+        _native_tar_commands(
+            "tar.exe", tmp_path / "output.tar", root, [member],
+            command_limit=len(subprocess.list2cmdline(command)),
+        )
 
 
 def test_ambiguous_same_stem_sidecar_stays_outside_archives(tmp_path: Path) -> None:

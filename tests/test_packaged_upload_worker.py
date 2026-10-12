@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from app.core.archive_upload import UploadPackage, analyze_upload_tree
 from app.core.profiles import Profile
+from app.core.ssh_test import CommandResult
 from app.gui.main_window import PackagedUploadWorker
 
 
@@ -305,3 +308,75 @@ def test_packaged_retry_prefers_the_other_qriscloud_host(monkeypatch, tmp_path: 
     assert selected is not None
     assert selected.host == "ssh2.qriscloud.org.au"
     assert attempted_hosts == ["ssh2.qriscloud.org.au"]
+
+
+@pytest.mark.parametrize("failure", [
+    CommandResult(124, "SSH test timed out after 30 seconds."),
+    CommandResult(255, "ssh: connect to host host port 22: Connection refused"),
+])
+def test_recovery_continues_after_transient_host_check_failure(monkeypatch, tmp_path: Path, failure) -> None:
+    profile = Profile(name="test", username="user", host="host")
+    worker = PackagedUploadWorker(profile, _plan(tmp_path), "/data/Q0101", dry_run=False)
+    checks = iter([CommandResult(0, "OK"), failure, CommandResult(0, "OK")])
+    monkeypatch.setattr("app.gui.main_window.run_ssh_test", lambda *_args, **_kwargs: next(checks))
+    codes = iter([10, 0])
+    monkeypatch.setattr(worker, "_run_command", lambda *_args: next(codes))
+    delays = []
+    monkeypatch.setattr(worker._cancelled, "wait", lambda delay: delays.append(delay) or False)
+    resume_flags = []
+
+    result = worker._run_transfer_with_retries(
+        lambda _profile, retry: resume_flags.append(retry) or ["rsync"], tmp_path / "unused.log", "Upload",
+    )
+
+    assert result == 0
+    assert delays == [10, 30]
+    assert resume_flags == [False, True]
+
+
+@pytest.mark.parametrize("failure", [
+    CommandResult(255, "Permission denied (publickey)."),
+    CommandResult(255, "Unknown SSH failure"),
+    CommandResult(127, "SSH executable was not found"),
+])
+def test_recovery_does_not_retry_non_network_host_failure(monkeypatch, tmp_path: Path, failure) -> None:
+    profile = Profile(name="test", username="user", host="host")
+    worker = PackagedUploadWorker(profile, _plan(tmp_path), "/data/Q0101", dry_run=False)
+    checks = iter([CommandResult(0, "OK"), failure])
+    monkeypatch.setattr("app.gui.main_window.run_ssh_test", lambda *_args, **_kwargs: next(checks))
+    monkeypatch.setattr(worker, "_run_command", lambda *_args: 10)
+    delays = []
+    monkeypatch.setattr(worker._cancelled, "wait", lambda delay: delays.append(delay) or False)
+
+    assert worker._run_transfer_with_retries(lambda *_args: ["rsync"], tmp_path / "unused.log", "Upload") == 10
+    assert delays == [10]
+
+
+@pytest.mark.parametrize("cancel_during_wait", [False, True])
+def test_repeated_host_timeouts_are_bounded_and_cancellable(monkeypatch, tmp_path: Path, cancel_during_wait) -> None:
+    profile = Profile(name="test", username="user", host="host")
+    worker = PackagedUploadWorker(profile, _plan(tmp_path), "/data/Q0101", dry_run=False)
+    checks = []
+
+    def ssh_test(*_args, **_kwargs):
+        checks.append(True)
+        return CommandResult(0, "OK") if len(checks) == 1 else CommandResult(124, "Timed out")
+
+    monkeypatch.setattr("app.gui.main_window.run_ssh_test", ssh_test)
+    monkeypatch.setattr(worker, "_run_command", lambda *_args: 10)
+    delays = []
+
+    def wait(delay):
+        delays.append(delay)
+        if cancel_during_wait and len(delays) == 2:
+            worker._cancelled.set()
+            return True
+        return False
+
+    monkeypatch.setattr(worker._cancelled, "wait", wait)
+
+    result = worker._run_transfer_with_retries(lambda *_args: ["rsync"], tmp_path / "unused.log", "Upload")
+
+    assert result == (130 if cancel_during_wait else 10)
+    assert delays == ([10, 30] if cancel_during_wait else [10, 30, 60])
+    assert len(checks) == (2 if cancel_during_wait else 4)

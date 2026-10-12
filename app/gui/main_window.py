@@ -308,6 +308,7 @@ class PackagedUploadWorker(QObject):
         self.runner = RsyncRunner()
         self._cancelled = threading.Event()
         self._log_file: Path | None = None
+        self._host_checks_retryable = False
 
     @Slot()
     def run(self) -> None:
@@ -424,6 +425,7 @@ class PackagedUploadWorker(QObject):
         phase: str = "before packaged upload",
         avoid_host: str | None = None,
     ) -> Profile | None:
+        self._host_checks_retryable = True
         hosts = fallback_hosts(self.profile)
         if avoid_host and len(hosts) > 1:
             hosts = [host for host in hosts if host != avoid_host] + [host for host in hosts if host == avoid_host]
@@ -449,6 +451,18 @@ class PackagedUploadWorker(QObject):
             self._emit(f"{host} unavailable: exit code {result.returncode}\n")
             if result.output:
                 self._emit(result.output + ("" if result.output.endswith("\n") else "\n"))
+            # SSH uses 255 for both network and authentication failures. Only
+            # retry known connection failures; leave ambiguous failures alone.
+            transient = result.returncode == 124 or (
+                result.returncode == 255
+                and any(text in result.output.lower() for text in (
+                    "connection timed out", "connection refused", "connection reset",
+                    "network is unreachable", "no route to host",
+                    "temporary failure in name resolution",
+                ))
+            )
+            if not transient:
+                self._host_checks_retryable = False
         self._emit(f"No QRIScloud SSH host was available {phase}.\n")
         return None
 
@@ -468,22 +482,24 @@ class PackagedUploadWorker(QObject):
             if attempt_profile is None:
                 if self._cancelled.is_set():
                     return 130
-                return last_code if last_code is not None else 124
-            if attempt_index:
-                self._emit(
-                    f"Retrying with {attempt_profile.host} "
-                    f"(attempt {attempt_index + 1} of {attempt_count}).\n"
+                if last_code is None or not self._host_checks_retryable:
+                    return last_code if last_code is not None else 124
+            else:
+                if attempt_index:
+                    self._emit(
+                        f"Retrying with {attempt_profile.host} "
+                        f"(attempt {attempt_index + 1} of {attempt_count}).\n"
+                    )
+                last_code = self._run_command(
+                    command_builder(attempt_profile, attempt_index > 0),
+                    log_file,
+                    message,
                 )
-            last_code = self._run_command(
-                command_builder(attempt_profile, attempt_index > 0),
-                log_file,
-                message,
-            )
+                previous_host = attempt_profile.host
             if last_code == 0 or last_code == 130 or self._cancelled.is_set():
                 return 130 if self._cancelled.is_set() else last_code
             if last_code not in self.RETRYABLE_RSYNC_EXIT_CODES:
                 return last_code
-            previous_host = attempt_profile.host
             if attempt_index == attempt_count - 1:
                 self._emit(
                     f"{message} failed with recoverable rsync exit code {last_code}, "
