@@ -508,4 +508,4 @@ Links in the PDF are clickable. Installation and account instructions were check
 
 App labels, profile fields, folder destinations, archive behavior, and transfer receipts were checked against the repository's README, built-in setup guide, and implementation of **v1.1.0** (commit a0342cb). The registration command adapts the built-in method to use the installed MSYS2 SSH program explicitly and set accepted-key permissions. It has not been run against a live QRIScloud account for this guide.
 
-The guide uses text path diagrams rather than simulated app screenshots. The editable source is `WINDOWS_BEGINNER_TUTORIAL.md` in the repository; the printable guide is `output/pdf/QRIS_Rsync_Manager_Windows_Guide.pdf`.
+The guide uses text path diagrams rather than simulated app screenshots. The editable source is `WINDOWS_BEGINNER_TUTORIAL.md` in the repository; the printable guide is built with `packaging/build_tutorial_pdf.py`.

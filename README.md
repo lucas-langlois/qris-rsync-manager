@@ -446,6 +446,22 @@ The executable is written to:
 dist\QRISRsyncManager.exe
 ```
 
+### Build the PDF Guide
+
+The printable beginner guide is generated from `WINDOWS_BEGINNER_TUTORIAL.md`.
+Edit the Markdown, then rebuild (requires the `packaging` extras, which include
+ReportLab):
+
+```powershell
+.\envs\qris-rsync-manager\python.exe packaging\build_tutorial_pdf.py
+```
+
+The PDF is written to:
+
+```text
+dist\QRIS_Rsync_Manager_Windows_Guide.pdf
+```
+
 ### Create a GitHub Release
 
 After building the executable:

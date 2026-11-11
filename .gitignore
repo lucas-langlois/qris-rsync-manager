@@ -10,3 +10,5 @@ dist/
 build/
 *.spec
 !packaging/QRISRsyncManager.spec
+output/
+tmp/
