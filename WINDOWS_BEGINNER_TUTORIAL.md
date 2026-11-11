@@ -11,7 +11,7 @@ Read one step, do it, then check the expected result before continuing.
 
 ### What the app does
 
-An **upload** copies files from your computer to QRIScloud. A **download** copies them back. The app uses **rsync**, a file-copying program, over **SSH**, an encrypted connection to the server. MSYS2 supplies these programs on Windows.
+An **upload** copies files from your computer to QRIScloud. A **download** copies them back. The app uses **rsync**, a file-copying program, over **SSH**, an encrypted connection to the server. MSYS2 supplies these programs on Windows. After each transfer, the app writes a **receipt**: a dated list of the files it moved, with a checksum for each one.
 
 The left browser shows **Local** files on your computer. The right browser shows **Remote** files on QRIScloud. A **path** is a file or folder's address, such as `C:\Users\Alex\Documents\Research`.
 
@@ -27,7 +27,7 @@ The left browser shows **Local** files on your computer. The right browser shows
 8. Test SSH and browse your collection.
 9. Compare and upload a tiny test folder.
 10. Download the test file into a separate folder.
-11. Understand folder destinations and automatic archives.
+11. Understand folder destinations, automatic archives, and transfer receipts.
 12. Resolve common problems.
 
 ### Two windows for commands
@@ -256,7 +256,7 @@ Alternatively, click **New** beside the Profile selector to enter the same setti
 
 **Example only:** if your Windows account is Alex, the private key could be `C:\Users\Alex\.ssh\qriscloud_ed25519`. Choose the file under your own Windows account. Paths entered in the app do not need enclosing quotation marks.
 
-The setup wizard pre-fills the suggested key filename. If you reused another key, change **SSH key path** to its real private file. The app saves settings, but does not save your UQ password or key passphrase.
+The setup wizard pre-fills the suggested key filename. When you click **New** or **Edit**, the app also fills an empty **SSH key path** from your other profiles, or from a single QRIScloud key it finds in your `.ssh` folder. Check the suggestion: if you reused another key, change **SSH key path** to its real private file. If you try to save a profile with no key, or with a key file that does not exist, the app warns you first, because QRIScloud normally refuses the connection without one. The app saves settings, but does not save your UQ password or key passphrase.
 
 ### Where is the SSH executable field?
 
@@ -330,6 +330,8 @@ A **dry run** previews a transfer. It does not copy file data or change destinat
 11. Click **Yes** and wait. Watch the progress and Log. Do not close the app or let the computer sleep.
 12. When the operation finishes with exit code **0**, click **Refresh** in Remote. Open the newly uploaded `QRIS practice upload` folder. Confirm that `hello-qris.txt` is there.
 
+The upload also created a folder named `.qris-receipts` inside `QRIS practice upload`, both on your computer and on QRIScloud. It holds the receipt for this transfer. Step 11 explains how to read it.
+
 **Folder address example only:** with a remote destination of `/data/Q0101`, this upload produces `/data/Q0101/QRIS practice upload/hello-qris.txt`. The app adds the local folder name under the destination. Use your real Q number.
 
 For a small text file the transfer may finish too fast to show a useful speed or estimated time. The completion result and visible file matter more than the moving progress bar.
@@ -400,15 +402,30 @@ In a qualifying folder, every file of the qualifying type goes into one archive,
 **Illustrative example:** a folder named `Dive photos` with 300 JPEG photos can produce `Dive photos.tar` and `Dive photos.tar.inventory.txt`. If that folder also held 80 `.json` files, they would go into the same `Dive photos.tar`. The inventory is a readable list of filenames, sizes, and modification times. Use the actual names shown in the app's archive plan; long or unusual folder names can be adjusted. If a folder's archive would be larger than 50 GB, the app splits it into numbered parts, such as `Dive photos.part01.tar` and `Dive photos.part02.tar`, and each part gets its own inventory.
 
 1. Read the proposed archive list in the confirmation before agreeing.
-2. Check the temporary-space estimate. Archives are built beside the local source folder, so that drive needs roughly enough extra space for the packaged media plus overhead. A TAR is not a compressed space-saving backup.
+2. Check the temporary-space estimate. Archives are built beside the local source folder, so that drive needs roughly enough extra space for the archived files plus overhead. A TAR is not a compressed space-saving backup.
 3. Leave the source data alone until the operation completes.
 4. After upload, expect the TAR and inventory on QRIScloud rather than separate copies of those archived originals. The source files on your computer remain unchanged.
 
-The comparison reports planned archives without building the large TAR files. It compares the loose files, then describes the archive payload the real upload will create. A real packaged upload refreshes generated archives and inventories; it is not necessarily a quick upload of only the changed photo.
+The comparison reports planned archives without building the large TAR files. It compares the loose files, then describes the archive payload the real upload will create. A real packaged upload refreshes generated archives and inventories; it is not necessarily a quick upload of only the changed file.
 
 Successful or cancelled operations remove the temporary package. If transfer recovery fails, the package can remain; the Log shows its location. Do not remove it while an operation is active. Existing loose copies on QRIScloud are not automatically deleted when you later upload an archive.
 
 Selecting individual local files uploads those selected files without automatic packaging. That is useful when you intentionally need a few separate files, but does not solve storage file-count limits for a large dataset.
+
+### Transfer receipts
+
+Every upload or download that copies at least one file writes a **receipt**. It is your record of what was transferred, when, and to where, so you can tell which folders have been synced and which have not.
+
+A receipt is two files with the same name, for example `20261111T052430Z_upload.json` and `20261111T052430Z_upload.sha256`. The name starts with the date and time in UTC. Receipts are never overwritten, so each transfer adds a new one.
+
+- **Where:** in a `.qris-receipts` folder inside the folder you transferred. An upload keeps one copy on your computer and one on QRIScloud. A download keeps its receipt on your computer only, inside the download folder.
+- **What it lists:** each transferred file with its size, modification time, and **SHA-256 checksum**, a fingerprint of the file's exact contents. For a packaged upload, it lists the `.tar` and inventory files that were sent.
+- **Not listed:** files that were already up to date were not transferred, so they are not in the new receipt. A transfer that copied nothing writes no receipt.
+- **Interrupted transfers:** a receipt ending in `_incomplete` is kept on your computer only. It shows what was sent before the problem.
+
+The app never copies `.qris-receipts` folders as ordinary data, and **Find changed files** ignores them. Leave them in place.
+
+To check later that the files on QRIScloud still match, someone with command-line access to QRIScloud or an HPC system can open the transferred folder and run `sha256sum -c .qris-receipts/<receipt name>.sha256`. Each file should report `OK`. This reads every listed file, so it can take a while for large datasets.
 
 ### Getting files out of an archive
 
@@ -447,6 +464,7 @@ Read the **first specific error** in the Log as well as the final exit code. A n
 | Files appear in the wrong folder | Check both Path boxes and the upload/download examples in step 10 before repeating the transfer. |
 | Not enough disk space during packaging | Check free space on the source drive against the temporary-space estimate, not just the destination quota. |
 | Upload reports quota or too many files | Contact the collection owner/support. Group suitable files into archives; do not delete shared files to make room without agreement. |
+| Log warns that the receipt could not be saved or uploaded | The transfer itself still completed. Check that you can write to the local folder. Any copy reported as saved is still valid. |
 | Download waits a long time or reports I/O errors | Some data may need retrieval from tape. **Recall from tape** requests retrieval for visible files; it does not download them. Contact support for persistent delays. |
 
 **Need to stop?** Click **Stop** and wait for cancellation to finish. Source files remain; partial destination files can remain too. Compare the same source/destination again before retrying. Packaged uploads can retry interrupted connections automatically; authentication failures need correction rather than repeated retries.
@@ -475,6 +493,7 @@ Include your app version, username, Q number, operation, exact error, and releva
 4. Read the confirmation, including archive and space notices.
 5. Start the real transfer and check that it finishes with exit code **0**.
 6. Refresh the destination and check the expected result.
+7. If you need a record of the transfer, find its receipt in the `.qris-receipts` folder.
 
 ### Verified sources and scope
 
@@ -487,6 +506,6 @@ Links in the PDF are clickable. Installation and account instructions were check
 - [Microsoft OpenSSH key management](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_keymanagement) for key-pair and passphrase guidance.
 - [OpenSSH authorized-key documentation](https://man.openbsd.org/sshd.8#AUTHORIZED_KEYS_FILE_FORMAT) for public-key registration on the server.
 
-App labels, profile fields, folder destinations, and archive behavior were checked against the repository's README, built-in setup guide, and implementation at **aa876b2**. The registration command adapts the built-in method to use the installed MSYS2 SSH program explicitly and set accepted-key permissions. It has not been run against a live QRIScloud account for this guide.
+App labels, profile fields, folder destinations, archive behavior, and transfer receipts were checked against the repository's README, built-in setup guide, and implementation of **v1.1.0** (commit a0342cb). The registration command adapts the built-in method to use the installed MSYS2 SSH program explicitly and set accepted-key permissions. It has not been run against a live QRIScloud account for this guide.
 
 The guide uses text path diagrams rather than simulated app screenshots. The editable source is `WINDOWS_BEGINNER_TUTORIAL.md` in the repository; the printable guide is `output/pdf/QRIS_Rsync_Manager_Windows_Guide.pdf`.
