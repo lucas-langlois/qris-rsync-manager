@@ -15,7 +15,7 @@ def _plan(tmp_path: Path):
     source.mkdir()
     (source / "one.jpg").write_bytes(b"123")
     (source / "two.jpg").write_bytes(b"456")
-    return analyze_upload_tree(source, min_flat_files=1, min_folder_bytes=5)
+    return analyze_upload_tree(source, min_same_type=1)
 
 
 def test_packaged_worker_uploads_loose_tree_then_archive_payload_and_cleans_up(monkeypatch, tmp_path: Path) -> None:
@@ -380,3 +380,58 @@ def test_repeated_host_timeouts_are_bounded_and_cancellable(monkeypatch, tmp_pat
     assert result == (130 if cancel_during_wait else 10)
     assert delays == ([10, 30] if cancel_during_wait else [10, 30, 60])
     assert len(checks) == (2 if cancel_during_wait else 4)
+
+
+def test_packaged_worker_writes_receipt_with_loose_files_and_archives(monkeypatch, tmp_path: Path) -> None:
+    import hashlib
+    import json
+
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    plan = _plan(tmp_path)
+    (plan.root / "notes.txt").write_bytes(b"loose")
+    plan = analyze_upload_tree(plan.root, min_same_type=1)
+    profile = Profile(
+        name="Q0101",
+        username="user",
+        host="ssh1.qriscloud.org.au",
+        collection_id="Q0101",
+        remote_path="/data/Q0101",
+        rsync_path=r"C:\msys64\usr\bin\rsync.exe",
+    )
+    worker = PackagedUploadWorker(profile, plan, "/data/Q0101", dry_run=False, ssh_path="ssh.exe")
+    monkeypatch.setattr(worker, "_available_profile", lambda *args, **kwargs: profile)
+    commands: list[list[str]] = []
+    tar_hash: list[str] = []
+    outputs = [
+        "<f+++++++++ notes.txt\n",
+        "<f+++++++++ source.tar\n<f+++++++++ source.tar.inventory.txt\n",
+    ]
+
+    def run(command, _log_file, on_output, *_args, **_kwargs) -> int:
+        commands.append(command)
+        if len(commands) == 2:
+            payload = Path(command[-2].rstrip("/"))
+            if not payload.exists():  # MSYS-style /x/... path
+                payload = Path(f"{command[-2][1].upper()}:{command[-2][2:]}")
+            tar_hash.append(hashlib.sha256((payload / "source.tar").read_bytes()).hexdigest())
+        if len(commands) <= 2:
+            on_output(outputs[len(commands) - 1])
+        return 0
+
+    monkeypatch.setattr(worker.runner, "run", run)
+    results: list[int] = []
+    worker.finished.connect(results.append)
+
+    worker.run()
+
+    assert results == [0]
+    assert len(commands) == 3
+    assert commands[2][-1] == "user@ssh1.qriscloud.org.au:/data/Q0101/.qris-receipts/"
+    receipts = list((plan.root / ".qris-receipts").glob("*_upload.json"))
+    assert not (tmp_path / "appdata" / "QRISRsyncManager" / "receipts").exists()
+    receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+    by_path = {item["path"]: item for item in receipt["files"]}
+    assert set(by_path) == {"notes.txt", "source.tar", "source.tar.inventory.txt"}
+    assert by_path["notes.txt"]["sha256"] == hashlib.sha256(b"loose").hexdigest()
+    assert by_path["source.tar"]["sha256"] == tar_hash[0]
+    assert receipt["status"] == "complete"

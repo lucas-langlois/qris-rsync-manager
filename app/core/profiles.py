@@ -213,6 +213,32 @@ def upsert_profile(profiles: list[Profile], profile: Profile) -> list[Profile]:
     return result
 
 
+def suggest_ssh_key_path(profiles: list[Profile], ssh_dir: str | Path | None = None) -> str:
+    """Suggest a private key for a profile that has none.
+
+    Reuse the key of an existing profile when that file still exists. Otherwise
+    pick the only private key in ``~/.ssh`` whose name mentions QRIS and that has
+    a matching ``.pub`` file. Return "" when there is no clear single choice.
+    """
+    for profile in profiles:
+        key = profile.ssh_key_path.strip()
+        if key and Path(key).expanduser().is_file():
+            return key
+    directory = Path(ssh_dir) if ssh_dir is not None else Path.home() / ".ssh"
+    try:
+        candidates = [
+            path
+            for path in directory.iterdir()
+            if "qris" in path.name.casefold()
+            and path.suffix.casefold() not in {".pub", ".ppk"}
+            and path.is_file()
+            and path.with_name(f"{path.name}.pub").is_file()
+        ]
+    except OSError:
+        return ""
+    return str(candidates[0]) if len(candidates) == 1 else ""
+
+
 def profile_with_host(profile: Profile, host: str) -> Profile:
     clean = profile.normalized()
     return Profile(

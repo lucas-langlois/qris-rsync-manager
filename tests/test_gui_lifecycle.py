@@ -527,7 +527,7 @@ def test_packaged_upload_confirmation_explains_archives_and_starts_packaged_work
     source.mkdir()
     (source / "one.jpg").write_bytes(b"123")
     (source / "two.jpg").write_bytes(b"456")
-    plan = analyze_upload_tree(source, min_flat_files=1, min_folder_bytes=5)
+    plan = analyze_upload_tree(source, min_same_type=1)
     shown: list[str] = []
     monkeypatch.setattr(
         QMessageBox,
@@ -556,11 +556,11 @@ def test_packaged_upload_confirmation_explains_archives_and_starts_packaged_work
     )
 
     assert "Automatic media archiving" in shown[0]
-    assert "more than 200 direct files or more than 10 GB" in shown[0]
-    assert "separate uncompressed TAR archives" in shown[0]
+    assert "more than 50 files of the same type" in shown[0]
+    assert "uncompressed TAR archive" in shown[0]
     assert "source folder will not be changed" in shown[0]
     assert "will not be deleted automatically" in shown[0]
-    assert "survey__photos.tar" in shown[0]
+    assert "survey.tar" in shown[0]
     assert isinstance(started[0][0], PackagedUploadWorker)
     assert started[0][1] == "Packaged upload"
     window.close()

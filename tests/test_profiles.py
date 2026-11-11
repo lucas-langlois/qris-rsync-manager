@@ -191,3 +191,46 @@ def test_successful_save_after_backup_recovery_keeps_prior_good_backup(tmp_path:
 
     assert [profile.name for profile in load_profiles(path)] == ["New"]
     assert [profile.name for profile in load_profiles(path.with_name("profiles.json.bak"))] == ["Recover"]
+
+
+def _key_pair(directory: Path, name: str) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    private = directory / name
+    private.write_text("private", encoding="utf-8")
+    (directory / f"{name}.pub").write_text("public", encoding="utf-8")
+    return private
+
+
+def test_suggest_ssh_key_reuses_existing_profile_key(tmp_path: Path) -> None:
+    from app.core.profiles import suggest_ssh_key_path
+
+    key = _key_pair(tmp_path / "keys", "work_key")
+    profiles = [
+        Profile(name="no key", username="alice"),
+        Profile(name="missing", username="alice", ssh_key_path=str(tmp_path / "gone")),
+        Profile(name="good", username="alice", ssh_key_path=str(key)),
+    ]
+
+    assert suggest_ssh_key_path(profiles, ssh_dir=tmp_path / "empty") == str(key)
+
+
+def test_suggest_ssh_key_finds_single_qriscloud_key(tmp_path: Path) -> None:
+    from app.core.profiles import suggest_ssh_key_path
+
+    ssh_dir = tmp_path / ".ssh"
+    key = _key_pair(ssh_dir, "qriscloud_ed25519")
+    _key_pair(ssh_dir, "id_ed25519")
+    (ssh_dir / "qris_old.ppk").write_text("putty", encoding="utf-8")
+    (ssh_dir / "qris_no_pub").write_text("private", encoding="utf-8")
+
+    assert suggest_ssh_key_path([], ssh_dir=ssh_dir) == str(key)
+
+
+def test_suggest_ssh_key_returns_empty_when_ambiguous_or_missing(tmp_path: Path) -> None:
+    from app.core.profiles import suggest_ssh_key_path
+
+    ssh_dir = tmp_path / ".ssh"
+    assert suggest_ssh_key_path([], ssh_dir=ssh_dir) == ""
+    _key_pair(ssh_dir, "qriscloud_ed25519")
+    _key_pair(ssh_dir, "qris_second")
+    assert suggest_ssh_key_path([], ssh_dir=ssh_dir) == ""

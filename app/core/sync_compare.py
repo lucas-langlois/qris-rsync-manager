@@ -11,6 +11,7 @@ from pathlib import Path
 from .file_scan import CancelSignal
 from .paths import app_data_dir, path_for_rsync
 from .profiles import Profile
+from .receipts import RECEIPT_DIR_NAME
 from .remote_dirs import build_remote_ssh_base
 
 
@@ -107,7 +108,9 @@ def scan_local_manifest(
                     if _is_reparse_point(entry_stat):
                         pass
                     elif stat_module.S_ISDIR(entry_stat.st_mode):
-                        pending.append(Path(entry.path))
+                        # Transfer receipts are managed by the app, not synced.
+                        if entry.name != RECEIPT_DIR_NAME:
+                            pending.append(Path(entry.path))
                     elif stat_module.S_ISREG(entry_stat.st_mode):
                         relative_path = Path(entry.path).relative_to(root).as_posix()
                         records[relative_path] = FileRecord(

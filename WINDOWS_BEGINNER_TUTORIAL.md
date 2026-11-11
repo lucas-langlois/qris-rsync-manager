@@ -389,15 +389,15 @@ For one-file downloads, select **Selected items**, highlight a remote file, then
 
 Use **Compare upload folder**, read the confirmation, and check the expected folder destination before every new dataset. Keep source files unchanged during scanning, packaging, and transfer.
 
-### Automatic packaging for many photos or videos
+### Automatic packaging for folders of many files
 
 An **archive** bundles many files into one file. This app uses uncompressed `.tar` archives: they group files without trying to make the data smaller. Fewer separate files can be easier for research storage to handle.
 
-When you upload the current folder, or one selected local folder, the app checks each folder independently. A folder qualifies for packaging if the regular files **directly inside it** number more than **200**, or total more than **10 GB** (10,000,000,000 bytes). Files inside subfolders are checked in those subfolders, rather than added to the parent's direct count.
+When you upload the current folder, or one selected local folder, the app checks each folder independently. A folder qualifies for packaging if more than **50** of the regular files **directly inside it** are the same type, such as 51 `.png` tiles. Size alone does not qualify a folder, so a few very large files, such as GeoTIFF rasters or videos, upload as ordinary files. Files inside subfolders are checked in those subfolders, rather than added to the parent's direct count.
 
-In qualifying folders, supported photos and videos go into separate archives. Files clearly associated by name with a media file, such as certain metadata sidecars, go with that file. Unrelated or ambiguous files stay separate. A folder full of non-media files can therefore still upload as individual files.
+In a qualifying folder, every file of the qualifying type goes into one archive, together with files that share their names, such as `.xmp` sidecars or the `.shx`, `.dbf` and `.prj` parts of a shapefile. Other files stay separate and upload as individual files.
 
-**Illustrative example:** a folder named `Dive photos` with 300 supported JPEG photos can produce `Dive photos__photos.tar` and `Dive photos__photos.tar.inventory.txt`. The inventory is a readable list of filenames, sizes, and modification times. Use the actual names shown in the app's archive plan; long or unusual folder names can be adjusted. If the photos or videos in one folder add up to more than 50 GB, the app splits them into numbered parts, such as `Dive photos__photos.part001.tar` and `Dive photos__photos.part002.tar`, and each part gets its own inventory.
+**Illustrative example:** a folder named `Dive photos` with 300 JPEG photos can produce `Dive photos.tar` and `Dive photos.tar.inventory.txt`. If that folder also held 80 `.json` files, they would go into the same `Dive photos.tar`. The inventory is a readable list of filenames, sizes, and modification times. Use the actual names shown in the app's archive plan; long or unusual folder names can be adjusted. If a folder's archive would be larger than 50 GB, the app splits it into numbered parts, such as `Dive photos.part01.tar` and `Dive photos.part02.tar`, and each part gets its own inventory.
 
 1. Read the proposed archive list in the confirmation before agreeing.
 2. Check the temporary-space estimate. Archives are built beside the local source folder, so that drive needs roughly enough extra space for the packaged media plus overhead. A TAR is not a compressed space-saving backup.

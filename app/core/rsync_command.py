@@ -11,6 +11,7 @@ from .paths import (
     ssh_host_key_options,
 )
 from .profiles import Profile
+from .receipts import RECEIPT_DIR_NAME
 
 
 DEFAULT_RSYNC_OPTIONS = [
@@ -118,6 +119,7 @@ def build_rsync_command(
     include_source_directory: bool = False,
     ignore_times: bool = False,
     resume_partial: bool = False,
+    itemize: bool = False,
 ) -> list[str]:
     clean = profile.normalized()
     local_path = Path(local_folder).expanduser()
@@ -138,8 +140,15 @@ def build_rsync_command(
     if dry_run:
         command.append("--dry-run")
         command.extend(DRY_RUN_COMPARE_OPTIONS)
+    elif itemize:
+        # Real transfers itemize so the app can record exactly which files
+        # were sent or received in a transfer receipt.
+        command.append("--itemize-changes")
     if ignore_times:
         command.append("--ignore-times")
+    # Receipts are written into synced folders by the app itself; never sync
+    # them as ordinary data, or they would be re-sent and listed as transfers.
+    command.append(f"--exclude={RECEIPT_DIR_NAME}/")
     if files_from:
         command.append(f"--files-from={path_for_rsync(files_from, clean.rsync_path)}")
     if exclude_from:

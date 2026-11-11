@@ -163,14 +163,14 @@ No live QRIScloud access should be required for unit tests.
 
 Before upload, scan local folders and warn when there are very high file counts or many tiny files. Recommend archiving when appropriate.
 
-## Automatic Media Archives
+## Automatic Archives
 
-Planning and building live in `app/core/archive_upload.py`. The README documents the thresholds (over 200 direct files or 10 GB per folder, 50 GB parts). Keep README and code in sync when they change.
+Planning and building live in `app/core/archive_upload.py`. The README documents the thresholds (more than 50 direct files of one type per folder, 50 GB parts). Keep README and code in sync when they change.
 
 Rules:
 
 - Never modify or delete source files.
-- Use uncompressed `.tar` with a UTF-8 `.inventory.txt` sidecar. Keep each media file in the same part as its sidecars.
+- Use uncompressed `.tar` with a UTF-8 `.inventory.txt` sidecar. Keep files that share a base name (sidecars, shapefile sets) in the same archive and part.
 - Prefer Windows `tar.exe` and fall back to MSYS2 tar.
 - Compare/dry-run must not build TAR files.
 - Remove temporary packages after success or cancel. Keep them after retries are exhausted and log where they are.

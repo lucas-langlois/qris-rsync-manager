@@ -43,7 +43,7 @@ On first launch, Windows may show a security warning because this is not yet a c
 - Upload and download with rsync
 - Compare/dry-run for upload and download
 - WinSCP-style upload selection for missing/changed files
-- Automatic, uncompressed TAR packaging for large flat photo/video folders, with inventory sidecars
+- Automatic, uncompressed TAR packaging for folders with many files of one type, with inventory files
 - QRIScloud Medici tape-recall requests for visible remote files
 - Live rsync log panel
 - Progress bar with speed and ETA where rsync reports it
@@ -180,26 +180,28 @@ Create or edit a profile with:
 
 If the host is `ssh1.qriscloud.org.au` or `ssh2.qriscloud.org.au`, the app automatically tries the other host as a fallback.
 
-## Automatic Media Archives
+## Automatic Archives
 
 When **Upload folder** or **Compare upload folder** scans a directory tree, each
-folder is checked independently. A folder is automatically packaged when either
-of these conditions is true:
+folder is checked independently. A folder is automatically packaged when more
+than 50 of the regular files directly inside it share one file type, for
+example 704 `.png` tiles or 300 `.csv` files. Case is ignored, and `.jpg/.jpeg`,
+`.tif/.tiff`, `.mpg/.mpeg`, and `.htm/.html` count as one type. Size alone never
+triggers packaging, so a few large rasters or videos upload as ordinary files
+and stay directly usable on QRIScloud.
 
-- it contains more than 200 regular files directly inside that folder; or
-- those direct files total more than 10 GB.
-
-Photos and videos are placed into separate, uncompressed TAR archives. Files
-whose names clearly match a media filename, such as an XMP or JSON sidecar, are
-kept with that media file. Ambiguous or unrelated files stay outside the TAR and
-are uploaded normally. Each TAR has a UTF-8 `.inventory.txt` file listing its
+Each qualifying folder gets one uncompressed TAR archive named after the folder:
+a folder called `survey` produces `survey.tar`. It holds every file of each
+qualifying type plus files that share their names, so shapefile sets
+(`.shp/.shx/.dbf/.prj`), sidecars such as `IMG_0001.xmp` or `clip.mp4.json`, and
+`.aux.xml` files stay together. All other files stay outside the TAR and are
+uploaded normally. Each TAR has a UTF-8 `.inventory.txt` file listing its
 filenames, sizes, and modification times.
 
-When a folder's photos or videos total more than 50 GB, they are split into
-numbered parts such as `survey__videos.part001.tar`, `survey__videos.part002.tar`,
-and so on. Each part has its own inventory, and a media file always stays in the
-same part as its sidecars. A single file larger than 50 GB gets a part of its
-own. Smaller archives keep the plain `survey__videos.tar` name.
+When an archive would exceed 50 GB, it is split into numbered parts such as
+`survey.part01.tar`, `survey.part02.tar`, and so on. Each part has its own
+inventory, and related files always stay in the same part. A single file larger
+than 50 GB gets a part of its own.
 
 The confirmation window shows the proposed archives before work begins. The
 source files are never modified or deleted. TAR files are built in a temporary
@@ -290,6 +292,44 @@ Other app data, including profiles and temporary file lists, is saved under:
 ```text
 %APPDATA%\QRISRsyncManager
 ```
+
+## Transfer Receipts
+
+Every real upload or download that transfers at least one file writes a
+receipt: the date, profile, collection, host, and each transferred file with its
+size, modification time, and SHA-256 checksum. Packaged uploads list the TAR and
+inventory files they sent. Compare/dry-run operations write no receipt.
+
+Each receipt has two files with the same name, for example
+`20261111T120922Z_upload.json` and `20261111T120922Z_upload.sha256`. Receipts
+are never overwritten, so they build up a history of transfers.
+
+Receipts are stored in a hidden `.qris-receipts` folder inside the folder that
+was synced, and nowhere else:
+
+- **Uploads**: in the local folder and in the matching QRIScloud folder. For
+  example, uploading `D:\Surveys\img` to `/data/Q0101/project` writes receipts
+  to `D:\Surveys\img\.qris-receipts\` and
+  `/data/Q0101/project/img/.qris-receipts/`.
+- **Downloads**: in the local download folder only. Nothing is written to
+  QRIScloud during a download.
+- **Interrupted transfers**: a local receipt ending in `_incomplete` records
+  what was sent before the failure. Nothing is uploaded for it.
+
+`.qris-receipts` folders are never transferred as ordinary data and are ignored
+by **Find changed files**.
+
+File paths in a receipt are relative to the synced folder. rsync already
+verifies each file it transfers with its own checksum. The receipt adds a
+permanent SHA-256 record that you can check at any time. On QRIScloud or an HPC
+system, run this from the synced folder:
+
+```bash
+sha256sum -c .qris-receipts/20261111T120922Z_upload.sha256
+```
+
+Computing checksums reads every transferred file once more on the local side,
+so very large transfers take a little longer to finish.
 
 ## Safety Defaults
 

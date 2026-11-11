@@ -54,8 +54,22 @@ from app.core.local_delete import LocalDeleteResult, delete_local_paths
 from app.core.local_move import move_local_paths, plan_local_moves
 from app.core.medici import build_recall_medici_files_command, medici_path_for_remote_path
 from app.core.paths import app_data_dir, detect_ssh, is_executable_file
-from app.core.profiles import Profile, fallback_hosts, load_profiles_result, profile_with_host, save_profiles, upsert_profile
+from app.core.profiles import (
+    Profile,
+    fallback_hosts,
+    load_profiles_result,
+    profile_with_host,
+    save_profiles,
+    suggest_ssh_key_path,
+    upsert_profile,
+)
 from app.core.progress import parse_rsync_progress
+from app.core.receipt_recorder import (
+    ReceiptPlan,
+    record_transfer_receipt,
+    upload_local_base,
+    upload_receipt_roots,
+)
 from app.core.remote_dirs import RemoteDirectoryCache, RemoteEntry, build_list_remote_entries_command
 from app.core.remote_ops import (
     build_remote_delete_command,
@@ -112,10 +126,16 @@ class FallbackCommandWorker(CommandWorker):
         log_prefix: str,
         passphrase: str = "",
         ssh_path: str | None = None,
+        receipt_plan: ReceiptPlan | None = None,
+        receipt_base: tuple[Path, str] | None = None,
     ) -> None:
         super().__init__([], log_prefix, passphrase=passphrase, ssh_path=ssh_path)
         self.profile = profile
         self.command_factory = command_factory
+        # receipt_base: (local folder, remote folder) that rsync's reported
+        # names are relative to. Without a plan, no receipt is written.
+        self.receipt_plan = receipt_plan
+        self.receipt_base = receipt_base
         # This must not share RsyncRunner's flag: RsyncRunner resets it when a
         # process starts, while this worker also has a potentially slow SSH
         # preflight before that process exists.
@@ -165,14 +185,41 @@ class FallbackCommandWorker(CommandWorker):
                 self.finished.emit(130)
                 return
             self.output.emit("Starting rsync. Large remote folders may spend time on the file list before file progress appears.\n")
+            collector = None
+            if self.receipt_plan is not None and self.receipt_base is not None:
+                collector = self.receipt_plan.add_phase(*self.receipt_base)
+
+            def on_output(text: str) -> None:
+                if collector is not None:
+                    collector.feed(text)
+                self.output.emit(text)
+
             code = self.runner.run(
                 self.command,
                 log_file,
-                self.output.emit,
+                on_output,
                 passphrase=self.passphrase,
                 ssh_path=self.ssh_path,
                 cancel_event=self._cancelled,
             )
+            if self.receipt_plan is not None:
+                record_transfer_receipt(
+                    self.receipt_plan,
+                    attempt_profile,
+                    completed=code == 0,
+                    emit=self.output.emit,
+                    run_command=lambda command: self.runner.run(
+                        command,
+                        log_file,
+                        self.output.emit,
+                        passphrase=self.passphrase,
+                        ssh_path=self.ssh_path,
+                        cancel_event=self._cancelled,
+                    ),
+                    ssh_path=self.ssh_path,
+                    batch_mode=not bool(self.passphrase),
+                    cancel_event=self._cancelled,
+                )
             self.output.emit(f"\nLog saved to: {log_file}\n")
             self.finished.emit(code)
             return
@@ -255,7 +302,7 @@ class UploadAnalysisWorker(QObject):
             if self.result.groups:
                 self.output.emit(
                     f"Automatic archive plan: {len(self.result.groups):,} TAR archive(s) will contain "
-                    f"{self.result.archived_file_count:,} media/sidecar files "
+                    f"{self.result.archived_file_count:,} files "
                     f"({self.result.archived_bytes:,} bytes).\n"
                 )
             self.finished.emit(0)
@@ -309,6 +356,9 @@ class PackagedUploadWorker(QObject):
         self._cancelled = threading.Event()
         self._log_file: Path | None = None
         self._host_checks_retryable = False
+        self._receipt_plan: ReceiptPlan | None = None
+        self._collector = None
+        self._last_attempt_profile: Profile | None = None
 
     @Slot()
     def run(self) -> None:
@@ -324,7 +374,7 @@ class PackagedUploadWorker(QObject):
                 code = 130 if self._cancelled.is_set() else 124
                 return
             self._emit(
-                "Preparing uncompressed media archives. Source files will not be changed; "
+                "Preparing uncompressed TAR archives. Source files will not be changed; "
                 "press Stop to cancel.\n"
             )
             package = prepare_upload_package(
@@ -345,6 +395,22 @@ class PackagedUploadWorker(QObject):
             )
             if self.dry_run:
                 self._emit_planned_payload(package)
+            else:
+                self._receipt_plan = ReceiptPlan(
+                    "upload",
+                    *upload_receipt_roots(
+                        self.plan.root,
+                        self.remote_path,
+                        files_from=False,
+                        include_source_directory=self.include_source_directory,
+                    ),
+                )
+                self._collector = self._receipt_plan.add_phase(
+                    upload_local_base(
+                        self.plan.root, files_from=False, include_source_directory=self.include_source_directory
+                    ),
+                    self.remote_path,
+                )
             code = self._run_transfer_with_retries(
                 lambda attempt_profile, is_retry: build_rsync_command(
                     attempt_profile,
@@ -357,6 +423,7 @@ class PackagedUploadWorker(QObject):
                     direction="upload",
                     include_source_directory=self.include_source_directory,
                     resume_partial=is_retry and not self.dry_run,
+                    itemize=not self.dry_run,
                 ),
                 log_file,
                 "Uploading non-archived files and folders",
@@ -372,6 +439,13 @@ class PackagedUploadWorker(QObject):
             if self._cancelled.is_set():
                 code = 130
                 return
+            payload_remote = (
+                f"{self.remote_path.rstrip('/')}/{self.plan.root.name}"
+                if self.include_source_directory
+                else self.remote_path
+            )
+            if self._receipt_plan is not None:
+                self._collector = self._receipt_plan.add_phase(package.payload_dir, payload_remote)
             code = self._run_transfer_with_retries(
                 lambda attempt_profile, is_retry: build_rsync_command(
                     attempt_profile,
@@ -390,6 +464,7 @@ class PackagedUploadWorker(QObject):
                     # their size and timestamp at the remote destination.
                     ignore_times=True,
                     resume_partial=is_retry,
+                    itemize=True,
                 ),
                 log_file,
                 "Uploading TAR archives and inventories",
@@ -401,6 +476,9 @@ class PackagedUploadWorker(QObject):
             self._emit(f"Packaged upload failed: {exc}\n")
             code = 1
         finally:
+            # Hash before cleanup: the receipt includes the temporary TAR files.
+            if self._receipt_plan is not None and self._last_attempt_profile is not None and log_file is not None:
+                self._write_receipt(code == 0, log_file)
             should_cleanup_package = package is not None and (code in {0, 130} or self.dry_run)
             if should_cleanup_package and package is not None:
                 cleanup_error = package.cleanup()
@@ -496,6 +574,7 @@ class PackagedUploadWorker(QObject):
                     message,
                 )
                 previous_host = attempt_profile.host
+                self._last_attempt_profile = attempt_profile
             if last_code == 0 or last_code == 130 or self._cancelled.is_set():
                 return 130 if self._cancelled.is_set() else last_code
             if last_code not in self.RETRYABLE_RSYNC_EXIT_CODES:
@@ -529,12 +608,34 @@ class PackagedUploadWorker(QObject):
         if self._cancelled.is_set():
             return 130
         self._emit(message + "...\n")
+        collector = self._collector
+
+        def on_output(text: str) -> None:
+            if collector is not None:
+                collector.feed(text)
+            self.output.emit(text)
+
         return self.runner.run(
             command,
             log_file,
-            self.output.emit,
+            on_output,
             passphrase=self.passphrase,
             ssh_path=self.ssh_path,
+            cancel_event=self._cancelled,
+        )
+
+    def _write_receipt(self, completed: bool, log_file: Path) -> None:
+        if self._receipt_plan is None or self._last_attempt_profile is None:
+            return
+        self._collector = None
+        record_transfer_receipt(
+            self._receipt_plan,
+            self._last_attempt_profile,
+            completed=completed,
+            emit=self._emit,
+            run_command=lambda command: self._run_command(command, log_file, "Uploading transfer receipt"),
+            ssh_path=self.ssh_path,
+            batch_mode=not bool(self.passphrase),
             cancel_event=self._cancelled,
         )
 
@@ -1644,7 +1745,7 @@ class MainWindow(QMainWindow):
         self._create_profile()
 
     def _create_profile(self, initial_profile: Profile | None = None) -> None:
-        dialog = ProfileDialog(initial_profile, self)
+        dialog = ProfileDialog(initial_profile, self, suggested_key_path=suggest_ssh_key_path(self.profiles))
         if dialog.exec() == ProfileDialog.Accepted:
             profile = dialog.profile()
             if any(existing.name == profile.name for existing in self.profiles):
@@ -1664,7 +1765,7 @@ class MainWindow(QMainWindow):
         profile = self.current_profile()
         if not profile:
             return
-        dialog = ProfileDialog(profile, self)
+        dialog = ProfileDialog(profile, self, suggested_key_path=suggest_ssh_key_path(self.profiles))
         if dialog.exec() == ProfileDialog.Accepted:
             updated = dialog.profile()
             index = self.profile_combo.currentIndex()
@@ -2457,8 +2558,11 @@ class MainWindow(QMainWindow):
                 ssh_path=self.detected_ssh,
                 batch_mode=not bool(passphrase),
                 files_from=str(self.sync_selection["file_list"]),
+                itemize=True,
             )
 
+        local_folder = self.local_folder_edit.text()
+        remote_folder = self.remote_path_edit.text()
         self._start_worker(
             FallbackCommandWorker(
                 profile,
@@ -2466,6 +2570,8 @@ class MainWindow(QMainWindow):
                 f"sync_selection_upload_{profile.name}",
                 passphrase=passphrase,
                 ssh_path=self.detected_ssh,
+                receipt_plan=ReceiptPlan("upload", Path(local_folder), remote_folder),
+                receipt_base=(Path(local_folder), remote_folder),
             ),
             "Upload selection",
             refresh_remote=True,
@@ -2570,16 +2676,17 @@ class MainWindow(QMainWindow):
         if archive_plan and archive_plan.groups:
             group_lines = [
                 f"- {(group.relative_folder + '/') if group.relative_folder else ''}{group.archive_name}: "
-                f"{group.media_count:,} {group.category}, {group.member_count:,} files including sidecars"
+                f"{group.member_count:,} files ({group.media_count:,} {group.category} plus related files)"
                 for group in archive_plan.groups[:12]
             ]
             if len(archive_plan.groups) > 12:
                 group_lines.append(f"- ...and {len(archive_plan.groups) - 12:,} more archive(s)")
             archive_notice = (
                 "\n\nAutomatic media archiving:\n"
-                "Folders with more than 200 direct files or more than 10 GB will have photos and videos "
-                "placed in separate uncompressed TAR archives. Archives over 50 GB are split into "
-                "numbered parts, each with its own inventory. Unassociated files remain outside. "
+                "A folder with more than 50 files of the same type directly inside it gets one "
+                "uncompressed TAR archive holding those files and files that share their names "
+                "(sidecars, shapefile parts). Archives over 50 GB are split into numbered parts, "
+                "each with its own inventory. Other files upload normally. "
                 "The source folder will not be changed. Existing individual copies already on QRIScloud "
                 "will not be deleted automatically.\n"
                 + "\n".join(group_lines)
@@ -2634,7 +2741,38 @@ class MainWindow(QMainWindow):
                 direction=direction,
                 remote_is_file=selected_remote_file is not None,
                 include_source_directory=include_source_directory,
+                itemize=not dry_run,
             )
+
+        receipt_plan = None
+        receipt_base = None
+        if not dry_run:
+            if direction == "upload":
+                receipt_plan = ReceiptPlan(
+                    direction,
+                    *upload_receipt_roots(
+                        local_transfer_path,
+                        remote_transfer_path,
+                        files_from=bool(visible_files_from),
+                        include_source_directory=include_source_directory,
+                    ),
+                )
+                receipt_base = (
+                    upload_local_base(
+                        local_transfer_path,
+                        files_from=bool(visible_files_from),
+                        include_source_directory=include_source_directory,
+                    ),
+                    remote_transfer_path,
+                )
+            else:
+                remote_base = (
+                    remote_transfer_path.rsplit("/", 1)[0] or "/"
+                    if selected_remote_file is not None
+                    else remote_transfer_path
+                )
+                receipt_plan = ReceiptPlan(direction, Path(local_transfer_path), remote_base)
+                receipt_base = (Path(local_transfer_path), remote_base)
 
         if dry_run:
             action = f"{direction}_dry_run"
@@ -2649,6 +2787,8 @@ class MainWindow(QMainWindow):
                 f"{action}_{profile.name}",
                 passphrase=passphrase,
                 ssh_path=self.detected_ssh,
+                receipt_plan=receipt_plan,
+                receipt_base=receipt_base,
             ),
             label,
             refresh_remote=direction == "upload" and not dry_run,

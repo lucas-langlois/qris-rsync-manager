@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtWidgets import QApplication, QLabel, QTextEdit
+from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QTextEdit
+
+from app.core.profiles import Profile
 
 from app.gui.profile_dialog import ProfileDialog
 from app.gui.setup_guide_dialog import (
@@ -146,4 +148,38 @@ def test_profile_rejects_public_key_and_explains_fields() -> None:
     assert "granted access" in dialog.username_edit.toolTip()
     assert "not .pub" in dialog.key_path_edit.placeholderText()
     assert "suggested filename" in dialog.key_path_edit.toolTip()
+    dialog.close()
+
+
+def test_profile_dialog_prefills_suggested_key_only_when_empty(tmp_path) -> None:
+    _application()
+    key = tmp_path / "qriscloud_ed25519"
+    key.write_text("private", encoding="utf-8")
+
+    new_dialog = ProfileDialog(suggested_key_path=str(key))
+    assert new_dialog.key_path_edit.text() == str(key)
+    assert new_dialog.validation_warnings() == []
+    new_dialog.close()
+
+    existing = Profile(name="Q0101", username="alice", ssh_key_path=str(tmp_path / "other_key"))
+    edit_dialog = ProfileDialog(existing, suggested_key_path=str(key))
+    assert edit_dialog.key_path_edit.text() == str(tmp_path / "other_key")
+    assert "not found" in edit_dialog.validation_warnings()[0]
+    edit_dialog.close()
+
+
+def test_profile_dialog_warns_and_can_cancel_save_without_key(monkeypatch) -> None:
+    _application()
+    dialog = ProfileDialog()
+    dialog.username_edit.setText("alice")
+    dialog.key_path_edit.setText("")
+    asked: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox, "question", lambda _parent, _title, message, *_args: asked.append(message) or QMessageBox.No
+    )
+
+    dialog._validate_and_accept()
+
+    assert "No SSH key is selected" in asked[0]
+    assert dialog.result() != ProfileDialog.Accepted
     dialog.close()

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtWidgets import (
@@ -22,13 +23,15 @@ from app.gui.setup_guide_dialog import SetupGuideDialog
 
 
 class ProfileDialog(QDialog):
-    def __init__(self, profile: Profile | None = None, parent=None) -> None:
+    def __init__(self, profile: Profile | None = None, parent=None, suggested_key_path: str = "") -> None:
         super().__init__(parent)
         self.setWindowTitle("QRIScloud Profile")
         self._previous_collection = (profile.collection_id if profile else "Q0101").upper()
 
         current = profile or Profile(host=DEFAULT_HOST, rsync_path=detect_rsync())
         current = current.normalized()
+        if not current.ssh_key_path and suggested_key_path:
+            current = replace(current, ssh_key_path=suggested_key_path)
 
         self.name_edit = QLineEdit(current.name)
         self.username_edit = QLineEdit(current.username)
@@ -133,10 +136,33 @@ class ProfileDialog(QDialog):
             errors.append("SSH key path must be the private key, not the public .pub file.")
         return errors
 
+    def validation_warnings(self) -> list[str]:
+        key = self.profile().ssh_key_path
+        if not key:
+            return [
+                "No SSH key is selected. QRIScloud normally rejects the connection unless the "
+                "private key (for example qriscloud_ed25519) is set here."
+            ]
+        if not Path(key).expanduser().is_file():
+            return [f"The SSH key file was not found: {key}"]
+        return []
+
     def _validate_and_accept(self) -> None:
         errors = self.validation_errors()
         if errors:
             QMessageBox.warning(self, "Check profile details", "\n".join(f"• {error}" for error in errors))
+            return
+        warnings = self.validation_warnings()
+        if warnings and (
+            QMessageBox.question(
+                self,
+                "Check SSH key",
+                "\n".join(f"• {warning}" for warning in warnings) + "\n\nSave the profile anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            != QMessageBox.Yes
+        ):
             return
         self.accept()
 

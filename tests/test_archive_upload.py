@@ -15,7 +15,7 @@ from app.core.archive_upload import (
     _native_tar_command,
     _native_tar_commands,
     _group_snapshots,
-    _members_by_category,
+    _archive_parts,
     _windows_io_path,
     analyze_upload_tree,
     build_upload_package,
@@ -29,55 +29,55 @@ def _write(path: Path, content: bytes) -> None:
     path.write_bytes(content)
 
 
-def test_analysis_qualifies_on_either_strict_folder_threshold(tmp_path: Path) -> None:
+def test_analysis_qualifies_only_on_strict_file_count(tmp_path: Path) -> None:
     root = tmp_path / "source"
     _write(root / "a.jpg", b"12345")
     _write(root / "b.jpg", b"12345")
 
-    neither_over = analyze_upload_tree(root, min_flat_files=2, min_folder_bytes=10)
-    size_only = analyze_upload_tree(root, min_flat_files=99, min_folder_bytes=9)
-    count_only = analyze_upload_tree(root, min_flat_files=1, min_folder_bytes=99)
+    at_limit = analyze_upload_tree(root, min_same_type=2)
+    over_limit = analyze_upload_tree(root, min_same_type=1)
 
-    assert not neither_over.groups
-    assert [group.category for group in size_only.groups] == ["photos"]
-    assert [group.category for group in count_only.groups] == ["photos"]
+    assert not at_limit.groups
+    assert [group.category for group in over_limit.groups] == ["jpg"]
 
 
-def test_photos_videos_and_matching_sidecars_are_archived_separately(tmp_path: Path) -> None:
+def test_few_large_files_are_never_archived_by_size(tmp_path: Path) -> None:
+    root = tmp_path / "outputs"
+    _write(root / "big_ortho.tif", b"x" * 1000)
+    _write(root / "big_mosaic.tif", b"x" * 1000)
+
+    plan = analyze_upload_tree(root, max_part_bytes=10)
+
+    assert not plan.groups
+
+
+def test_qualifying_type_and_named_companions_share_one_archive(tmp_path: Path) -> None:
     root = tmp_path / "survey"
-    _write(root / "station01.jpg", b"photo")
-    _write(root / "station01.xmp", b"photo metadata")
+    for index in range(3):
+        _write(root / f"station0{index}.jpg", b"photo")
+    _write(root / "station00.xmp", b"photo metadata")
     _write(root / "transect01.mp4", b"video")
-    _write(root / "transect01.mp4.json", b"video metadata")
     _write(root / "field-notes.txt", b"keep loose")
 
-    plan = analyze_upload_tree(root, min_flat_files=4, min_folder_bytes=1)
+    plan = analyze_upload_tree(root, min_same_type=2)
 
-    assert [(group.category, group.media_count, group.member_count) for group in plan.groups] == [
-        ("photos", 1, 2),
-        ("videos", 1, 2),
+    assert [(group.archive_name, group.category, group.media_count, group.member_count) for group in plan.groups] == [
+        ("survey.tar", "jpg", 3, 4),
     ]
     package = build_upload_package(plan)
     try:
-        photo_tar = package.payload_dir / "survey__photos.tar"
-        video_tar = package.payload_dir / "survey__videos.tar"
-        with tarfile.open(photo_tar) as archive:
-            assert archive.getnames() == ["station01.jpg", "station01.xmp"]
-        with tarfile.open(video_tar) as archive:
-            assert archive.getnames() == ["transect01.mp4", "transect01.mp4.json"]
+        with tarfile.open(package.payload_dir / "survey.tar") as archive:
+            assert archive.getnames() == ["station00.jpg", "station00.xmp", "station01.jpg", "station02.jpg"]
 
         exclusions = package.exclude_file.read_text(encoding="utf-8").splitlines()
-        assert "/station01.jpg" in exclusions
-        assert "/station01.xmp" in exclusions
-        assert "/transect01.mp4" in exclusions
-        assert "/transect01.mp4.json" in exclusions
-        assert all("field-notes.txt" not in line for line in exclusions)
+        assert "/station00.xmp" in exclusions
+        assert all("transect01.mp4" not in line and "field-notes.txt" not in line for line in exclusions)
 
-        inventory = (package.payload_dir / "survey__photos.tar.inventory.txt").read_text(encoding="utf-8")
+        inventory = (package.payload_dir / "survey.tar.inventory.txt").read_text(encoding="utf-8")
+        assert "# types: jpg" in inventory
         assert "filename\tbytes\tmodified_utc" in inventory
-        assert "station01.jpg" in inventory
-        assert "station01.xmp" in inventory
-        assert (root / "station01.jpg").exists()
+        assert "station00.xmp" in inventory
+        assert (root / "station00.jpg").exists()
     finally:
         work_dir = package.work_dir
         package.cleanup()
@@ -88,11 +88,11 @@ def test_native_tar_handles_unicode_spaces_and_leading_dash_names(tmp_path: Path
     root = tmp_path / "survey"
     for name in ("-leading.jpg", "café photo.jpg", "ordinary.jpg"):
         _write(root / name, name.encode("utf-8"))
-    plan = analyze_upload_tree(root, min_flat_files=2, min_folder_bytes=1)
+    plan = analyze_upload_tree(root, min_same_type=2)
 
     package = build_upload_package(plan)
     try:
-        with tarfile.open(package.payload_dir / "survey__photos.tar") as archive:
+        with tarfile.open(package.payload_dir / "survey.tar") as archive:
             assert archive.getnames() == ["-leading.jpg", "café photo.jpg", "ordinary.jpg"]
     finally:
         package.cleanup()
@@ -170,19 +170,20 @@ def test_native_tar_rejects_single_member_exceeding_command_limit(tmp_path: Path
         )
 
 
-def test_ambiguous_same_stem_sidecar_stays_outside_archives(tmp_path: Path) -> None:
+def test_same_named_file_of_other_type_joins_archive_but_unrelated_stays_loose(tmp_path: Path) -> None:
     root = tmp_path / "survey"
-    _write(root / "sample.jpg", b"photo")
-    _write(root / "sample.mp4", b"video")
-    _write(root / "sample.xmp", b"ambiguous")
+    for name in ("sample.jpg", "other.jpg", "third.jpg"):
+        _write(root / name, b"photo")
+    _write(root / "sample.mp4", b"video with the same base name")
+    _write(root / "unrelated.mp4", b"video")
 
-    plan = analyze_upload_tree(root, min_flat_files=2, min_folder_bytes=1)
+    plan = analyze_upload_tree(root, min_same_type=2)
     package = build_upload_package(plan)
     try:
         exclusions = package.exclude_file.read_text(encoding="utf-8")
         assert "/sample.jpg" in exclusions
         assert "/sample.mp4" in exclusions
-        assert "sample.xmp" not in exclusions
+        assert "unrelated.mp4" not in exclusions
     finally:
         package.cleanup()
 
@@ -193,10 +194,10 @@ def test_qualifying_nested_folder_preserves_remote_relative_path(tmp_path: Path)
     _write(folder / "one.jpg", b"123")
     _write(folder / "two.jpg", b"456")
 
-    plan = analyze_upload_tree(root, min_flat_files=1, min_folder_bytes=5)
+    plan = analyze_upload_tree(root, min_same_type=1)
     package = build_upload_package(plan)
     try:
-        assert (package.payload_dir / "camera A" / "camera A__photos.tar").is_file()
+        assert (package.payload_dir / "camera A" / "camera A.tar").is_file()
         assert "/camera A/one.jpg" in package.exclude_file.read_text(encoding="utf-8")
     finally:
         package.cleanup()
@@ -206,7 +207,7 @@ def test_cancelled_package_build_removes_temporary_directory(tmp_path: Path) -> 
     root = tmp_path / "survey"
     _write(root / "one.jpg", b"123")
     _write(root / "two.jpg", b"456")
-    plan = analyze_upload_tree(root, min_flat_files=1, min_folder_bytes=5)
+    plan = analyze_upload_tree(root, min_same_type=1)
     cancelled = threading.Event()
     cancelled.set()
 
@@ -220,7 +221,7 @@ def test_cancellation_stops_native_tar_and_removes_partial_package(monkeypatch, 
     root = tmp_path / "survey"
     _write(root / "one.jpg", b"123")
     _write(root / "two.jpg", b"456")
-    plan = analyze_upload_tree(root, min_flat_files=1, min_folder_bytes=5)
+    plan = analyze_upload_tree(root, min_same_type=1)
     cancelled = threading.Event()
 
     class FakeProcess:
@@ -260,7 +261,7 @@ def test_rsync_exclusions_escape_wildcards_in_real_filenames(tmp_path: Path) -> 
     root = tmp_path / "survey"
     _write(root / "photo[1].jpg", b"123")
     _write(root / "photo[2].jpg", b"456")
-    plan = analyze_upload_tree(root, min_flat_files=1, min_folder_bytes=5)
+    plan = analyze_upload_tree(root, min_same_type=1)
 
     package = build_upload_package(plan)
     try:
@@ -275,7 +276,7 @@ def test_build_refuses_exact_tree_change_after_confirmation(tmp_path: Path) -> N
     root = tmp_path / "survey"
     _write(root / "one.jpg", b"123")
     _write(root / "two.jpg", b"456")
-    plan = analyze_upload_tree(root, min_flat_files=1, min_folder_bytes=5)
+    plan = analyze_upload_tree(root, min_same_type=1)
     (root / "one.jpg").rename(root / "renamed.jpg")
 
     with pytest.raises(RuntimeError, match="changed after it was scanned"):
@@ -289,7 +290,7 @@ def test_revalidate_refuses_selected_folder_replaced_by_symlink(tmp_path: Path) 
     selected = root / "camera"
     _write(selected / "one.jpg", b"123")
     _write(selected / "two.jpg", b"456")
-    plan = analyze_upload_tree(root, min_flat_files=1, min_folder_bytes=5)
+    plan = analyze_upload_tree(root, min_same_type=1)
     replacement = tmp_path / "replacement"
     _write(replacement / "one.jpg", b"123")
     _write(replacement / "two.jpg", b"456")
@@ -307,7 +308,7 @@ def test_dry_preparation_writes_only_exclusions_and_exposes_planned_groups(tmp_p
     root = tmp_path / "survey"
     _write(root / "one.jpg", b"123")
     _write(root / "two.jpg", b"456")
-    plan = analyze_upload_tree(root, min_flat_files=1, min_folder_bytes=5)
+    plan = analyze_upload_tree(root, min_same_type=1)
 
     package = prepare_upload_package(plan, build_archives=False, include_source_directory=True)
     try:
@@ -328,7 +329,7 @@ def test_dry_preparation_writes_only_exclusions_and_exposes_planned_groups(tmp_p
         contents_package.cleanup()
 
 
-def test_indexed_sidecar_matching_handles_large_synthetic_folder() -> None:
+def test_companion_matching_handles_large_synthetic_folder() -> None:
     folder = Path("synthetic")
     snapshots = [
         FileSnapshot(folder / f"frame-{index:05d}.jpg", 1, 1)
@@ -338,10 +339,10 @@ def test_indexed_sidecar_matching_handles_large_synthetic_folder() -> None:
         for index in range(2_000)
     ]
 
-    members = _members_by_category(snapshots)
+    parts = _archive_parts(snapshots, min_same_type=50)
 
-    assert len(members["photos"]) == 4_000
-    assert not members["videos"]
+    assert len(parts) == 1
+    assert len(parts[0][1]) == 4_000
 
 
 def test_long_source_component_generates_bounded_unique_archive_names() -> None:
@@ -357,7 +358,7 @@ def test_long_source_component_generates_bounded_unique_archive_names() -> None:
     assert len(groups) == 1
     assert len(groups[0].archive_name) <= 255
     assert len(groups[0].inventory_name) <= 255
-    assert groups[0].archive_name.endswith("__photos.tar")
+    assert groups[0].archive_name.endswith(".tar")
 
 
 def test_astral_source_component_respects_windows_utf16_component_limit() -> None:
@@ -377,16 +378,16 @@ def test_astral_source_component_respects_windows_utf16_component_limit() -> Non
 @pytest.mark.skipif(not sys.platform.startswith("win"), reason="Windows extended-path regression")
 def test_package_writes_inventory_beyond_windows_max_path(tmp_path: Path) -> None:
     root = tmp_path / "survey"
-    long_folder = root / ("D" * 50)
+    long_folder = root / ("D" * 60)
     expected = [f"{index:04d}-{'x' * 24}.jpg" for index in range(950)]
     for name in expected:
         _write(long_folder / name, b"x")
-    plan = analyze_upload_tree(root, min_flat_files=1, min_folder_bytes=5)
+    plan = analyze_upload_tree(root, min_same_type=1)
 
     package = build_upload_package(plan)
     try:
-        inventory = package.payload_dir / long_folder.name / f"{long_folder.name}__photos.tar.inventory.txt"
-        archive = package.payload_dir / long_folder.name / f"{long_folder.name}__photos.tar"
+        inventory = package.payload_dir / long_folder.name / f"{long_folder.name}.tar.inventory.txt"
+        archive = package.payload_dir / long_folder.name / f"{long_folder.name}.tar"
         assert len(str(inventory)) > 260
         assert len(str(archive)) > 260
         with open(_windows_io_path(inventory), encoding="utf-8") as inventory_file:
@@ -405,10 +406,10 @@ def test_small_archive_keeps_single_unnumbered_name(tmp_path: Path) -> None:
     _write(root / "a.jpg", b"12345")
     _write(root / "b.jpg", b"12345")
 
-    plan = analyze_upload_tree(root, min_flat_files=1, min_folder_bytes=1, max_part_bytes=10)
+    plan = analyze_upload_tree(root, min_same_type=1, max_part_bytes=10)
 
     assert [(group.archive_name, group.part_number, group.part_count) for group in plan.groups] == [
-        ("survey__photos.tar", 1, 1),
+        ("survey.tar", 1, 1),
     ]
 
 
@@ -420,19 +421,19 @@ def test_large_archive_splits_into_parts_with_their_own_inventories(tmp_path: Pa
     _write(root / "notes.txt", b"loose")
 
     # a.jpg + a.xmp = 10 bytes; adding b.jpg (6) or pairing b+c (12) exceeds 11.
-    plan = analyze_upload_tree(root, min_flat_files=1, min_folder_bytes=1, max_part_bytes=11)
+    plan = analyze_upload_tree(root, min_same_type=1, max_part_bytes=11)
 
     assert [(group.archive_name, group.part_number, group.part_count, group.member_count) for group in plan.groups] == [
-        ("survey__photos.part001.tar", 1, 3, 2),
-        ("survey__photos.part002.tar", 2, 3, 1),
-        ("survey__photos.part003.tar", 3, 3, 1),
+        ("survey.part01.tar", 1, 3, 2),
+        ("survey.part02.tar", 2, 3, 1),
+        ("survey.part03.tar", 3, 3, 1),
     ]
     package = build_upload_package(plan)
     try:
         expected = {
-            "survey__photos.part001.tar": ["a.jpg", "a.xmp"],
-            "survey__photos.part002.tar": ["b.jpg"],
-            "survey__photos.part003.tar": ["c.jpg"],
+            "survey.part01.tar": ["a.jpg", "a.xmp"],
+            "survey.part02.tar": ["b.jpg"],
+            "survey.part03.tar": ["c.jpg"],
         }
         for archive_name, names in expected.items():
             with tarfile.open(package.payload_dir / archive_name) as archive:
@@ -457,11 +458,11 @@ def test_parts_keep_sidecars_with_media_and_oversized_units_alone() -> None:
         FileSnapshot(folder / "small.srt", 1, 1),
     ]
 
-    groups = _group_snapshots(Path("root"), folder, snapshots, max_part_bytes=10)
+    groups = _group_snapshots(Path("root"), folder, snapshots, max_part_bytes=10, min_same_type=1)
 
     assert [(group.archive_name, group.member_count, group.member_bytes, group.media_count) for group in groups] == [
-        ("cam__videos.part001.tar", 2, 101, 1),
-        ("cam__videos.part002.tar", 2, 3, 1),
+        ("cam.part01.tar", 2, 101, 1),
+        ("cam.part02.tar", 2, 3, 1),
     ]
 
 
@@ -469,9 +470,53 @@ def test_revalidation_rejects_change_that_moves_part_boundaries(tmp_path: Path) 
     root = tmp_path / "survey"
     _write(root / "a.jpg", b"x" * 6)
     _write(root / "b.jpg", b"x" * 6)
-    plan = analyze_upload_tree(root, min_flat_files=1, min_folder_bytes=1, max_part_bytes=12)
+    plan = analyze_upload_tree(root, min_same_type=1, max_part_bytes=12)
     assert len(plan.groups) == 1
     _write(root / "c.jpg", b"x" * 6)
 
     with pytest.raises(RuntimeError, match="changed after it was scanned"):
         revalidate_upload_plan(plan)
+
+
+def test_several_qualifying_types_share_one_folder_archive() -> None:
+    folder = Path("root") / "cam"
+    snapshots = [FileSnapshot(folder / f"img{index}.png", 1, 1) for index in range(3)] + [
+        FileSnapshot(folder / f"row{index}.csv", 1, 1) for index in range(3)
+    ] + [FileSnapshot(folder / "readme.txt", 1, 1)]
+
+    groups = _group_snapshots(Path("root"), folder, snapshots, min_same_type=2)
+
+    assert [(group.archive_name, group.category, group.member_count) for group in groups] == [
+        ("cam.tar", "csv, png", 6),
+    ]
+
+
+def test_shapefile_sets_stay_together_and_alias_extensions_count_as_one_type() -> None:
+    folder = Path("root") / "shapes"
+    snapshots = []
+    for index in range(2):
+        for suffix in (".shp", ".shx", ".dbf", ".prj", ".shp.xml"):
+            snapshots.append(FileSnapshot(folder / f"site{index}{suffix}", 1, 1))
+    snapshots += [FileSnapshot(folder / "a.jpg", 1, 1), FileSnapshot(folder / "b.jpeg", 1, 1)]
+    snapshots.append(FileSnapshot(folder / "c.JPG", 1, 1))
+
+    parts = _archive_parts(snapshots, min_same_type=2)
+
+    names = [item.path.name for item in parts[0][1]]
+    assert names == ["a.jpg", "b.jpeg", "c.JPG"]
+    shp_parts = _archive_parts(snapshots, min_same_type=1)
+    assert {item.path.name for item in shp_parts[0][1]} >= {
+        "site0.shp", "site0.shx", "site0.dbf", "site0.prj", "site0.shp.xml",
+    }
+
+
+def test_folder_below_same_type_threshold_is_not_archived(tmp_path: Path) -> None:
+    root = tmp_path / "tiles"
+    for index in range(50):
+        _write(root / f"tile{index:02d}.png", b"x")
+    for index in range(40):
+        _write(root / f"tile{index:02d}.tif", b"x")
+
+    assert not analyze_upload_tree(root).groups
+    _write(root / "tile50.png", b"x")
+    assert [group.media_count for group in analyze_upload_tree(root).groups] == [51]
