@@ -195,6 +195,12 @@ kept with that media file. Ambiguous or unrelated files stay outside the TAR and
 are uploaded normally. Each TAR has a UTF-8 `.inventory.txt` file listing its
 filenames, sizes, and modification times.
 
+When a folder's photos or videos total more than 50 GB, they are split into
+numbered parts such as `survey__videos.part001.tar`, `survey__videos.part002.tar`,
+and so on. Each part has its own inventory, and a media file always stays in the
+same part as its sidecars. A single file larger than 50 GB gets a part of its
+own. Smaller archives keep the plain `survey__videos.tar` name.
+
 The confirmation window shows the proposed archives before work begins. The
 source files are never modified or deleted. TAR files are built in a temporary
 folder beside the upload source and uploaded with rsync. Successful and cancelled

@@ -22,6 +22,10 @@ from .paths import detect_tar, is_executable_file
 
 ARCHIVE_FOLDER_BYTES = 10_000_000_000
 ARCHIVE_FLAT_FILE_COUNT = 200
+# Archives larger than this are split into numbered parts, each with its own
+# inventory. Smaller parts limit retry cost and tape-recall time on QRISdata.
+ARCHIVE_PART_BYTES = 50_000_000_000
+ARCHIVE_MAX_PARTS = 9_999
 NATIVE_TAR_BLOCKING_FACTOR = 2048
 NATIVE_TAR_POLL_SECONDS = 0.2
 NATIVE_TAR_STOP_SECONDS = 5.0
@@ -66,6 +70,8 @@ class ArchiveGroupPlan:
     member_bytes: int
     archive_name: str
     inventory_name: str
+    part_number: int = 1
+    part_count: int = 1
 
 
 @dataclass(frozen=True)
@@ -83,6 +89,7 @@ class UploadArchivePlan:
     root: Path
     scan: FolderScan
     folders: list[EligibleFolderPlan] = field(default_factory=list)
+    max_part_bytes: int = ARCHIVE_PART_BYTES
 
     @property
     def groups(self) -> list[ArchiveGroupPlan]:
@@ -127,16 +134,20 @@ def analyze_upload_tree(
     *,
     min_folder_bytes: int = ARCHIVE_FOLDER_BYTES,
     min_flat_files: int = ARCHIVE_FLAT_FILE_COUNT,
+    max_part_bytes: int = ARCHIVE_PART_BYTES,
 ) -> UploadArchivePlan:
     """Scan *root* and identify directories requiring media archives.
 
     A directory qualifies when its direct regular files exceed either
-    threshold. Subdirectories are evaluated independently.
+    threshold. Subdirectories are evaluated independently. Archives whose
+    members exceed *max_part_bytes* are split into numbered parts.
     """
+    if max_part_bytes <= 0:
+        raise ValueError("max_part_bytes must be positive.")
     source = Path(root).expanduser().resolve()
     _validate_root(source)
     scan = FolderScan()
-    plan = UploadArchivePlan(root=source, scan=scan)
+    plan = UploadArchivePlan(root=source, scan=scan, max_part_bytes=max_part_bytes)
     pending = [source]
 
     while pending:
@@ -178,7 +189,7 @@ def analyze_upload_tree(
 
         flat_bytes = sum(item.size for item in snapshots)
         if len(snapshots) > min_flat_files or flat_bytes > min_folder_bytes:
-            groups = _group_snapshots(source, folder, snapshots)
+            groups = _group_snapshots(source, folder, snapshots, max_part_bytes)
             if groups:
                 plan.folders.append(
                     EligibleFolderPlan(
@@ -266,9 +277,12 @@ def prepare_upload_package(
             for folder_plan in plan.folders:
                 _raise_if_cancelled(cancel_event)
                 snapshots = _validated_folder_snapshots(plan, folder_plan, cancel_event)
-                member_map = _members_by_category(snapshots)
+                member_map = {
+                    (category, part_number): members
+                    for category, part_number, members in _archive_parts(snapshots, plan.max_part_bytes)
+                }
                 for group in folder_plan.groups:
-                    members = member_map[group.category]
+                    members = member_map[(group.category, group.part_number)]
                     if build_archives:
                         destination = payload_dir / Path(group.relative_folder) if group.relative_folder else payload_dir
                         os.makedirs(_windows_io_path(destination), exist_ok=True)
@@ -298,19 +312,33 @@ def prepare_upload_package(
         raise
 
 
-def _group_snapshots(root: Path, folder: Path, snapshots: list[FileSnapshot]) -> list[ArchiveGroupPlan]:
-    members = _members_by_category(snapshots)
+def _group_snapshots(
+    root: Path,
+    folder: Path,
+    snapshots: list[FileSnapshot],
+    max_part_bytes: int = ARCHIVE_PART_BYTES,
+) -> list[ArchiveGroupPlan]:
     groups: list[ArchiveGroupPlan] = []
     relative_folder = _relative_posix(folder, root)
     safe_base = _archive_basename(folder.name or root.name or "folder")
     existing_names = {item.path.name.casefold() for item in snapshots}
-    media_by_category = _media_by_category(snapshots)
-    for category in ("photos", "videos"):
-        category_members = members[category]
-        media = media_by_category[category]
-        if not media:
-            continue
-        archive_name = f"{safe_base}__{category}.tar"
+    media_suffixes = PHOTO_EXTENSIONS | VIDEO_EXTENSIONS
+    parts = _archive_parts(snapshots, max_part_bytes)
+    part_counts: dict[str, int] = {}
+    for category, _part_number, _members in parts:
+        part_counts[category] = part_counts.get(category, 0) + 1
+    for category, part_number, members in parts:
+        part_count = part_counts[category]
+        if part_count > ARCHIVE_MAX_PARTS:
+            raise ValueError(
+                f"Cannot archive {folder}: its {category} would need {part_count:,} parts "
+                f"(maximum {ARCHIVE_MAX_PARTS:,}). Split the folder into smaller folders first."
+            )
+        if part_count == 1:
+            archive_name = f"{safe_base}__{category}.tar"
+        else:
+            width = max(3, len(str(part_count)))
+            archive_name = f"{safe_base}__{category}.part{part_number:0{width}d}.tar"
         inventory_name = f"{archive_name}.inventory.txt"
         if archive_name.casefold() in existing_names or inventory_name.casefold() in existing_names:
             raise ValueError(
@@ -321,14 +349,73 @@ def _group_snapshots(root: Path, folder: Path, snapshots: list[FileSnapshot]) ->
                 folder=folder,
                 relative_folder=relative_folder,
                 category=category,
-                media_count=len(media),
-                member_count=len(category_members),
-                member_bytes=sum(item.size for item in category_members),
+                media_count=sum(1 for item in members if item.path.suffix.casefold() in media_suffixes),
+                member_count=len(members),
+                member_bytes=sum(item.size for item in members),
                 archive_name=archive_name,
                 inventory_name=inventory_name,
+                part_number=part_number,
+                part_count=part_count,
             )
         )
     return groups
+
+
+def _archive_parts(
+    snapshots: list[FileSnapshot],
+    max_part_bytes: int = ARCHIVE_PART_BYTES,
+) -> list[tuple[str, int, list[FileSnapshot]]]:
+    """Split each category's members into parts of at most *max_part_bytes*.
+
+    A media file and its sidecars always stay in the same part. A single
+    media unit larger than the limit gets a part of its own. Assignment is
+    deterministic so analysis and packaging produce identical parts.
+    """
+    members = _members_by_category(snapshots)
+    media = _media_by_category(snapshots)
+    result: list[tuple[str, int, list[FileSnapshot]]] = []
+    for category in ("photos", "videos"):
+        if not media[category]:
+            continue
+        stems = {item.path.stem.casefold() for item in media[category]}
+        stem_by_full_name = {item.path.name.casefold(): item.path.stem.casefold() for item in media[category]}
+        units: dict[str, list[FileSnapshot]] = {}
+        for item in members[category]:
+            units.setdefault(_unit_key(item, stems, stem_by_full_name), []).append(item)
+        parts: list[list[FileSnapshot]] = []
+        current: list[FileSnapshot] = []
+        current_bytes = 0
+        for key in sorted(units):
+            unit = units[key]
+            unit_bytes = sum(item.size for item in unit)
+            if current and current_bytes + unit_bytes > max_part_bytes:
+                parts.append(current)
+                current, current_bytes = [], 0
+            current.extend(unit)
+            current_bytes += unit_bytes
+        if current:
+            parts.append(current)
+        for number, part in enumerate(parts, start=1):
+            part.sort(key=lambda item: item.path.name.casefold())
+            result.append((category, number, part))
+    return result
+
+
+def _unit_key(item: FileSnapshot, stems: set[str], stem_by_full_name: dict[str, str]) -> str:
+    """Return the media stem that *item* belongs to within one category."""
+    name = item.path.name.casefold()
+    if name in stem_by_full_name:
+        return stem_by_full_name[name]
+    stem = item.path.stem.casefold()
+    if stem in stems:
+        return stem
+    # Sidecars that extend a media filename, such as ``clip.mp4.json``.
+    prefix = name
+    while "." in prefix:
+        prefix = prefix.rsplit(".", 1)[0]
+        if prefix in stem_by_full_name:
+            return stem_by_full_name[prefix]
+    return name
 
 
 def _media_by_category(snapshots: list[FileSnapshot]) -> dict[str, list[FileSnapshot]]:
@@ -431,14 +518,18 @@ def _validated_folder_snapshots(
         raise RuntimeError(
             f"{folder_plan.folder} changed after it was scanned. Start the upload again so it can be rechecked."
         )
-    current_groups = _group_snapshots(plan.root, folder_plan.folder, snapshots)
-    expected = {(group.category, group.media_count, group.member_count, group.member_bytes) for group in folder_plan.groups}
-    actual = {(group.category, group.media_count, group.member_count, group.member_bytes) for group in current_groups}
+    current_groups = _group_snapshots(plan.root, folder_plan.folder, snapshots, plan.max_part_bytes)
+    expected = {_group_identity(group) for group in folder_plan.groups}
+    actual = {_group_identity(group) for group in current_groups}
     if actual != expected:
         raise RuntimeError(
             f"{folder_plan.folder} changed after it was scanned. Start the upload again so it can be rechecked."
         )
     return snapshots
+
+
+def _group_identity(group: ArchiveGroupPlan) -> tuple[str, str, int, int, int]:
+    return (group.archive_name, group.category, group.media_count, group.member_count, group.member_bytes)
 
 
 def _write_tar(
@@ -609,6 +700,8 @@ def _write_inventory(destination: Path, group: ArchiveGroupPlan, members: list[F
         inventory.write("# QRIS Rsync Manager archive inventory v1\n")
         inventory.write(f"# archive: {group.archive_name}\n")
         inventory.write(f"# category: {group.category}\n")
+        if group.part_count > 1:
+            inventory.write(f"# part: {group.part_number} of {group.part_count}\n")
         inventory.write(f"# files: {len(members)}\n")
         inventory.write("filename\tbytes\tmodified_utc\n")
         for member in members:
@@ -636,8 +729,8 @@ def _work_directory_prefix(root: Path) -> str:
 
 def _archive_basename(name: str) -> str:
     """Return a deterministic component that leaves room for archive suffixes."""
-    # The longest generated component is ``__photos.tar.inventory.txt``.
-    max_units = 255 - _utf16_units("__photos.tar.inventory.txt")
+    # The longest generated component is ``__photos.part0000.tar.inventory.txt``.
+    max_units = 255 - _utf16_units("__photos.part0000.tar.inventory.txt")
     if _utf16_units(name) <= max_units:
         return name
     digest = sha256(name.encode("utf-8")).hexdigest()[:16]

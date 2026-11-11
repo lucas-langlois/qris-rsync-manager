@@ -398,3 +398,80 @@ def test_package_writes_inventory_beyond_windows_max_path(tmp_path: Path) -> Non
     finally:
         cleanup_error = package.cleanup()
     assert cleanup_error is None
+
+
+def test_small_archive_keeps_single_unnumbered_name(tmp_path: Path) -> None:
+    root = tmp_path / "survey"
+    _write(root / "a.jpg", b"12345")
+    _write(root / "b.jpg", b"12345")
+
+    plan = analyze_upload_tree(root, min_flat_files=1, min_folder_bytes=1, max_part_bytes=10)
+
+    assert [(group.archive_name, group.part_number, group.part_count) for group in plan.groups] == [
+        ("survey__photos.tar", 1, 1),
+    ]
+
+
+def test_large_archive_splits_into_parts_with_their_own_inventories(tmp_path: Path) -> None:
+    root = tmp_path / "survey"
+    for name in ("a.jpg", "b.jpg", "c.jpg"):
+        _write(root / name, b"x" * 6)
+    _write(root / "a.xmp", b"meta")
+    _write(root / "notes.txt", b"loose")
+
+    # a.jpg + a.xmp = 10 bytes; adding b.jpg (6) or pairing b+c (12) exceeds 11.
+    plan = analyze_upload_tree(root, min_flat_files=1, min_folder_bytes=1, max_part_bytes=11)
+
+    assert [(group.archive_name, group.part_number, group.part_count, group.member_count) for group in plan.groups] == [
+        ("survey__photos.part001.tar", 1, 3, 2),
+        ("survey__photos.part002.tar", 2, 3, 1),
+        ("survey__photos.part003.tar", 3, 3, 1),
+    ]
+    package = build_upload_package(plan)
+    try:
+        expected = {
+            "survey__photos.part001.tar": ["a.jpg", "a.xmp"],
+            "survey__photos.part002.tar": ["b.jpg"],
+            "survey__photos.part003.tar": ["c.jpg"],
+        }
+        for archive_name, names in expected.items():
+            with tarfile.open(package.payload_dir / archive_name) as archive:
+                assert archive.getnames() == names
+            inventory = (package.payload_dir / f"{archive_name}.inventory.txt").read_text(encoding="utf-8")
+            assert f"# archive: {archive_name}" in inventory
+            assert "# part: " in inventory and " of 3" in inventory
+            assert all(name in inventory for name in names)
+        assert package.archive_count == package.inventory_count == 3
+        exclusions = package.exclude_file.read_text(encoding="utf-8").splitlines()
+        assert sorted(exclusions) == ["/a.jpg", "/a.xmp", "/b.jpg", "/c.jpg"]
+    finally:
+        package.cleanup()
+
+
+def test_parts_keep_sidecars_with_media_and_oversized_units_alone() -> None:
+    folder = Path("root") / "cam"
+    snapshots = [
+        FileSnapshot(folder / "big.mp4", 100, 1),
+        FileSnapshot(folder / "big.mp4.json", 1, 1),
+        FileSnapshot(folder / "small.mp4", 2, 1),
+        FileSnapshot(folder / "small.srt", 1, 1),
+    ]
+
+    groups = _group_snapshots(Path("root"), folder, snapshots, max_part_bytes=10)
+
+    assert [(group.archive_name, group.member_count, group.member_bytes, group.media_count) for group in groups] == [
+        ("cam__videos.part001.tar", 2, 101, 1),
+        ("cam__videos.part002.tar", 2, 3, 1),
+    ]
+
+
+def test_revalidation_rejects_change_that_moves_part_boundaries(tmp_path: Path) -> None:
+    root = tmp_path / "survey"
+    _write(root / "a.jpg", b"x" * 6)
+    _write(root / "b.jpg", b"x" * 6)
+    plan = analyze_upload_tree(root, min_flat_files=1, min_folder_bytes=1, max_part_bytes=12)
+    assert len(plan.groups) == 1
+    _write(root / "c.jpg", b"x" * 6)
+
+    with pytest.raises(RuntimeError, match="changed after it was scanned"):
+        revalidate_upload_plan(plan)

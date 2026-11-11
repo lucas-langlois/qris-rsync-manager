@@ -2578,7 +2578,8 @@ class MainWindow(QMainWindow):
             archive_notice = (
                 "\n\nAutomatic media archiving:\n"
                 "Folders with more than 200 direct files or more than 10 GB will have photos and videos "
-                "placed in separate uncompressed TAR archives. Unassociated files remain outside. "
+                "placed in separate uncompressed TAR archives. Archives over 50 GB are split into "
+                "numbered parts, each with its own inventory. Unassociated files remain outside. "
                 "The source folder will not be changed. Existing individual copies already on QRIScloud "
                 "will not be deleted automatically.\n"
                 + "\n".join(group_lines)
