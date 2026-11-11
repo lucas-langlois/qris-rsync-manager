@@ -17,23 +17,6 @@ Always prioritize:
 
 Do not over-engineer. Keep the first working solution simple, testable, and resilient.
 
-## Model Routing
-
-Use the project-local Codex configuration in `.codex/config.toml` and choose the
-model according to task shape. Explicit agent files under `.codex/agents/`
-override these defaults.
-
-| Model | Use for | Default project roles |
-| --- | --- | --- |
-| `gpt-5.6-sol` | Complex code review, architecture, security, reliability analysis, ambiguous multi-step work, and release-risk decisions. Use `high` reasoning when tracing edge cases. | `reviewer`, `planner` |
-| `gpt-5.6-terra` | Balanced implementation, codebase exploration, execution tracing, test analysis, and other read-heavy work where speed and depth both matter. | `explorer`, `implementer` |
-| `gpt-5.6-luna` | Fast, narrowly scoped, deterministic, repeatable, or high-volume tasks with explicit inputs and acceptance criteria. Do not use it to choose architecture, scientific rules, security boundaries, or ambiguous behaviour. | `mechanical_worker`; project default for unassigned subagents |
-
-The coordinating agent should remain on `gpt-5.6-sol`. Keep subagent work
-read-only for review and planning unless implementation has been explicitly
-approved. Prefer `medium` reasoning for routine work and `high` for reviewers,
-security checks, and complex edge-case analysis.
-
 ## Technical Stack
 
 Use:
@@ -113,6 +96,10 @@ Do not use `--delete` or mirror mode unless explicitly designed later with stron
 
 Do not combine `--append-verify` with `-W`. Current MSYS2 rsync rejects that combination.
 
+The one sanctioned exception to `-W` is recovery: when `resume_partial=True` (automatic retry after a dropped connection), `-W` is removed and `--no-whole-file` is added so rsync can reuse partial remote data. Keep this limited to retries.
+
+Add `--protect-args` only when the remote path contains shell-special characters, so normal collection paths stay compatible with older receivers.
+
 SSH keepalive defaults:
 
 ```text
@@ -127,7 +114,9 @@ Never:
 - log passwords, passphrases, or private key contents
 - concatenate shell command strings for execution
 
-Prefer SSH key authentication. Passphrases may be held in memory for the current app session only.
+Prefer SSH key authentication. Passphrases may be held in memory for the current app session only, and are passed to ssh through the askpass helper (`app/core/askpass.py`).
+
+QRIScloud host keys are trusted per user. Do not weaken the check that rejects an unexpected server identity.
 
 ## GUI and Background Work
 
@@ -148,11 +137,19 @@ Stream live output into the log panel and save logs to:
 
 The UI should be lightweight, responsive, and practical. Prefer obvious controls and actionable messages over decorative UI.
 
-## Remote Browsing and Sync
+## File Management and Sync
 
-Remote browsing should remain read-only unless a future feature explicitly adds safe remote mutation.
+Remote and local file management already exists. Keep the current guardrails when changing it:
 
-Do not add remote delete, rename, chmod, or mirror behavior casually.
+- Remote commands (mkdir, rename/move, delete) are built in `app/core/remote_ops.py` with `shlex` quoting and path validation.
+- Remote moves stay inside the active collection. Collection roots and unsafe paths are protected (`is_dangerous_remote_path`).
+- Remote deletion requires the user to type `DELETE`.
+- Local deletion sends items to the Windows Recycle Bin (`app/core/local_delete.py`) and never deletes permanently.
+- Drag and drop moves items within one pane only. It never starts an upload or download.
+
+Do not add chmod, mirror, or `--delete` behavior. Any new destructive action needs a confirmation at least as strong as the existing ones.
+
+Medici tape recall (`app/core/medici.py`) only requests retrieval. It does not download files.
 
 For sync selection, compare:
 
@@ -165,6 +162,20 @@ No live QRIScloud access should be required for unit tests.
 ## File Count Warnings
 
 Before upload, scan local folders and warn when there are very high file counts or many tiny files. Recommend archiving when appropriate.
+
+## Automatic Media Archives
+
+Planning and building live in `app/core/archive_upload.py`. The README documents the thresholds (over 200 direct files or 10 GB per folder, 50 GB parts). Keep README and code in sync when they change.
+
+Rules:
+
+- Never modify or delete source files.
+- Use uncompressed `.tar` with a UTF-8 `.inventory.txt` sidecar. Keep each media file in the same part as its sidecars.
+- Prefer Windows `tar.exe` and fall back to MSYS2 tar.
+- Compare/dry-run must not build TAR files.
+- Remove temporary packages after success or cancel. Keep them after retries are exhausted and log where they are.
+- Do not retry authentication failures automatically.
+- Selected-file uploads are exact and are never packaged.
 
 ## Error Handling
 
@@ -190,6 +201,9 @@ Keep tests focused and offline. At minimum cover:
 - sync comparison logic
 - progress parsing
 - file scan warnings
+- archive planning and packaged-upload recovery
+- remote/local file operation guards
+- worker cancellation and GUI shutdown
 
 Run tests with:
 
@@ -201,11 +215,19 @@ The wrapper manages a project-local pytest temp directory and cleans it up.
 
 ## Packaging
 
-Package with PyInstaller. Target executable:
+Package with PyInstaller using:
+
+```powershell
+.\packaging\build_pyinstaller.ps1
+```
+
+Target executable:
 
 ```text
-QRISRsyncManager.exe
+dist\QRISRsyncManager.exe
 ```
+
+`run_tests.ps1` and the build script prefer the project-local environment at `envs\qris-rsync-manager`.
 
 The packaged app should detect MSYS2 rsync/ssh on startup and allow custom executable paths.
 
