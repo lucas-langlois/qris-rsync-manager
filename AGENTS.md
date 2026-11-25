@@ -1,6 +1,6 @@
 # QRIS Rsync Manager Agent Instructions
 
-QRIS Rsync Manager is a Windows desktop PySide6 application for reliable rsync-based uploads, downloads, and comparison against QRIScloud QRISdata collections.
+QRIS Rsync Manager is a Windows desktop PySide6 application for reliable rsync-based uploads, downloads, and comparison against QRIScloud QRISdata collections, plus server-side copies between collections.
 
 Primary users are researchers moving large datasets between Windows workstations, QRIScloud storage, and HPC environments. The app should feel familiar to WinSCP/FileZilla users, but it is deliberately narrower and safer.
 
@@ -100,6 +100,8 @@ The one sanctioned exception to `-W` is recovery: when `resume_partial=True` (au
 
 Add `--protect-args` only when the remote path contains shell-special characters, so normal collection paths stay compatible with older receivers.
 
+Collection ↔ Collection copies (`build_collection_copy_command`) run rsync on the QRIScloud host over ssh, using `COLLECTION_COPY_RSYNC_OPTIONS`. They are copy only: no `--delete`, no `--remove-source-files`, no moves. Keep `--no-o --no-g` so the source collection's owner and group are not carried into the destination. Do not add `--timeout`, because reads can block on Medici tape recall. Keep `--exclude=.afm/`: each collection root has a root-owned, unreadable `.afm` folder that would otherwise fail a whole-collection copy. Both paths must be inside a QRISdata collection, source and destination must be in different collections (compared by collection ID, so `/data/Qxxxx` and `/QRISdata/Qxxxx` count as the same), and the destination must not be inside a source.
+
 SSH keepalive defaults:
 
 ```text
@@ -142,10 +144,15 @@ The UI should be lightweight, responsive, and practical. Prefer obvious controls
 Remote and local file management already exists. Keep the current guardrails when changing it:
 
 - Remote commands (mkdir, rename/move, delete) are built in `app/core/remote_ops.py` with `shlex` quoting and path validation.
-- Remote moves stay inside the active collection. Collection roots and unsafe paths are protected (`is_dangerous_remote_path`).
+- Remote file actions are shared by both remote panes through the `side` argument (`"right"` or `"left"`) in `main_window.py`. Drag, Move to… and Paste all go through `_move_remote_items`, which reuses `build_remote_move_into_command`.
+- Remote moves stay inside the collection the items come from. Collection roots and unsafe paths are protected (`is_dangerous_remote_path`). Rename is name-only.
+- Remote tables select entries by stored path, never by row number, because the `..` row is display-only and is never part of the entries list.
+- Right-click menus and keyboard shortcuts (`app/gui/pane_actions.py`) are scoped to the file list widget and gated on the matching button's enabled state.
+- Cut/Paste is internal (not the system clipboard), bound to the pane it was cut from, consumed by any paste attempt in that pane (a refused paste in another pane keeps it), and cleared on profile change.
+- Local drag moves stay inside the displayed folder. Local Move to… and Paste may reach any folder on the same drive and refuse other drives.
 - Remote deletion requires the user to type `DELETE`.
 - Local deletion sends items to the Windows Recycle Bin (`app/core/local_delete.py`) and never deletes permanently.
-- Drag and drop moves items within one pane only. It never starts an upload or download.
+- Drag and drop, Cut/Paste and Move to… move items within one pane only. They never start an upload, download or collection copy.
 
 Do not add chmod, mirror, or `--delete` behavior. Any new destructive action needs a confirmation at least as strong as the existing ones.
 

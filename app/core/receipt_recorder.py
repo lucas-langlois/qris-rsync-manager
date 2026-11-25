@@ -122,7 +122,7 @@ def record_transfer_receipt(
             direction=plan.direction,
             status="complete" if completed else "incomplete",
             profile_name=clean.name,
-            collection_id=clean.collection_id,
+            collection_id=_collection_id_for(plan.remote_root, clean.collection_id),
             host=clean.host,
             local_source=str(plan.local_root),
             remote_destination=plan.remote_root,
@@ -194,3 +194,17 @@ def _upload_receipt(receipt, files, base_name, plan, profile, emit, run_command,
             )
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+
+
+def _collection_id_for(remote_root: str, fallback: str) -> str:
+    """The collection the transfer really used.
+
+    The Collection dropdown can point the remote pane at a collection other
+    than the selected profile's, so derive it from the remote path.
+    """
+    from .rsync_command import collection_key
+
+    try:
+        return collection_key(remote_root)[0]
+    except ValueError:
+        return fallback

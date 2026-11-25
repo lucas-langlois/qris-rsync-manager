@@ -15,6 +15,7 @@ from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFileSystemModel,
     QFormLayout,
@@ -31,6 +32,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSplitter,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -77,7 +79,14 @@ from app.core.remote_ops import (
     build_remote_move_command,
     build_remote_move_into_command,
 )
-from app.core.rsync_command import build_rsync_command, validate_transfer_inputs
+from app.core.rsync_command import (
+    build_collection_copy_command,
+    build_rsync_command,
+    collection_copy_destinations,
+    collection_key,
+    collection_of_remote_path,
+    validate_transfer_inputs,
+)
 from app.core.rsync_runner import RsyncRunner
 from app.core.ssh_test import run_ssh_test
 from app.core.sync_compare import (
@@ -89,8 +98,20 @@ from app.core.sync_compare import (
     write_files_from,
 )
 from app.gui.profile_dialog import ProfileDialog
-from app.gui.drag_views import LocalMoveTreeView, RemoteMoveTable
-from app.gui.remote_browser_dialog import RemoteListWorker
+from app.gui.collection_pane import (
+    CollectionPane,
+    exclude_collection,
+    fill_collection_combo,
+    sync_collection_combo,
+)
+from app.gui.pane_actions import PaneAction, install_pane_actions
+from app.gui.drag_views import (
+    LocalMoveTreeView,
+    RemoteMoveTable,
+    populate_remote_table,
+    selected_remote_entries,
+)
+from app.gui.remote_browser_dialog import RemoteBrowserDialog, RemoteListWorker
 from app.gui.setup_guide_dialog import SetupGuideDialog
 
 
@@ -1480,6 +1501,7 @@ class MainWindow(QMainWindow):
         self.current_refresh_remote = False
         self.current_remote_cache_invalidations: list[tuple[Profile, str, bool]] = []
         self.current_after_finish = None
+        self.current_cleanup = None
         self.current_exit_code: int | None = None
         self._current_operation_id = 0
         self.remote_thread: QThread | None = None
@@ -1495,11 +1517,25 @@ class MainWindow(QMainWindow):
         self.remote_entries_path = ""
         self.session_passphrase: str | None = None
         self._close_after_stop = False
+        self._cut_clipboard: tuple[str, list[str]] | None = None
 
         self.profile_combo = QComboBox()
         self.local_folder_edit = QLineEdit()
         self.remote_path_edit = QLineEdit()
         self.detected_ssh = detect_ssh()
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("Local ↔ QRIScloud", "local")
+        self.mode_combo.addItem("Collection ↔ Collection", "collections")
+        self.mode_combo.setToolTip(
+            "Collection ↔ Collection replaces the local pane with a second QRIScloud browser. "
+            "Copies run on the QRIScloud server, so data does not pass through this PC."
+        )
+        self.remote_collection_combo = QComboBox()
+        self.remote_collection_combo.setToolTip(
+            "Collections from your saved profiles. Picking one opens it here; it does not change the profile."
+        )
+        self.collection_pane = CollectionPane(self.current_profile, self._get_session_passphrase, self.detected_ssh)
+        self.left_stack = QStackedWidget()
         self.status_label = QLabel()
         self.transfer_progress = QProgressBar()
         self.transfer_progress.setRange(0, 100)
@@ -1540,13 +1576,15 @@ class MainWindow(QMainWindow):
         self.local_up_button = QPushButton("Up")
         self.local_refresh_button = QPushButton("Refresh")
         self.local_new_folder_button = QPushButton("New folder")
-        self.local_rename_button = QPushButton("Rename/move")
+        self.local_rename_button = QPushButton("Rename")
+        self.local_move_button = QPushButton("Move to…")
         self.local_delete_button = QPushButton("Delete")
         self.remote_load_button = QPushButton("Load")
         self.remote_up_button = QPushButton("Up")
         self.remote_refresh_button = QPushButton("Refresh")
         self.remote_new_folder_button = QPushButton("New folder")
-        self.remote_rename_button = QPushButton("Rename/move")
+        self.remote_rename_button = QPushButton("Rename")
+        self.remote_move_button = QPushButton("Move to…")
         self.remote_delete_button = QPushButton("Delete")
         self.transfer_scope_combo = QComboBox()
         self.transfer_scope_combo.addItem("Current folder", "folder")
@@ -1599,8 +1637,17 @@ class MainWindow(QMainWindow):
         profile_layout.addWidget(self.status_label, 1, 0, 1, 7)
         layout.addWidget(self.profile_box)
 
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Mode"))
+        mode_row.addWidget(self.mode_combo)
+        self.mode_hint_label = QLabel()
+        mode_row.addWidget(self.mode_hint_label, stretch=1)
+        layout.addLayout(mode_row)
+
         browser = QSplitter()
-        browser.addWidget(self._local_panel())
+        self.left_stack.addWidget(self._local_panel())
+        self.left_stack.addWidget(self.collection_pane)
+        browser.addWidget(self.left_stack)
         browser.addWidget(self._remote_panel())
         browser.setSizes([480, 480])
         layout.addWidget(browser, stretch=2)
@@ -1631,6 +1678,12 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.log_output, stretch=1)
 
         self.profile_combo.currentIndexChanged.connect(self._profile_changed)
+        self.mode_combo.currentIndexChanged.connect(self._mode_changed)
+        self.remote_collection_combo.activated.connect(self._remote_collection_picked)
+        self.collection_pane.pathChanged.connect(self._update_collection_exclusions)
+        self.remote_path_edit.editingFinished.connect(self._sync_remote_collection_combo)
+        self.collection_pane.busyChanged.connect(self._collection_pane_busy_changed)
+        self.collection_pane.selectionChanged.connect(self._update_transfer_scope_ui)
         new_button.clicked.connect(self._new_profile)
         edit_button.clicked.connect(self._edit_profile)
         delete_button.clicked.connect(self._delete_profile)
@@ -1640,14 +1693,22 @@ class MainWindow(QMainWindow):
         self.local_up_button.clicked.connect(self._local_go_up)
         self.local_refresh_button.clicked.connect(self._refresh_local_tree)
         self.local_new_folder_button.clicked.connect(self._local_new_folder)
-        self.local_rename_button.clicked.connect(self._local_rename_or_move)
+        self.local_rename_button.clicked.connect(self._local_rename)
+        self.local_move_button.clicked.connect(self._local_move_to)
         self.local_delete_button.clicked.connect(self._local_delete_selected)
         self.remote_load_button.clicked.connect(lambda: self._refresh_remote_table(force=True))
         self.remote_up_button.clicked.connect(self._remote_go_up)
         self.remote_refresh_button.clicked.connect(lambda: self._refresh_remote_table(force=True))
-        self.remote_new_folder_button.clicked.connect(self._remote_new_folder)
-        self.remote_rename_button.clicked.connect(self._remote_rename_or_move)
-        self.remote_delete_button.clicked.connect(self._remote_delete_selected)
+        self.remote_new_folder_button.clicked.connect(lambda: self._remote_new_folder("right"))
+        self.remote_rename_button.clicked.connect(lambda: self._remote_rename("right"))
+        self.remote_move_button.clicked.connect(lambda: self._remote_move_to("right"))
+        self.remote_delete_button.clicked.connect(lambda: self._remote_delete_selected("right"))
+        pane = self.collection_pane
+        pane.new_folder_button.clicked.connect(lambda: self._remote_new_folder("left"))
+        pane.rename_button.clicked.connect(lambda: self._remote_rename("left"))
+        pane.move_button.clicked.connect(lambda: self._remote_move_to("left"))
+        pane.delete_button.clicked.connect(lambda: self._remote_delete_selected("left"))
+        pane.table.moveDropped.connect(lambda paths, target: self._move_remote_items_by_drop(paths, target, "left"))
         self.dry_run_button.clicked.connect(lambda: self._start_rsync(dry_run=True, direction="upload"))
         self.download_dry_run_button.clicked.connect(lambda: self._start_rsync(dry_run=True, direction="download"))
         self.build_selection_button.clicked.connect(self._build_sync_selection)
@@ -1661,6 +1722,7 @@ class MainWindow(QMainWindow):
         self.local_tree.moveDropped.connect(self._move_local_items_by_drop)
         self.remote_table.itemSelectionChanged.connect(self._update_transfer_scope_ui)
         self.remote_table.moveDropped.connect(self._move_remote_items_by_drop)
+        self._install_pane_actions()
 
     def _local_panel(self) -> QGroupBox:
         box = QGroupBox("Local")
@@ -1690,6 +1752,7 @@ class MainWindow(QMainWindow):
         action_row.addWidget(self.local_refresh_button)
         action_row.addWidget(self.local_new_folder_button)
         action_row.addWidget(self.local_rename_button)
+        action_row.addWidget(self.local_move_button)
         action_row.addWidget(self.local_delete_button)
         action_row.addStretch()
         rows.addLayout(path_row)
@@ -1698,6 +1761,10 @@ class MainWindow(QMainWindow):
 
     def _remote_path_row(self) -> QVBoxLayout:
         rows = QVBoxLayout()
+        collection_row = QHBoxLayout()
+        collection_row.addWidget(QLabel("Collection"))
+        collection_row.addWidget(self.remote_collection_combo, stretch=1)
+        rows.addLayout(collection_row)
         path_row = QHBoxLayout()
         path_row.addWidget(QLabel("Path"))
         path_row.addWidget(self.remote_path_edit, stretch=1)
@@ -1707,6 +1774,7 @@ class MainWindow(QMainWindow):
         action_row.addWidget(self.remote_refresh_button)
         action_row.addWidget(self.remote_new_folder_button)
         action_row.addWidget(self.remote_rename_button)
+        action_row.addWidget(self.remote_move_button)
         action_row.addWidget(self.remote_delete_button)
         action_row.addStretch()
         rows.addLayout(path_row)
@@ -1729,10 +1797,17 @@ class MainWindow(QMainWindow):
         self.session_passphrase = None
         self._pending_remote_path = None
         self._pending_remote_force = False
+        self._cut_clipboard = None
         self._clear_sync_selection()
         profile = self.current_profile()
         if profile:
             self.remote_path_edit.setText(profile.remote_path)
+        self.collection_pane.cancel()
+        self.collection_pane.clear()
+        self._refresh_collection_choices()
+        if self._collection_mode():
+            self._move_left_pane_off_right_collection()
+            self._update_collection_exclusions()
         self._update_status()
 
     def current_profile(self) -> Profile | None:
@@ -1820,6 +1895,10 @@ class MainWindow(QMainWindow):
             local = local.parent
         if not local.exists():
             return
+        if self.local_folder_edit.text() != str(local):
+            # Otherwise the old, now invisible, selection would still drive
+            # Delete, Rename, Cut and the Paste target.
+            self.local_tree.clearSelection()
         self.local_folder_edit.setText(str(local))
         self._clear_sync_selection()
         self.local_tree.setRootIndex(self.local_model.setRootPath(str(local)))
@@ -1831,6 +1910,120 @@ class MainWindow(QMainWindow):
         current = Path(self.local_folder_edit.text() or str(Path.home())).expanduser()
         parent = current.parent if current.parent != current else current
         self._set_local_root(str(parent))
+
+    def _install_pane_actions(self) -> None:
+        """Right-click menus and WinSCP-style keys for each pane.
+
+        Every action is gated on the same state as its button, so a shortcut
+        never runs while that button is disabled (for example mid-transfer).
+        """
+        local, right, pane = "local", "right", self.collection_pane
+
+        def selected_local_dir() -> Path | None:
+            paths = self._selected_local_paths()
+            return paths[0] if len(paths) == 1 and paths[0].is_dir() else None
+
+        def selected_remote_dir(side: str):
+            selected = self._remote_pane_state(side)[3]
+            return selected[0] if len(selected) == 1 and selected[0].is_dir else None
+
+        def open_local() -> None:
+            folder = selected_local_dir()
+            if folder is not None:
+                self._set_local_root(str(folder))
+
+        def open_remote(side: str) -> None:
+            folder = selected_remote_dir(side)
+            if folder is None:
+                return
+            if side == "left":
+                pane.navigate(folder.path)
+            else:
+                self._navigate_remote_path(folder.path)
+
+        def copy_paths(side: str) -> None:
+            if side == local:
+                paths = [str(path) for path in self._selected_local_paths()] or [self.local_folder_edit.text()]
+            else:
+                current, _loaded, _entries, selected = self._remote_pane_state(side)
+                paths = [entry.path for entry in selected] or [current]
+            QApplication.clipboard().setText("\n".join(paths))
+            self._append_log(f"Copied {len(paths):,} path(s) to the clipboard.\n")
+
+        def has_local_selection() -> bool:
+            return bool(self._selected_local_paths())
+
+        def has_remote_selection(side: str) -> bool:
+            return bool(self._remote_pane_state(side)[3])
+
+        install_pane_actions(
+            self.local_tree,
+            [
+                PaneAction("Open", ("Return", "Enter"), open_local, lambda: selected_local_dir() is not None),
+                PaneAction("Up one level", ("Backspace",), self._local_go_up, self.local_up_button.isEnabled),
+                PaneAction("Refresh", ("F5",), self._refresh_local_tree, self.local_refresh_button.isEnabled),
+                None,
+                PaneAction("New folder…", ("F7",), self._local_new_folder, self.local_new_folder_button.isEnabled),
+                PaneAction("Rename…", ("F2",), self._local_rename, self.local_rename_button.isEnabled),
+                PaneAction("Move to…", ("F6",), self._local_move_to,
+                           lambda: self.local_move_button.isEnabled() and has_local_selection()),
+                PaneAction("Cut", ("Ctrl+X",), lambda: self._cut_items(local),
+                           lambda: self.local_move_button.isEnabled() and has_local_selection()),
+                PaneAction("Paste (move here)", ("Ctrl+V",), lambda: self._paste_items(local),
+                           lambda: self.local_move_button.isEnabled() and self._has_cut_items(local)),
+                None,
+                PaneAction("Copy path", ("Ctrl+Shift+C",), lambda: copy_paths(local), lambda: True),
+                PaneAction("Delete…", ("Delete",), self._local_delete_selected,
+                           lambda: self.local_delete_button.isEnabled() and has_local_selection()),
+            ],
+        )
+        install_pane_actions(
+            self.remote_table,
+            [
+                PaneAction("Open", ("Return", "Enter"), lambda: open_remote(right),
+                           lambda: self.remote_up_button.isEnabled() and selected_remote_dir(right) is not None),
+                PaneAction("Up one level", ("Backspace",), self._remote_go_up, self.remote_up_button.isEnabled),
+                PaneAction("Refresh", ("F5",), lambda: self._refresh_remote_table(force=True),
+                           self.remote_refresh_button.isEnabled),
+                None,
+                PaneAction("New folder…", ("F7",), lambda: self._remote_new_folder(right),
+                           self.remote_new_folder_button.isEnabled),
+                PaneAction("Rename…", ("F2",), lambda: self._remote_rename(right), self.remote_rename_button.isEnabled),
+                PaneAction("Move to…", ("F6",), lambda: self._remote_move_to(right),
+                           lambda: self.remote_move_button.isEnabled() and has_remote_selection(right)),
+                PaneAction("Cut", ("Ctrl+X",), lambda: self._cut_items(right),
+                           lambda: self.remote_move_button.isEnabled() and has_remote_selection(right)),
+                PaneAction("Paste (move here)", ("Ctrl+V",), lambda: self._paste_items(right),
+                           lambda: self.remote_move_button.isEnabled() and self._has_cut_items(right)),
+                None,
+                PaneAction("Copy path", ("Ctrl+Shift+C",), lambda: copy_paths(right), lambda: True),
+                PaneAction("Delete…", ("Delete",), lambda: self._remote_delete_selected(right),
+                           lambda: self.remote_delete_button.isEnabled() and has_remote_selection(right)),
+            ],
+        )
+        install_pane_actions(
+            pane.table,
+            [
+                PaneAction("Open", ("Return", "Enter"), lambda: open_remote("left"),
+                           lambda: pane.refresh_button.isEnabled() and selected_remote_dir("left") is not None),
+                PaneAction("Up one level", ("Backspace",), pane.go_up, pane.up_button.isEnabled),
+                PaneAction("Refresh", ("F5",), lambda: pane.refresh(force=True), pane.refresh_button.isEnabled),
+                None,
+                PaneAction("New folder…", ("F7",), lambda: self._remote_new_folder("left"),
+                           pane.new_folder_button.isEnabled),
+                PaneAction("Rename…", ("F2",), lambda: self._remote_rename("left"), pane.rename_button.isEnabled),
+                PaneAction("Move to…", ("F6",), lambda: self._remote_move_to("left"),
+                           lambda: pane.move_button.isEnabled() and has_remote_selection("left")),
+                PaneAction("Cut", ("Ctrl+X",), lambda: self._cut_items("left"),
+                           lambda: pane.move_button.isEnabled() and has_remote_selection("left")),
+                PaneAction("Paste (move here)", ("Ctrl+V",), lambda: self._paste_items("left"),
+                           lambda: pane.move_button.isEnabled() and self._has_cut_items("left")),
+                None,
+                PaneAction("Copy path", ("Ctrl+Shift+C",), lambda: copy_paths("left"), lambda: True),
+                PaneAction("Delete…", ("Delete",), lambda: self._remote_delete_selected("left"),
+                           lambda: pane.delete_button.isEnabled() and has_remote_selection("left")),
+            ],
+        )
 
     def _local_double_clicked(self, index) -> None:
         path = Path(self.local_model.filePath(index))
@@ -1867,70 +2060,107 @@ class MainWindow(QMainWindow):
         self._append_log(f"Created local folder: {target}\n")
         self._refresh_local_tree()
 
-    def _local_rename_or_move(self) -> None:
+    def _local_rename(self) -> None:
         paths = self._selected_local_paths()
         if len(paths) != 1:
-            self._show_errors(["Select exactly one local file or folder to rename/move."])
+            self._show_errors(["Select exactly one local file or folder to rename."])
             return
         source = paths[0]
         text, accepted = QInputDialog.getText(
             self,
-            "Rename/move local item",
-            "New name, or full destination path:",
+            "Rename local item",
+            "New name (to move items, drag them, use Move to…, or Cut and Paste):",
             text=source.name,
         )
         if not accepted:
             return
-        text = text.strip()
-        if not text:
-            self._show_errors(["Destination is required."])
+        name = text.strip()
+        if not name or "/" in name or "\\" in name or name in {".", ".."}:
+            self._show_errors(["Enter a new name only, without path separators."])
             return
-        destination = Path(text).expanduser()
-        if not destination.is_absolute():
-            destination = source.parent / text
-        if destination.exists():
+        if name == source.name:
+            return
+        destination = source.parent / name
+        if destination.exists() and destination.name.casefold() != source.name.casefold():
             self._show_errors([f"Destination already exists: {destination}"])
             return
         try:
             source.rename(destination)
         except OSError as exc:
-            self._show_errors([f"Could not rename/move local item: {exc}"])
+            self._show_errors([f"Could not rename local item: {exc}"])
             return
-        self._append_log(f"Moved local item: {source} -> {destination}\n")
+        self._append_log(f"Renamed local item: {source} -> {destination}\n")
         self._refresh_local_tree()
 
-    @Slot(object, str)
-    def _move_local_items_by_drop(self, raw_paths: object, target_text: str) -> None:
-        if self.current_thread or self.remote_thread or self.compare_thread:
+    def _move_local_items(
+        self,
+        raw_paths: list[str],
+        target_text: str | Path,
+        title: str = "Move local items",
+        allowed_root: Path | None = None,
+    ) -> bool:
+        """Confirm and start a local move. Return True if started.
+
+        Drag passes the displayed folder as allowed_root. Move to… and Paste
+        can reach any folder on the same drive, so they use the drive root and
+        refuse a different drive up front.
+        """
+        if self.current_thread or self.remote_thread or self.compare_thread or self.collection_pane.is_busy():
             QMessageBox.information(self, "Operation running", "Wait for the current operation to finish.")
-            return
+            return False
         paths = [Path(str(path)).expanduser() for path in list(raw_paths or [])]
         target = Path(target_text).expanduser()
-        root = Path(self.local_folder_edit.text()).expanduser()
+        if allowed_root is None:
+            drive = target.absolute().anchor
+            if not drive or any(path.absolute().anchor.casefold() != drive.casefold() for path in paths):
+                self._show_errors(["Local items can only be moved within the same drive."])
+                return False
+            root = Path(drive)
+        else:
+            root = allowed_root
         try:
             moves = plan_local_moves(paths, target, root)
         except (OSError, ValueError) as exc:
             self._show_errors([str(exc)])
-            return
+            return False
         preview = "\n".join(f"{source}\n  → {destination}" for source, destination in moves[:10])
         if len(moves) > 10:
             preview += f"\n... and {len(moves) - 10:,} more"
         if (
             QMessageBox.question(
                 self,
-                "Move local items",
+                title,
                 f"Move {len(moves):,} local item(s)?\n\n{preview}",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
             != QMessageBox.Yes
         ):
+            return False
+        self._start_worker(LocalMoveWorker(paths, target, root), "Move local items", refresh_local=True)
+        return True
+
+    @Slot(object, str)
+    def _move_local_items_by_drop(self, raw_paths: object, target_text: str) -> None:
+        root = Path(self.local_folder_edit.text()).expanduser()
+        self._move_local_items([str(path) for path in list(raw_paths or [])], target_text, allowed_root=root)
+
+    def _local_move_to(self) -> None:
+        paths = self._selected_local_paths()
+        if not paths:
+            self._show_errors(["Select one or more local items to move."])
             return
-        self._start_worker(
-            LocalMoveWorker(paths, target, root),
-            "Move local items",
-            refresh_local=True,
-        )
+        start = self.local_folder_edit.text() or str(Path.home())
+        target = QFileDialog.getExistingDirectory(self, f"Move {len(paths):,} item(s) to…", start)
+        if not target:
+            return
+        self._move_local_items([str(path) for path in paths], target, title="Move to…")
+
+    def _local_paste_target(self) -> Path:
+        selected = self._selected_local_paths()
+        if len(selected) == 1 and selected[0].is_dir():
+            return selected[0]
+        return Path(self.local_folder_edit.text() or str(Path.home())).expanduser()
 
     def _local_delete_selected(self) -> None:
         paths = self._selected_local_paths()
@@ -2124,19 +2354,7 @@ class MainWindow(QMainWindow):
         self._populate_remote_table(self.remote_entries)
 
     def _populate_remote_table(self, entries: list[RemoteEntry]) -> None:
-        self.remote_table.setRowCount(len(entries))
-        for row, entry in enumerate(entries):
-            name_item = QTableWidgetItem(entry.name)
-            size_item = QTableWidgetItem(entry.size_label)
-            type_item = QTableWidgetItem(entry.type_label)
-            modified_item = QTableWidgetItem(entry.modified)
-            for item in (name_item, size_item, type_item, modified_item):
-                item.setData(Qt.UserRole, entry.path)
-                item.setData(Qt.UserRole + 1, entry.is_dir)
-            self.remote_table.setItem(row, 0, name_item)
-            self.remote_table.setItem(row, 1, size_item)
-            self.remote_table.setItem(row, 2, type_item)
-            self.remote_table.setItem(row, 3, modified_item)
+        populate_remote_table(self.remote_table, entries, self.remote_table.current_remote_path or "/")
 
     def _remote_double_clicked(self, item: QTableWidgetItem) -> None:
         if item.data(Qt.UserRole + 1):
@@ -2146,6 +2364,7 @@ class MainWindow(QMainWindow):
     def _navigate_remote_path(self, path: str) -> None:
         target = path.strip().rstrip("/") or "/"
         self.remote_path_edit.setText(target)
+        self._sync_remote_collection_combo()
         self._clear_sync_selection()
         self._refresh_remote_table()
 
@@ -2156,32 +2375,86 @@ class MainWindow(QMainWindow):
         current_path = self.remote_path_edit.text().strip().rstrip("/")
         if self.remote_entries_path != current_path:
             return []
-        rows = {index.row() for index in self.remote_table.selectionModel().selectedRows()}
-        if not rows:
-            rows = {item.row() for item in self.remote_table.selectedItems()}
-        rows = sorted(rows)
-        entries: list[RemoteEntry] = []
-        for row in rows:
-            if row < 0 or row >= len(self.remote_entries):
-                continue
-            entry = self.remote_entries[row]
-            entries.append(entry)
-        return entries
+        return selected_remote_entries(self.remote_table, self.remote_entries)
 
-    def _remote_new_folder(self) -> None:
+    # Remote file management, shared by both remote panes -------------------
+    #
+    # side is "right" (the main remote pane) or "left" (the second collection
+    # pane in Collection ↔ Collection mode). Every action stays inside one
+    # pane; nothing here starts an upload, download or copy.
+
+    def _remote_pane_state(self, side: str) -> tuple[str, str, list[RemoteEntry], list[RemoteEntry]]:
+        """Return (current path, loaded path, listed entries, selected entries)."""
+        if side == "left":
+            pane = self.collection_pane
+            return pane.current_path(), pane.entries_path, list(pane.entries), pane.selected_entries()
+        current = self.remote_path_edit.text().strip().rstrip("/") or "/"
+        loaded = (self.remote_entries_path or "/") if self.remote_entries_path == current.rstrip("/") else ""
+        return current, loaded, list(self.remote_entries), self._selected_remote_entries()
+
+    def _remote_operation_profile(self) -> Profile | None:
+        if self.current_thread or self.remote_thread or self.compare_thread or self.collection_pane.is_busy():
+            QMessageBox.information(self, "Operation running", "Wait for the current operation to finish.")
+            return None
         profile = self.current_profile()
         if not profile:
-            return
-        name, accepted = QInputDialog.getText(self, "New remote folder", "Folder name:")
-        if not accepted:
-            return
-        name = name.strip()
-        if not name or "/" in name:
-            self._show_errors(["Folder name is required and must not contain '/'."])
-            return
+            return None
         errors = self._profile_errors(profile, require_rsync=False)
         if errors:
             self._show_errors(errors)
+            return None
+        return profile
+
+    def _start_remote_operation(
+        self,
+        profile: Profile,
+        side: str,
+        passphrase: str,
+        command_factory,
+        log_prefix: str,
+        label: str,
+        touched_paths: list[str],
+    ) -> None:
+        touched = list(dict.fromkeys(path for path in touched_paths if path))
+
+        def after(_worker: object, _code: int) -> None:
+            # Refresh even after a failure: a multi-item move can stop halfway.
+            for path in touched:
+                self.remote_directory_cache.invalidate(profile, path, subdirectories=True)
+                self.collection_pane.invalidate(profile, path)
+            if side == "left":
+                self.collection_pane.refresh(force=True)
+
+        self._start_worker(
+            FallbackCommandWorker(
+                profile,
+                command_factory,
+                f"{log_prefix}_{profile.name}",
+                passphrase=passphrase,
+                ssh_path=self.detected_ssh,
+            ),
+            label,
+            refresh_remote=side == "right",
+            remote_cache_invalidations=[(profile, path, True) for path in touched] if side == "right" else [],
+            cleanup=after,
+        )
+
+    def _remote_new_folder(self, side: str = "right") -> None:
+        profile = self._remote_operation_profile()
+        if not profile:
+            return
+        parent, loaded, _entries, _selected = self._remote_pane_state(side)
+        if not loaded or loaded.rstrip("/") != parent.rstrip("/"):
+            # mkdir -p on a mistyped, never-listed path would create every
+            # missing folder along it.
+            self._show_errors(["Load this folder first (click Load or Refresh), then create the new folder."])
+            return
+        name, accepted = QInputDialog.getText(self, "New remote folder", f"New folder in {parent}:")
+        if not accepted:
+            return
+        name = name.strip()
+        if not name or "/" in name or name in {".", ".."}:
+            self._show_errors(["Folder name is required and must not contain '/'."])
             return
         passphrase = self._get_session_passphrase(profile)
         if passphrase is None:
@@ -2189,50 +2462,38 @@ class MainWindow(QMainWindow):
 
         def command_factory(attempt_profile: Profile) -> list[str]:
             return build_remote_mkdir_command(
-                attempt_profile,
-                self.remote_path_edit.text(),
-                name,
-                ssh_path=self.detected_ssh,
-                batch_mode=not bool(passphrase),
+                attempt_profile, parent, name, ssh_path=self.detected_ssh, batch_mode=not bool(passphrase)
             )
 
-        self._start_worker(
-            FallbackCommandWorker(profile, command_factory, f"remote_mkdir_{profile.name}", passphrase=passphrase, ssh_path=self.detected_ssh),
-            "Create remote folder",
-            refresh_remote=True,
-            remote_cache_invalidations=[(profile, self.remote_path_edit.text(), False)],
+        self._start_remote_operation(
+            profile, side, passphrase, command_factory, "remote_mkdir", "Create remote folder", [parent]
         )
 
-    def _remote_rename_or_move(self) -> None:
-        profile = self.current_profile()
+    def _remote_rename(self, side: str = "right") -> None:
+        profile = self._remote_operation_profile()
         if not profile:
             return
-        errors = self._profile_errors(profile, require_rsync=False)
-        if errors:
-            self._show_errors(errors)
+        _current, _loaded, _entries, selected = self._remote_pane_state(side)
+        if len(selected) != 1:
+            self._show_errors(["Select exactly one remote file or folder to rename."])
             return
-        entries = self._selected_remote_entries()
-        if len(entries) != 1:
-            self._show_errors(["Select exactly one remote file or folder to rename/move."])
-            return
-        entry = entries[0]
+        entry = selected[0]
         text, accepted = QInputDialog.getText(
             self,
-            "Rename/move remote item",
-            "New name, or full remote destination path:",
+            "Rename remote item",
+            "New name (to move items, drag them, use Move to…, or Cut and Paste):",
             text=entry.name,
         )
         if not accepted:
             return
-        text = text.strip()
-        if not text:
-            self._show_errors(["Destination is required."])
+        name = text.strip()
+        if not name or "/" in name or name in {".", ".."}:
+            self._show_errors(["Enter a new name only, without '/'."])
             return
-        if text.startswith("/"):
-            destination = text.rstrip("/")
-        else:
-            parent = entry.path.rsplit("/", 1)[0]
-            destination = f"{parent}/{text}"
+        if name == entry.name:
+            return
+        parent = entry.path.rsplit("/", 1)[0] or "/"
+        destination = f"{parent.rstrip('/')}/{name}"
         passphrase = self._get_session_passphrase(profile)
         if passphrase is None:
             return
@@ -2246,47 +2507,46 @@ class MainWindow(QMainWindow):
                 batch_mode=not bool(passphrase),
             )
 
-        self._start_worker(
-            FallbackCommandWorker(profile, command_factory, f"remote_move_{profile.name}", passphrase=passphrase, ssh_path=self.detected_ssh),
-            "Rename/move remote item",
-            refresh_remote=True,
-            remote_cache_invalidations=[
-                (profile, entry.path, True),
-                (profile, destination, True),
-                (profile, entry.path.rsplit("/", 1)[0] or "/", False),
-                (profile, destination.rsplit("/", 1)[0] or "/", False),
-            ],
+        self._start_remote_operation(
+            profile, side, passphrase, command_factory, "remote_rename", "Rename remote item",
+            [parent, entry.path, destination],
         )
 
-    @Slot(object, str)
-    def _move_remote_items_by_drop(self, raw_paths: object, destination_directory: str) -> None:
-        if self.current_thread or self.remote_thread or self.compare_thread:
-            QMessageBox.information(self, "Operation running", "Wait for the current operation to finish.")
-            return
-        profile = self.current_profile()
+    def _move_remote_items(
+        self,
+        side: str,
+        source_paths: list[str],
+        destination_directory: str,
+        require_visible: bool,
+        title: str = "Move remote items",
+    ) -> bool:
+        """Confirm and start a move inside one collection. Return True if started."""
+        profile = self._remote_operation_profile()
         if not profile:
-            return
-        errors = self._profile_errors(profile, require_rsync=False)
-        if errors:
-            self._show_errors(errors)
-            return
-        source_paths = [str(path) for path in list(raw_paths or [])]
-        visible_paths = {entry.path for entry in self.remote_entries}
-        if not source_paths or any(path not in visible_paths for path in source_paths):
-            self._show_errors(["The remote selection changed. Refresh the folder and try again."])
-            return
-        collection_root = f"/data/{profile.collection_id}"
+            return False
+        _current, _loaded, entries, _selected = self._remote_pane_state(side)
+        if require_visible:
+            visible_paths = {entry.path for entry in entries}
+            if not source_paths or any(path not in visible_paths for path in source_paths):
+                self._show_errors(["The remote selection changed. Refresh the folder and try again."])
+                return False
+        if not source_paths:
+            self._show_errors(["Select one or more remote items to move."])
+            return False
+        # Moves stay inside the collection the items come from.
+        try:
+            collection_root = collection_of_remote_path(source_paths[0])
+        except ValueError:
+            self._show_errors(["Remote moves are only allowed inside a collection folder (for example /data/Q0101/...)."])
+            return False
+        collection_name = collection_root.rsplit("/", 1)[-1]
         try:
             build_remote_move_into_command(
-                profile,
-                source_paths,
-                destination_directory,
-                collection_root,
-                ssh_path=self.detected_ssh,
+                profile, source_paths, destination_directory, collection_root, ssh_path=self.detected_ssh
             )
         except ValueError as exc:
             self._show_errors([str(exc)])
-            return
+            return False
         preview = "\n".join(
             f"{source}\n  → {destination_directory.rstrip('/')}/{source.rsplit('/', 1)[-1]}"
             for source in source_paths[:10]
@@ -2296,17 +2556,17 @@ class MainWindow(QMainWindow):
         if (
             QMessageBox.question(
                 self,
-                "Move remote items",
-                f"Move {len(source_paths):,} remote item(s) within {profile.collection_id}?\n\n{preview}",
+                title,
+                f"Move {len(source_paths):,} remote item(s) within {collection_name}?\n\n{preview}",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
             != QMessageBox.Yes
         ):
-            return
+            return False
         passphrase = self._get_session_passphrase(profile)
         if passphrase is None:
-            return
+            return False
 
         def command_factory(attempt_profile: Profile) -> list[str]:
             return build_remote_move_into_command(
@@ -2318,30 +2578,41 @@ class MainWindow(QMainWindow):
                 batch_mode=not bool(passphrase),
             )
 
-        invalidations = [(profile, self.remote_path_edit.text(), True), (profile, destination_directory, True)]
-        invalidations.extend((profile, source, True) for source in source_paths)
-        self._start_worker(
-            FallbackCommandWorker(
-                profile,
-                command_factory,
-                f"remote_drag_move_{profile.name}",
-                passphrase=passphrase,
-                ssh_path=self.detected_ssh,
-            ),
-            "Move remote items",
-            refresh_remote=True,
-            remote_cache_invalidations=invalidations,
+        touched = [destination_directory, *source_paths, *(path.rsplit("/", 1)[0] or "/" for path in source_paths)]
+        self._start_remote_operation(
+            profile, side, passphrase, command_factory, "remote_move", "Move remote items", touched
         )
+        return True
 
-    def _remote_delete_selected(self) -> None:
-        profile = self.current_profile()
+    @Slot(object, str)
+    def _move_remote_items_by_drop(self, raw_paths: object, destination_directory: str, side: str = "right") -> None:
+        source_paths = [str(path) for path in list(raw_paths or [])]
+        self._move_remote_items(side, source_paths, destination_directory, require_visible=True)
+
+    def _remote_move_to(self, side: str = "right") -> None:
+        profile = self._remote_operation_profile()
         if not profile:
             return
-        errors = self._profile_errors(profile, require_rsync=False)
-        if errors:
-            self._show_errors(errors)
+        current, _loaded, _entries, selected = self._remote_pane_state(side)
+        if not selected:
+            self._show_errors(["Select one or more remote items to move."])
             return
-        entries = self._selected_remote_entries()
+        passphrase = self._get_session_passphrase(profile)
+        if passphrase is None:
+            return
+        dialog = RemoteBrowserDialog(profile, self.detected_ssh, current, passphrase, parent=self)
+        dialog.setWindowTitle(f"Move {len(selected):,} item(s) to… (same collection only)")
+        if dialog.exec() != QDialog.Accepted:
+            return
+        self._move_remote_items(
+            side, [entry.path for entry in selected], dialog.selected_path, require_visible=False, title="Move to…"
+        )
+
+    def _remote_delete_selected(self, side: str = "right") -> None:
+        profile = self._remote_operation_profile()
+        if not profile:
+            return
+        current, _loaded, _entries, entries = self._remote_pane_state(side)
         if not entries:
             self._show_errors(["Select one or more remote files or folders to delete."])
             return
@@ -2367,14 +2638,56 @@ class MainWindow(QMainWindow):
                 batch_mode=not bool(passphrase),
             )
 
-        self._start_worker(
-            FallbackCommandWorker(profile, command_factory, f"remote_delete_{profile.name}", passphrase=passphrase, ssh_path=self.detected_ssh),
-            "Delete remote items",
-            refresh_remote=True,
-            remote_cache_invalidations=[
-                (profile, entry.path, True) for entry in entries
-            ] + [(profile, self.remote_path_edit.text(), False)],
+        self._start_remote_operation(
+            profile, side, passphrase, command_factory, "remote_delete", "Delete remote items",
+            [current, *(entry.path for entry in entries)],
         )
+
+    # Cut and paste (moves only, always within the pane it was cut from) -----
+
+    def _cut_items(self, pane: str) -> None:
+        if pane == "local":
+            paths = [str(path) for path in self._selected_local_paths()]
+        else:
+            paths = [entry.path for entry in self._remote_pane_state(pane)[3]]
+        if not paths:
+            self._show_errors(["Select one or more items to cut."])
+            return
+        self._cut_clipboard = (pane, paths)
+        self._append_log(
+            f"Cut {len(paths):,} item(s). Open the destination folder in the same pane and press Ctrl+V "
+            "(or right-click → Paste) to move them there.\n"
+        )
+        self.transfer_status_label.setText(f"{len(paths):,} item(s) cut — paste in the same pane to move them.")
+
+    def _paste_items(self, pane: str) -> None:
+        clipboard = self._cut_clipboard
+        if not clipboard:
+            self._show_errors(["Nothing to paste. Select items and use Cut (Ctrl+X) first."])
+            return
+        source_pane, paths = clipboard
+        if source_pane != pane:
+            self._show_errors(
+                [
+                    "Paste in the same pane you cut from. Cut and Paste only moves items; "
+                    "use the transfer buttons to upload, download or copy between panes."
+                ]
+            )
+            return
+        # A paste attempt always consumes the cut list, so a stale list can
+        # never be pasted twice.
+        self._cut_clipboard = None
+        if pane == "local":
+            destination = self._local_paste_target()
+            self._move_local_items(paths, destination, title="Paste (move) local items")
+        else:
+            current, _loaded, _entries, selected = self._remote_pane_state(pane)
+            folders = [entry for entry in selected if entry.is_dir]
+            destination = folders[0].path if len(selected) == 1 and folders else current
+            self._move_remote_items(pane, paths, destination, require_visible=False, title="Paste (move) remote items")
+
+    def _has_cut_items(self, pane: str) -> bool:
+        return bool(self._cut_clipboard and self._cut_clipboard[0] == pane)
 
     def _remote_go_up(self) -> None:
         current = self.remote_path_edit.text().strip().rstrip("/") or "/"
@@ -2578,7 +2891,265 @@ class MainWindow(QMainWindow):
             remote_cache_invalidations=[(profile, self.remote_path_edit.text(), True)],
         )
 
+    # Collection ↔ Collection mode -------------------------------------------
+
+    def _collection_mode(self) -> bool:
+        return str(self.mode_combo.currentData()) == "collections"
+
+    def _collection_choices(self) -> list[tuple[str, str]]:
+        """(profile name, remote path) for profiles that share the active login.
+
+        Both panes browse with the selected profile's account, so collections
+        saved under a different username would not be reachable.
+        """
+        profile = self.current_profile()
+        if profile is None:
+            return []
+        return [
+            (candidate.name, candidate.remote_path)
+            for candidate in (item.normalized() for item in self.profiles)
+            if candidate.username == profile.username
+        ]
+
+    def _refresh_collection_choices(self) -> None:
+        profile = self.current_profile()
+        choices = self._collection_choices()
+        fill_collection_combo(self.remote_collection_combo, choices)
+        self._sync_remote_collection_combo()
+        current = profile.remote_path if profile else ""
+        others = [path for _label, path in choices if path != current]
+        self.collection_pane.set_collections(choices, preferred=others[0] if others else "")
+
+    def _sync_remote_collection_combo(self) -> None:
+        sync_collection_combo(self.remote_collection_combo, self.remote_path_edit.text())
+        self._update_collection_exclusions()
+
+    def _update_collection_exclusions(self) -> None:
+        """In collection mode, a collection open in one pane cannot be picked in the other."""
+        if not hasattr(self, "mode_combo"):
+            return
+        collections = self._collection_mode()
+        exclude_collection(self.remote_collection_combo, self.collection_pane.current_path() if collections else "")
+        exclude_collection(self.collection_pane.collection_combo, self.remote_path_edit.text() if collections else "")
+
+    def _same_collection_in_both_panes(self) -> bool:
+        try:
+            return collection_key(self.collection_pane.current_path())[0] == collection_key(
+                self.remote_path_edit.text()
+            )[0]
+        except ValueError:
+            return False
+
+    def _move_left_pane_off_right_collection(self) -> None:
+        """Open the left pane on another collection when it would match the right pane."""
+        if not self._same_collection_in_both_panes():
+            return
+        right = self.remote_path_edit.text()
+        for _label, path in self._collection_choices():
+            try:
+                if collection_key(path)[0] != collection_key(right)[0]:
+                    self.collection_pane.path_edit.setText(path)
+                    self.collection_pane.entries = []
+                    self.collection_pane.entries_path = ""
+                    self.collection_pane.table.setRowCount(0)
+                    self.collection_pane._path_edited()
+                    return
+            except ValueError:
+                continue
+
+    def _remote_collection_picked(self, index: int) -> None:
+        path = self.remote_collection_combo.itemData(index)
+        if path:
+            self._navigate_remote_path(str(path))
+
+    def _mode_changed(self) -> None:
+        busy = self.current_thread or self.remote_thread or self.compare_thread or self.collection_pane.is_busy()
+        if busy:
+            self.mode_combo.blockSignals(True)
+            self.mode_combo.setCurrentIndex(self.left_stack.currentIndex())
+            self.mode_combo.blockSignals(False)
+            QMessageBox.information(self, "Operation running", "Wait for the current operation to finish before switching mode.")
+            return
+        collections = self._collection_mode()
+        self._clear_sync_selection()
+        self.left_stack.setCurrentIndex(1 if collections else 0)
+        self.build_selection_button.setVisible(not collections)
+        self.upload_selection_button.setVisible(not collections)
+        if collections:
+            self.mode_hint_label.setText(
+                "Both panes use the selected profile's account. Copies run on QRIScloud and never delete files."
+            )
+            self._move_left_pane_off_right_collection()
+            profile = self.current_profile()
+            if profile and profile.username and not self.collection_pane.entries_path:
+                self.collection_pane.refresh()
+        else:
+            self.mode_hint_label.setText("")
+        self._update_collection_exclusions()
+        self._update_transfer_scope_ui()
+
+    @Slot(bool)
+    def _collection_pane_busy_changed(self, busy: bool) -> None:
+        if not busy:
+            self.profile_box.setEnabled(
+                self.current_thread is None and self.remote_thread is None and self.compare_thread is None
+            )
+        self._update_mode_controls()
+        self._update_transfer_scope_ui()
+
+    def _update_mode_controls(self) -> None:
+        # The _set_*_busy/running callers have just set the profile box from
+        # their own state (which can change before the thread fields do), so
+        # follow it rather than recomputing idleness here.
+        pane_busy = self.collection_pane.is_busy()
+        if pane_busy:
+            # A listing in either pane locks the profile, so results cannot be
+            # applied to a different account's context.
+            self.profile_box.setEnabled(False)
+        self.mode_combo.setEnabled(self.profile_box.isEnabled())
+        self.remote_collection_combo.setEnabled(self.remote_path_edit.isEnabled())
+        self.collection_pane.set_locked(not pane_busy and not self.profile_box.isEnabled())
+
+    def _update_collection_scope_ui(self) -> None:
+        selected_scope = str(self.transfer_scope_combo.currentData()) == "selected"
+        left_items = self.collection_pane.selected_entries() if selected_scope else []
+        right_items = self._selected_remote_entries() if selected_scope else []
+        if selected_scope:
+            self.dry_run_button.setText(f"Compare selected → right ({len(left_items):,})")
+            self.upload_button.setText(f"Copy selected → right ({len(left_items):,})")
+            self.download_dry_run_button.setText(f"Compare selected → left ({len(right_items):,})")
+            self.download_button.setText(f"Copy selected → left ({len(right_items):,})")
+            self.selection_status_label.setText(
+                f"Selected: {len(left_items):,} left item(s) · {len(right_items):,} right item(s)"
+            )
+        else:
+            self.dry_run_button.setText("Compare left folder → right")
+            self.upload_button.setText("Copy left folder → right")
+            self.download_dry_run_button.setText("Compare right folder → left")
+            self.download_button.setText("Copy right folder → left")
+            self.selection_status_label.setText("Current folder")
+        idle = (
+            self.current_thread is None
+            and self.compare_thread is None
+            and self.remote_thread is None
+            and not self.collection_pane.is_busy()
+        )
+        left_ok = idle and (not selected_scope or bool(left_items))
+        right_ok = idle and (not selected_scope or bool(right_items))
+        self.dry_run_button.setEnabled(left_ok)
+        self.upload_button.setEnabled(left_ok)
+        self.download_dry_run_button.setEnabled(right_ok)
+        self.download_button.setEnabled(right_ok)
+
+    def _start_collection_copy(self, dry_run: bool, left_to_right: bool) -> None:
+        profile = self.current_profile()
+        if not profile:
+            return
+        errors = self._profile_errors(profile, require_rsync=False)
+        if errors:
+            self._show_errors(errors)
+            return
+        if self.remote_thread or self.collection_pane.is_busy():
+            QMessageBox.information(self, "Operation running", "Wait for the remote listing to finish.")
+            return
+        right_path = self.remote_path_edit.text().strip().rstrip("/") or "/"
+        left_path = self.collection_pane.current_path()
+        if self.remote_entries_path != right_path or self.collection_pane.entries_path != left_path:
+            self._show_errors(["Load both panes first, so the app has confirmed both folders exist and are accessible."])
+            return
+        scope = str(self.transfer_scope_combo.currentData())
+        if left_to_right:
+            source_folder, destination = left_path, right_path
+            selected = self.collection_pane.selected_entries()
+        else:
+            source_folder, destination = right_path, left_path
+            selected = self._selected_remote_entries()
+        if scope == "selected":
+            if not selected:
+                self._show_errors(["Select one or more items in the source pane, or choose Current folder."])
+                return
+            sources = [entry.path for entry in selected]
+        else:
+            sources = [source_folder]
+        try:
+            landings = collection_copy_destinations(sources, destination)
+        except ValueError as exc:
+            self._show_errors([str(exc)])
+            return
+
+        preview = "\n".join(f"{source}\n  → {landing}" for source, landing in zip(sources[:10], landings[:10]))
+        if len(sources) > 10:
+            preview += f"\n... and {len(sources) - 10:,} more"
+        mode = (
+            "Compare only (nothing is copied or changed)"
+            if dry_run
+            else "Copy (files with the same name at the destination may be updated)"
+        )
+        if (
+            QMessageBox.question(
+                self,
+                "Confirm collection copy",
+                f"Mode: {mode}\n\n{preview}\n\n"
+                "Copy only: nothing is deleted or moved. rsync runs on the QRIScloud server, "
+                "so the data does not pass through this PC. The source's owner and group are not "
+                "copied; files are owned as if this account had uploaded them.\n\n"
+                "Files that are on Medici tape are recalled when read, which can be slow. "
+                "Use Recall from tape first for large folders.\n\nContinue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            != QMessageBox.Yes
+        ):
+            return
+        passphrase = self._get_session_passphrase(profile)
+        if passphrase is None:
+            return
+
+        def command_factory(attempt_profile: Profile) -> list[str]:
+            return build_collection_copy_command(
+                attempt_profile,
+                sources,
+                destination,
+                dry_run=dry_run,
+                ssh_path=self.detected_ssh,
+                batch_mode=not bool(passphrase),
+            )
+
+        def after_copy(_worker: object, _code: int) -> None:
+            # Runs after success, failure and Stop: a partial copy still
+            # changes the destination. The panes keep separate caches.
+            self.collection_pane.invalidate(profile, destination)
+            self.remote_directory_cache.invalidate(profile, destination, subdirectories=True)
+            if not left_to_right:
+                self.collection_pane.refresh(force=True)
+
+        refresh_right = left_to_right and not dry_run
+        self._start_worker(
+            FallbackCommandWorker(
+                profile,
+                command_factory,
+                f"collection_copy{'_dry_run' if dry_run else ''}_{profile.name}",
+                passphrase=passphrase,
+                ssh_path=self.detected_ssh,
+            ),
+            "Compare collection copy" if dry_run else "Collection copy",
+            refresh_remote=refresh_right,
+            remote_cache_invalidations=[(profile, destination, True)] if refresh_right else [],
+            cleanup=None if dry_run else after_copy,
+        )
+        if self.current_worker is not None and not dry_run:
+            self._append_log(
+                "Stop closes the SSH connection. The server-side rsync normally stops within seconds, "
+                "but may continue briefly (for example while waiting on a tape recall). "
+                "Running the copy again skips files that were already copied.\n"
+            )
+
     def _start_rsync(self, dry_run: bool, direction: str = "upload") -> None:
+        if self._collection_mode():
+            # In collection mode the upload buttons copy left → right and the
+            # download buttons copy right → left.
+            self._start_collection_copy(dry_run, left_to_right=direction == "upload")
+            return
         profile = self.current_profile()
         if not profile:
             return
@@ -2803,7 +3374,7 @@ class MainWindow(QMainWindow):
                 self._append_log(f"Downloading {len(selected_remote_files):,} selected files.\n")
             else:
                 self._append_log(
-                    f"Using visible remote file list ({self.remote_table.rowCount():,} entries) to avoid recursive rsync discovery.\n"
+                    f"Using visible remote file list ({len(self.remote_entries):,} entries) to avoid recursive rsync discovery.\n"
                 )
         elif selected_local_file:
             self._append_log(f"Uploading selected item: {selected_local_file}\n")
@@ -2878,8 +3449,15 @@ class MainWindow(QMainWindow):
         refresh_remote: bool = False,
         remote_cache_invalidations: list[tuple[Profile, str, bool]] | None = None,
         after_finish=None,
+        cleanup=None,
     ) -> None:
-        if self.current_thread or self.remote_thread or self.compare_thread:
+        """Start a background operation.
+
+        after_finish is a continuation that Stop cancels. cleanup always runs
+        when the operation ends (success, failure or Stop), for refreshing
+        listings that the operation may have changed.
+        """
+        if self.current_thread or self.remote_thread or self.compare_thread or self.collection_pane.is_busy():
             QMessageBox.information(self, "Operation running", "Another operation is already running.")
             return
         self.log_output.clear()
@@ -2902,6 +3480,7 @@ class MainWindow(QMainWindow):
         self.current_refresh_remote = refresh_remote
         self.current_remote_cache_invalidations = list(remote_cache_invalidations or [])
         self.current_after_finish = after_finish
+        self.current_cleanup = cleanup
         self.current_exit_code = None
         self._set_running(True)
         self._reset_transfer_progress(label)
@@ -2924,7 +3503,7 @@ class MainWindow(QMainWindow):
             self.current_exit_code = code
             label = self.current_label or "Command"
             self._append_log(f"\n{label} finished with exit code {code}.\n")
-            if code == 0 and any(word in label.lower() for word in ("upload", "download", "dry run", "recall")):
+            if code == 0 and any(word in label.lower() for word in ("upload", "download", "dry run", "recall", "copy")):
                 self.transfer_progress.setValue(100)
             self.transfer_status_label.setText(f"{label} finished with exit code {code}.")
         finally:
@@ -2952,10 +3531,12 @@ class MainWindow(QMainWindow):
         worker = self.current_worker
         exit_code = self.current_exit_code if self.current_exit_code is not None else 1
         after_finish = self.current_after_finish
+        cleanup = self.current_cleanup
         self.current_thread = None
         self.current_worker = None
         self.current_label = ""
         self.current_after_finish = None
+        self.current_cleanup = None
         self.current_remote_cache_invalidations = []
         self.current_exit_code = None
         self._set_running(False)
@@ -2963,6 +3544,8 @@ class MainWindow(QMainWindow):
             for profile, path, subdirectories in remote_cache_invalidations:
                 self.remote_directory_cache.invalidate(profile, path, subdirectories=subdirectories)
         self._run_post_worker_refresh(refresh_local, refresh_remote)
+        if cleanup and not self._close_after_stop:
+            cleanup(worker, exit_code)
         if after_finish and not self._close_after_stop:
             after_finish(worker, exit_code)
 
@@ -2992,7 +3575,11 @@ class MainWindow(QMainWindow):
             self._append_log("\nNothing cancellable is currently running.\n")
 
     def closeEvent(self, event) -> None:
-        active_threads = [thread for thread in (self.current_thread, self.remote_thread, self.compare_thread) if thread and thread.isRunning()]
+        active_threads = [
+            thread
+            for thread in (self.current_thread, self.remote_thread, self.compare_thread, self.collection_pane.list_thread)
+            if thread and thread.isRunning()
+        ]
         if not active_threads:
             self._close_after_stop = False
             event.accept()
@@ -3028,6 +3615,7 @@ class MainWindow(QMainWindow):
             self.remote_worker.cancel()
         if self.compare_worker:
             self.compare_worker.cancel()
+        self.collection_pane.cancel()
         event.ignore()
         QTimer.singleShot(100, self._close_when_operations_stop)
 
@@ -3036,7 +3624,7 @@ class MainWindow(QMainWindow):
             return
         active = any(
             thread and thread.isRunning()
-            for thread in (self.current_thread, self.remote_thread, self.compare_thread)
+            for thread in (self.current_thread, self.remote_thread, self.compare_thread, self.collection_pane.list_thread)
         )
         if active:
             QTimer.singleShot(100, self._close_when_operations_stop)
@@ -3053,9 +3641,11 @@ class MainWindow(QMainWindow):
         self.remote_table.setEnabled(not running and self.remote_thread is None)
         self.local_new_folder_button.setEnabled(not running)
         self.local_rename_button.setEnabled(not running)
+        self.local_move_button.setEnabled(not running)
         self.local_delete_button.setEnabled(not running)
         self.remote_new_folder_button.setEnabled(not running and self.remote_thread is None)
         self.remote_rename_button.setEnabled(not running and self.remote_thread is None)
+        self.remote_move_button.setEnabled(not running and self.remote_thread is None)
         self.remote_delete_button.setEnabled(not running and self.remote_thread is None)
         self.dry_run_button.setEnabled(not running)
         self.download_dry_run_button.setEnabled(not running)
@@ -3066,6 +3656,7 @@ class MainWindow(QMainWindow):
         self.download_button.setEnabled(not running)
         self.transfer_scope_combo.setEnabled(not running)
         self.stop_button.setEnabled(running)
+        self._update_mode_controls()
         if not running:
             self._update_transfer_scope_ui()
 
@@ -3078,6 +3669,7 @@ class MainWindow(QMainWindow):
         self.remote_table.setEnabled(not busy)
         self.remote_new_folder_button.setEnabled(not busy and self.current_thread is None)
         self.remote_rename_button.setEnabled(not busy and self.current_thread is None)
+        self.remote_move_button.setEnabled(not busy and self.current_thread is None)
         self.remote_delete_button.setEnabled(not busy and self.current_thread is None)
         self.transfer_scope_combo.setEnabled(not busy and self.current_thread is None and self.compare_thread is None)
         self.ssh_button.setEnabled(not busy and self.current_thread is None and self.compare_thread is None)
@@ -3093,6 +3685,7 @@ class MainWindow(QMainWindow):
             and bool(self.sync_selection and self.sync_selection.get("selected"))
         )
         self.recall_button.setEnabled(not busy and self.current_thread is None and self.compare_thread is None)
+        self._update_mode_controls()
         if not busy:
             self._update_transfer_scope_ui()
 
@@ -3107,16 +3700,22 @@ class MainWindow(QMainWindow):
         self.upload_button.setEnabled(not running and self.current_thread is None)
         self.local_new_folder_button.setEnabled(not running and self.current_thread is None)
         self.local_rename_button.setEnabled(not running and self.current_thread is None)
+        self.local_move_button.setEnabled(not running and self.current_thread is None)
         self.local_delete_button.setEnabled(not running and self.current_thread is None)
         self.recall_button.setEnabled(not running and self.current_thread is None)
         self.remote_new_folder_button.setEnabled(not running and self.current_thread is None and self.remote_thread is None)
         self.remote_rename_button.setEnabled(not running and self.current_thread is None and self.remote_thread is None)
+        self.remote_move_button.setEnabled(not running and self.current_thread is None and self.remote_thread is None)
         self.remote_delete_button.setEnabled(not running and self.current_thread is None and self.remote_thread is None)
         self.download_button.setEnabled(not running and self.current_thread is None)
         self.transfer_scope_combo.setEnabled(not running and self.current_thread is None)
         self.stop_button.setEnabled(running or self.current_thread is not None)
+        self._update_mode_controls()
 
     def _update_transfer_scope_ui(self, *_args) -> None:
+        if self._collection_mode():
+            self._update_collection_scope_ui()
+            return
         selected_scope = str(self.transfer_scope_combo.currentData()) == "selected"
         local_items = self._selected_local_paths() if selected_scope else []
         remote_files = self._selected_remote_files() if selected_scope else []

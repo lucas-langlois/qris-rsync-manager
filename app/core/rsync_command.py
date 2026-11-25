@@ -170,6 +170,129 @@ def build_rsync_command(
     return command
 
 
+# Collection-to-collection copies run rsync on the QRIScloud SSH host itself,
+# so data never travels through the workstation. These flags are parsed by
+# the server's rsync, not MSYS2's, so keep them to long-standing options.
+# --no-o/--no-g: do not carry the source collection's owner/group into the
+# destination collection; files are owned as for an upload by this account.
+# No --timeout: a source file waiting on a Medici tape recall can block reads
+# for minutes; the SSH keepalive still detects a dead connection.
+COLLECTION_COPY_RSYNC_OPTIONS = [
+    "-a",
+    "--no-o",
+    "--no-g",
+    "-v",
+    "-h",
+    "--partial",
+    "--outbuf=N",
+    "--info=progress2",
+]
+
+COLLECTION_ROOT_PREFIXES = frozenset({"data", "QRISdata", "RDS"})
+
+# QRIScloud storage metadata found in each collection root; not user data.
+QRISCLOUD_SYSTEM_DIR = ".afm"
+
+
+def collection_of_remote_path(remote_path: str) -> str:
+    """Return the collection root (for example ``/data/Q0101``) holding a path.
+
+    Raise ValueError when the path is not inside a QRISdata collection.
+    """
+    from .remote_ops import clean_remote_path
+
+    clean = clean_remote_path(remote_path)
+    parts = [part for part in clean.split("/") if part]
+    if len(parts) < 2 or parts[0] not in COLLECTION_ROOT_PREFIXES or not parts[1].upper().startswith("Q"):
+        raise ValueError(f"Path is not inside a QRISdata collection (for example /data/Q0101/...): {clean}")
+    return f"/{parts[0]}/{parts[1]}"
+
+
+def collection_key(remote_path: str) -> tuple[str, str]:
+    """Return (collection id, path inside the collection) for a remote path.
+
+    /data/Q0101/x and /QRISdata/Q0101/x name the same storage, so collections
+    are compared by their ID, never by the path prefix. Raise ValueError when
+    the path is not inside a collection.
+    """
+    from .remote_ops import clean_remote_path
+
+    collection_of_remote_path(remote_path)
+    parts = [part for part in clean_remote_path(remote_path).split("/") if part]
+    return parts[1].upper(), "/".join(parts[2:])
+
+
+def collection_copy_destinations(source_paths: list[str], destination_directory: str) -> list[str]:
+    """Validate a collection copy and return where each source will land.
+
+    Each source is copied *into* the destination folder, keeping its own name.
+    """
+    import posixpath
+
+    from .remote_ops import clean_remote_path
+
+    destination = clean_remote_path(_validated_remote_path(destination_directory))
+    destination_id, _inside = collection_key(destination)
+    sources = [clean_remote_path(_validated_remote_path(path)) for path in source_paths]
+    if not sources:
+        raise ValueError("Select at least one remote file or folder to copy.")
+    results: list[str] = []
+    for source in sources:
+        # Copies are between collections only; reorganising inside one
+        # collection is what Rename/move is for.
+        # Comparing IDs also rules out copying a folder into itself through
+        # the other prefix (/data/Q0101/a into /QRISdata/Q0101/a/sub).
+        if collection_key(source)[0] == destination_id:
+            raise ValueError(
+                f"Source and destination are both in {destination_id}. "
+                "Choose a different collection in one of the panes."
+            )
+        if destination == source or destination.startswith(source.rstrip("/") + "/"):
+            raise ValueError(f"Cannot copy a folder into itself or one of its subfolders: {source}")
+        landing = posixpath.join(destination, posixpath.basename(source))
+        if landing == source:
+            raise ValueError(f"Source and destination are the same: {source}")
+        results.append(landing)
+    if len(set(results)) != len(results):
+        raise ValueError("Selected items would have duplicate names in the destination folder.")
+    return results
+
+
+def build_collection_copy_command(
+    profile: Profile,
+    source_paths: list[str],
+    destination_directory: str,
+    dry_run: bool = False,
+    ssh_path: str | None = None,
+    batch_mode: bool = True,
+) -> list[str]:
+    """Build an ssh command that runs rsync on the QRIScloud host to copy
+    between collections. Copy only: never deletes or moves anything."""
+    from .remote_dirs import build_remote_ssh_base
+    from .remote_ops import clean_remote_path
+
+    collection_copy_destinations(source_paths, destination_directory)
+    sources = [clean_remote_path(path) for path in source_paths]
+    destination = clean_remote_path(destination_directory)
+    remote_args = ["rsync", *COLLECTION_COPY_RSYNC_OPTIONS]
+    if dry_run:
+        remote_args.append("--dry-run")
+        remote_args.extend(DRY_RUN_COMPARE_OPTIONS)
+    else:
+        remote_args.append("--itemize-changes")
+    remote_args.append(f"--exclude={RECEIPT_DIR_NAME}/")
+    # Every collection root holds a root-owned, unreadable .afm folder
+    # (QRIScloud storage metadata). Copying a whole collection would fail on
+    # it with a permission error, so it is never copied.
+    remote_args.append(f"--exclude={QRISCLOUD_SYSTEM_DIR}/")
+    # "--" stops option parsing; sources have no trailing slash so each one
+    # lands inside the destination under its own name.
+    remote_args.append("--")
+    remote_args.extend(sources)
+    remote_args.append(destination.rstrip("/") + "/")
+    return [*build_remote_ssh_base(profile, ssh_path=ssh_path, batch_mode=batch_mode), shlex.join(remote_args)]
+
+
 def _validated_remote_path(path: str) -> str:
     if any(ord(character) < 32 or ord(character) == 127 for character in path):
         raise ValueError("Remote paths cannot contain control characters.")

@@ -28,7 +28,8 @@ The left browser shows **Local** files on your computer. The right browser shows
 9. Compare and upload a tiny test folder.
 10. Download the test file into a separate folder.
 11. Understand folder destinations, automatic archives, and transfer receipts.
-12. Resolve common problems.
+12. Organise files and copy between collections.
+13. Resolve common problems.
 
 ### Two windows for commands
 
@@ -115,7 +116,7 @@ pacman -Syu
 
 **Checkpoint:** the update completes without errors. After any requested restart, the second run must also finish. It may say there is nothing to do. Do not skip that second run after a core update.
 
-The restart procedure follows [MSYS2's updating instructions](https://www.msys2.org/docs/updating/). If you see permission, download, or signature errors, use step 12 before continuing.
+The restart procedure follows [MSYS2's updating instructions](https://www.msys2.org/docs/updating/). If you see permission, download, or signature errors, use step 13 before continuing.
 
 ## 4. Install rsync and OpenSSH
 
@@ -292,7 +293,7 @@ The app tries the other direct host if the first one fails. It records a new ser
 
 ### Controls to leave alone during this practice
 
-The current app also has **New folder**, **Rename/move**, and **Delete** controls. They can change stored data. Dragging within a pane can move items after confirmation. Dragging between panes does not upload or download. Use the explicit transfer buttons for this tutorial.
+The current app also has **New folder**, **Rename**, **Move to…**, and **Delete** controls, plus the same actions on the right-click menu and keyboard shortcuts (F2, F6, F7, Del, Ctrl+X/Ctrl+V). They can change stored data. Dragging within a pane can move items after confirmation. Dragging between panes does not upload or download. Use the explicit transfer buttons for this tutorial.
 
 **Transfer scope** determines what a transfer copies:
 
@@ -433,7 +434,44 @@ Download the `.tar` to your workstation first. In File Explorer, use an extracti
 
 <!-- pagebreak -->
 
-## 12. Troubleshooting checkpoints
+## 12. Organise files and copy between collections
+
+Try these only after the practice transfers work, and practise on your own test folder first. They change stored data.
+
+### Organise files and folders
+
+Each pane works like a WinSCP file panel. Right-click an item, or click in the file list and use the keyboard:
+
+| Action and key | What it does |
+| --- | --- |
+| **Open** (Enter) / **Up** (Backspace) | Open the selected folder, or go to the parent folder. |
+| **Refresh** (F5) | Reload the folder listing. |
+| **New folder…** (F7) | Create a folder in the folder you have open. |
+| **Rename…** (F2) | Change the selected item's name. It stays in the same folder. |
+| **Move to…** (F6) | Choose a destination folder for the selected items. |
+| **Cut / Paste** (Ctrl+X / Ctrl+V) | Cut items, open another folder in the same pane, then paste to move them there. |
+| **Copy path** (Ctrl+Shift+C) | Copy the selected item's path, or the open folder's path, to the clipboard. |
+| **Delete…** (Del) | Local items go to the Recycle Bin. Remote items are deleted permanently after you type `DELETE`. |
+
+You can also drag selected items onto a folder in the same pane. In a QRIScloud pane, drop them on the `..` row to move them up one level. Every move shows the exact source and destination and asks you to confirm. Nothing is overwritten, and moves never copy data between panes.
+
+### Copy between two collections
+
+If your account can access two collections, you can copy data from one to the other without downloading it.
+
+1. Set **Mode** to **Collection ↔ Collection**. The Local pane becomes a second QRIScloud browser.
+2. In each pane, pick a collection from the **Collection** dropdown, or type a path and click **Load**, then open the folder you want. The two panes must show different collections. The collection open in one pane is greyed out in the other.
+3. Choose **Current folder** or **Selected items** in **Transfer scope**.
+4. Click **Compare left folder → right**, or **Compare right folder → left** for the other direction. With **Selected items** the buttons read **Compare selected → right** and **→ left**. Read the confirmation, which shows each source and where it will land. Click **Yes** and read the Log.
+5. When the comparison looks right, click the matching **Copy** button, such as **Copy left folder → right**, and confirm.
+
+**Folder address example only:** copying the folder `/data/Q0101/Survey 2025` into an open `/data/Q0202` produces `/data/Q0202/Survey 2025`.
+
+The copy runs on the QRIScloud server, so your network speed does not matter. It never deletes or moves anything, but files with the same name at the destination may be updated. Files on tape are recalled as they are read, so a large copy can be slow; use **Recall from tape** first. Collection copies do not write receipts. Set **Mode** back to **Local ↔ QRIScloud** for uploads and downloads.
+
+<!-- pagebreak -->
+
+## 13. Troubleshooting checkpoints
 
 Read the **first specific error** in the Log as well as the final exit code. A nonzero exit code means an error or cancellation; do not assume a partly visible file is a complete transfer.
 
@@ -506,6 +544,6 @@ Links in the PDF are clickable. Installation and account instructions were check
 - [Microsoft OpenSSH key management](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_keymanagement) for key-pair and passphrase guidance.
 - [OpenSSH authorized-key documentation](https://man.openbsd.org/sshd.8#AUTHORIZED_KEYS_FILE_FORMAT) for public-key registration on the server.
 
-App labels, profile fields, folder destinations, archive behavior, and transfer receipts were checked against the repository's README, built-in setup guide, and implementation of **v1.1.0** (commit a0342cb). The registration command adapts the built-in method to use the installed MSYS2 SSH program explicitly and set accepted-key permissions. It has not been run against a live QRIScloud account for this guide.
+App labels, profile fields, folder destinations, archive behavior, transfer receipts, file organising, and collection copies were checked against the repository's README, built-in setup guide, and implementation of **v1.2.0**. The registration command adapts the built-in method to use the installed MSYS2 SSH program explicitly and set accepted-key permissions. It has not been run against a live QRIScloud account for this guide.
 
 The guide uses text path diagrams rather than simulated app screenshots. The editable source is `WINDOWS_BEGINNER_TUTORIAL.md` in the repository; the printable guide is built with `packaging/build_tutorial_pdf.py`.
