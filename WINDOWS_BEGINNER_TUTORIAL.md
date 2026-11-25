@@ -292,7 +292,7 @@ The app tries the other direct host if the first one fails. It records a new ser
 
 ### Controls to leave alone during this practice
 
-The current app also has **New folder**, **Rename/move**, and **Delete** controls. They can change stored data. Dragging within a pane can move items after confirmation. Dragging between panes does not upload or download. Use the explicit transfer buttons for this tutorial.
+The current app also has **New folder**, **Rename**, **Move to…**, and **Delete** controls, plus the same actions on the right-click menu and keyboard shortcuts (F2, F6, F7, Del, Ctrl+X/Ctrl+V). They can change stored data. Dragging within a pane can move items after confirmation. Dragging between panes does not upload or download. Use the explicit transfer buttons for this tutorial.
 
 **Transfer scope** determines what a transfer copies:
 

@@ -1,6 +1,6 @@
 # QRIS Rsync Manager
 
-QRIS Rsync Manager is a Windows desktop app for moving research datasets between a local Windows workstation and QRIScloud QRISdata collections using MSYS2 `rsync` over SSH.
+QRIS Rsync Manager is a Windows desktop app for moving research datasets between a local Windows workstation and QRIScloud QRISdata collections using MSYS2 `rsync` over SSH. It can also copy data directly between two collections without the data passing through the workstation.
 
 The app is designed for practical QRIScloud workflows: side-by-side local/remote browsing, dry-run comparison, resumable uploads/downloads, live logs, progress display, and safe defaults.
 
@@ -30,8 +30,10 @@ On first launch, Windows may show a security warning because this is not yet a c
 - Side-by-side local and remote directory browser
 - Fast repeat navigation with a bounded, session-only remote directory cache
 - Current-folder or multi-item selection for uploads, downloads, and comparisons
-- Confirmed drag-and-drop moves within the local pane or within the active remote collection
-- Create folders, rename/move items, and safely remove selected items in either pane
+- WinSCP-style file management in every pane: right-click menus, F2/F5/F6/F7/Del/Backspace keys,
+  a `..` row, Cut/Paste moves, and a Move to… folder picker
+- Confirmed drag-and-drop moves within the local pane or within the displayed remote collection
+- Create folders, rename, move, and safely remove selected items in any pane
 - Local deletion uses the Windows Recycle Bin; remote deletion requires typed confirmation
 - QRIScloud connection profiles
 - Atomic profile saving, backup recovery, and isolation of malformed profile records
@@ -41,6 +43,7 @@ On first launch, Windows may show a security warning because this is not yet a c
 - Per-user QRIScloud host-key trust with protection against unexpected server identity changes
 - Automatic fallback between `ssh1.qriscloud.org.au` and `ssh2.qriscloud.org.au`
 - Upload and download with rsync
+- Collection ↔ Collection mode for server-side copies between QRISdata collections
 - Compare/dry-run for upload and download
 - WinSCP-style upload selection for missing/changed files
 - Automatic, uncompressed TAR packaging for folders with many files of one type, with inventory files
@@ -160,10 +163,44 @@ See the official [QRISdata collection guide](https://www.qriscloud.org.au/suppor
 9. Use **Compare download** before downloading.
 10. Use **Download folder** or **Download selected files** to transfer data into the displayed local folder.
 
-Within either browser pane, selected items can be dragged onto a folder to move
-them. The app shows the exact source and destination before moving. Dragging
-between the local and remote panes is intentionally disabled; uploads and
-downloads remain explicit button actions.
+## Organising Files and Folders
+
+Each pane (local, QRIScloud, and the second collection pane) works like a
+WinSCP file panel. Right-click an item, or use the keyboard while the file list
+has focus:
+
+| Action | Key | What it does |
+| --- | --- | --- |
+| Open | Enter | Open the selected folder |
+| Up one level | Backspace | Go to the parent folder |
+| Refresh | F5 | Reload the folder listing |
+| New folder… | F7 | Create a folder in the current folder |
+| Rename… | F2 | Rename the selected item (name only) |
+| Move to… | F6 | Pick a destination folder for the selected items |
+| Cut / Paste | Ctrl+X / Ctrl+V | Cut items, open another folder, paste to move them there |
+| Copy path | Ctrl+Shift+C | Copy the selected (or current) path to the clipboard |
+| Delete… | Del | Delete the selected items |
+
+Other ways to move items:
+
+- Drag selected items onto a folder. In the QRIScloud panes you can drop them
+  on the `..` row to move them up one level.
+- Paste goes into the selected folder, or into the current folder when no
+  single folder is selected.
+
+Every move shows the exact source and destination and asks for confirmation.
+Existing items are never overwritten.
+
+Everything stays inside one pane:
+
+- Dragging between panes does nothing, and you can only paste in the pane you
+  cut from. Uploads, downloads and collection copies are always explicit
+  button actions.
+- QRIScloud moves stay inside the collection the items come from.
+- Local Move to… and Paste can reach any folder on the same drive. Dragging
+  stays within the displayed local folder.
+- Keyboard shortcuts follow the buttons, so they do nothing while an operation
+  is running.
 
 ## Profile Setup
 
@@ -239,17 +276,59 @@ operation log even if rsync has not started.
 ## Remote File Management
 
 The remote browser supports double-click navigation, **Up**, **Refresh**, and a
-session-only cache that makes revisiting directories immediate. **Refresh**
+session-only cache that makes revisiting directories immediate. Its
+**Collection** dropdown lists your saved profiles by name (those that use the
+same username as the selected profile); picking one opens that collection in
+the pane without changing the selected profile. **Refresh**
 always requests a new listing from QRIScloud.
 
-You can create folders, rename or move selected items, and delete selected
-remote items. Remote moves are constrained to the active collection and require
-confirmation. Remote deletion requires typing `DELETE`; collection roots and
+You can create folders, rename, move, and delete selected remote items (see
+**Organising Files and Folders**). Remote moves are constrained to the
+collection being displayed and require confirmation. Remote deletion requires typing `DELETE`; collection roots and
 unsafe paths are protected. Drag and drop moves items only within the same pane.
 It never starts an upload or download.
 
 Local deletion moves explicitly selected files or folders to the Windows
 Recycle Bin.
+
+## Copy Between Collections
+
+Switch **Mode** to **Collection ↔ Collection** to copy data from one QRISdata
+collection to another, for example from `/data/Q0101` to `/data/Q0202`. The
+local pane is replaced by a second QRIScloud browser. Pick a collection by
+profile name from its **Collection** dropdown, or type any path, then click
+**Load**. The right pane has the same dropdown, so either side can switch
+collections quickly. Profiles only fill these lists; picking a collection does
+not change the selected profile. The two panes must show different collections:
+the collection open in one pane is greyed out in the other pane's dropdown, and
+a copy within a single collection is refused (use **Move to…** or Cut/Paste for that).
+
+The transfer buttons become **Compare/Copy left → right** and
+**Compare/Copy right → left**. With **Current folder**, the source pane's
+folder is copied into the destination pane's folder under its own name. With
+**Selected items**, the selected files and folders are copied the same way.
+The confirmation shows each source and where it will land.
+
+How it works and what to expect:
+
+- rsync runs on the QRIScloud SSH host, so the data never passes through your PC
+  and your network speed does not matter.
+- Both panes use the selected profile's account. That one account must have
+  access to both collections.
+- It is copy only. Nothing is deleted or moved, and `--delete` is never used.
+  Files with the same name at the destination may be updated.
+- The source's owner and group are not copied (`--no-o --no-g`). Copied files
+  are owned the same way as files this account uploads.
+- Files on Medici tape are recalled when rsync reads them, which can be slow.
+  For large folders, use **Recall from tape** first.
+- **Stop** closes the SSH connection. The server-side rsync normally stops
+  within seconds, but may continue briefly, for example while it waits on a tape
+  recall. Running the copy again skips files already copied.
+- Transfer receipts are not written for collection copies.
+- The `.afm` folder in each collection root is QRIScloud storage metadata that
+  your account cannot read, so it is never copied.
+- Both panes must be loaded before a copy starts, so the app knows both folders
+  exist and are accessible.
 
 ## Recall from Tape
 

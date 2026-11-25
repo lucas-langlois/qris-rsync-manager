@@ -294,3 +294,12 @@ def test_app_version_matches_pyproject() -> None:
 
     pyproject = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
     assert app_version() == __version__ == pyproject["project"]["version"]
+
+
+
+def test_receipt_collection_id_comes_from_the_remote_path() -> None:
+    from app.core.receipt_recorder import _collection_id_for
+
+    assert _collection_id_for("/data/Q8940/survey", "Q9560") == "Q8940"
+    assert _collection_id_for("/QRISdata/q8940", "Q9560") == "Q8940"
+    assert _collection_id_for("/home/user", "Q9560") == "Q9560"

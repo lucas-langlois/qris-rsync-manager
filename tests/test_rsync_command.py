@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
+
+import pytest
 
 from app.core.profiles import Profile
 from app.core.rsync_command import DEFAULT_RSYNC_OPTIONS, build_rsync_command, build_ssh_transport, validate_transfer_inputs
@@ -214,3 +217,101 @@ def test_ssh_transport_can_allow_passphrase_prompt(tmp_path: Path) -> None:
     transport = build_ssh_transport(profile, ssh_path=r"C:\msys64\usr\bin\ssh.exe", batch_mode=False)
 
     assert "BatchMode=yes" not in transport
+
+
+def test_collection_copy_runs_rsync_on_server_without_delete() -> None:
+    from app.core.rsync_command import COLLECTION_COPY_RSYNC_OPTIONS, build_collection_copy_command
+
+    profile = Profile(username="user", host="ssh1.qriscloud.org.au")
+
+    command = build_collection_copy_command(
+        profile,
+        ["/data/Q0101/survey 2024"],
+        "/data/Q0202/incoming",
+        ssh_path="ssh.exe",
+    )
+
+    assert command[0] == "ssh.exe"
+    assert command[-2] == "user@ssh1.qriscloud.org.au"
+    remote = shlex.split(command[-1])
+    assert remote[0] == "rsync"
+    for option in COLLECTION_COPY_RSYNC_OPTIONS:
+        assert option in remote
+    assert "--no-o" in remote and "--no-g" in remote
+    assert "--itemize-changes" in remote
+    assert "--exclude=.qris-receipts/" in remote
+    assert "--exclude=.afm/" in remote
+    assert remote[-3:] == ["--", "/data/Q0101/survey 2024", "/data/Q0202/incoming/"]
+    for forbidden in ("--delete", "-c", "--checksum", "--remove-source-files", "--dry-run"):
+        assert forbidden not in remote
+
+
+def test_collection_copy_dry_run_adds_compare_flags() -> None:
+    from app.core.rsync_command import build_collection_copy_command
+
+    command = build_collection_copy_command(
+        Profile(username="user"), ["/data/Q0101/a", "/data/Q0101/b.txt"], "/data/Q0202", dry_run=True, ssh_path="ssh.exe"
+    )
+
+    remote = shlex.split(command[-1])
+    assert "--dry-run" in remote
+    assert "--itemize-changes" in remote
+    assert remote[-3:] == ["/data/Q0101/a", "/data/Q0101/b.txt", "/data/Q0202/"]
+
+
+def test_collection_copy_quotes_shell_specials() -> None:
+    from app.core.rsync_command import build_collection_copy_command
+
+    command = build_collection_copy_command(
+        Profile(username="user"), ["/data/Q0101/it's $HOME; rm -rf x"], "/data/Q0202", ssh_path="ssh.exe"
+    )
+
+    assert shlex.split(command[-1])[-2] == "/data/Q0101/it's $HOME; rm -rf x"
+
+
+def test_collection_copy_destinations_keep_source_names() -> None:
+    from app.core.rsync_command import collection_copy_destinations
+
+    assert collection_copy_destinations(["/data/Q0101/a", "/data/Q0101"], "/data/Q0202/in/") == [
+        "/data/Q0202/in/a",
+        "/data/Q0202/in/Q0101",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("sources", "destination"),
+    [
+        (["/data/Q0101/a"], "/data/Q0101/a"),
+        (["/data/Q0101/a"], "/data/Q0101/a/sub"),
+        (["/data/Q0101/a"], "/data/Q0101"),
+        (["/home/user/a"], "/data/Q0202"),
+        (["/data/Q0101/a"], "/tmp"),
+        (["/data/Q0101/a"], "/data"),
+        (["/data/Q0101/../Q0303/a"], "/data/Q0202"),
+        (["/data/Q0101/x/a", "/data/Q0101/y/a"], "/data/Q0202"),
+        (["/data/Q0101/bad\nname"], "/data/Q0202"),
+        ([], "/data/Q0202"),
+    ],
+)
+def test_collection_copy_rejects_unsafe_requests(sources: list[str], destination: str) -> None:
+    from app.core.rsync_command import build_collection_copy_command
+
+    with pytest.raises(ValueError):
+        build_collection_copy_command(Profile(username="user"), sources, destination, ssh_path="ssh.exe")
+
+
+def test_collection_copy_refuses_same_collection() -> None:
+    from app.core.rsync_command import collection_copy_destinations
+
+    with pytest.raises(ValueError, match="both in Q0101"):
+        collection_copy_destinations(["/data/Q0101/a"], "/data/Q0101/b")
+
+
+
+def test_collection_copy_treats_data_and_qrisdata_as_one_collection() -> None:
+    from app.core.rsync_command import collection_copy_destinations
+
+    with pytest.raises(ValueError, match="both in Q0101"):
+        collection_copy_destinations(["/data/Q0101/a"], "/QRISdata/Q0101/a/sub")
+    with pytest.raises(ValueError, match="both in Q0101"):
+        collection_copy_destinations(["/QRISdata/q0101/a"], "/data/Q0101")
