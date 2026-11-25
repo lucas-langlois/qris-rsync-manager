@@ -55,7 +55,7 @@ On first launch, Windows may show a security warning because this is not yet a c
 - Unicode and long Windows/UNC path support for packaged uploads
 - Logs saved to `%APPDATA%\QRISRsyncManager\logs`
 
-See [the v1.1.0 release notes](RELEASE_NOTES_v1.1.0.md) for transfer receipts and type-based archiving, [the v1.0.2 release notes](RELEASE_NOTES_v1.0.2.md) for recovery and Unicode fixes, and [the v1.0.0 release notes](RELEASE_NOTES_v1.0.0.md) for the complete feature list since v0.2.0.
+See [the v1.2.0 release notes](RELEASE_NOTES_v1.2.0.md) for collection-to-collection copies and file management, [the v1.1.0 release notes](RELEASE_NOTES_v1.1.0.md) for transfer receipts and type-based archiving, [the v1.0.2 release notes](RELEASE_NOTES_v1.0.2.md) for recovery and Unicode fixes, and [the v1.0.0 release notes](RELEASE_NOTES_v1.0.0.md) for the complete feature list since v0.2.0.
 
 ## Install MSYS2, rsync, and SSH
 
@@ -546,9 +546,9 @@ dist\QRIS_Rsync_Manager_Windows_Guide.pdf
 After building the executable:
 
 ```powershell
-git tag v1.1.0
-git push origin main v1.1.0
-gh release create v1.1.0 .\dist\QRISRsyncManager.exe --title "QRIS Rsync Manager v1.1.0" --notes-file .\RELEASE_NOTES_v1.1.0.md
+git tag v1.2.0
+git push origin main v1.2.0
+gh release create v1.2.0 .\dist\QRISRsyncManager.exe --title "QRIS Rsync Manager v1.2.0" --notes-file .\RELEASE_NOTES_v1.2.0.md
 ```
 
 If GitHub CLI is not authenticated:
