@@ -250,6 +250,7 @@ L:\RES_MEG\NFCSecure\Custom Apps\QRISCloud transfer app
 - Rebuild the guide PDF (`packaging\build_tutorial_pdf.py`) first if the tutorial changed.
 - Run the tests and smoke-test the new executable before copying.
 - Copy to a temporary `.incoming` name, check the SHA-256 hash against `dist\`, then rename over the old file, so users never open a half-copied executable.
+- People run the app straight from these folders, so the old executable may be open. Replacing it then fails, and Windows can leave the old file "delete pending" with no runnable `.exe` in the folder until that person closes the app. Do not force it. Keep retrying the rename in the background, and tell the user which folder is waiting.
 - Verify the final hash in both folders and report the result.
 - The beginner guide tells users to open the app from the same shared folder as the guide. Do not put these paths in the guide.
 
