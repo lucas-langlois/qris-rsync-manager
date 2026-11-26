@@ -55,7 +55,7 @@ On first launch, Windows may show a security warning because this is not yet a c
 - Unicode and long Windows/UNC path support for packaged uploads
 - Logs saved to `%APPDATA%\QRISRsyncManager\logs`
 
-See [the v1.3.0 release notes](RELEASE_NOTES_v1.3.0.md) for the Synchronise window and folder trees, [the v1.2.0 release notes](RELEASE_NOTES_v1.2.0.md) for collection-to-collection copies and file management, [the v1.1.0 release notes](RELEASE_NOTES_v1.1.0.md) for transfer receipts and type-based archiving, [the v1.0.2 release notes](RELEASE_NOTES_v1.0.2.md) for recovery and Unicode fixes, and [the v1.0.0 release notes](RELEASE_NOTES_v1.0.0.md) for the complete feature list since v0.2.0.
+See [the v1.3.1 release notes](RELEASE_NOTES_v1.3.1.md) for tape status, Bunya recall jobs and the new button layout, [the v1.3.0 release notes](RELEASE_NOTES_v1.3.0.md) for the Synchronise window and folder trees, [the v1.2.0 release notes](RELEASE_NOTES_v1.2.0.md) for collection-to-collection copies and file management, [the v1.1.0 release notes](RELEASE_NOTES_v1.1.0.md) for transfer receipts and type-based archiving, [the v1.0.2 release notes](RELEASE_NOTES_v1.0.2.md) for recovery and Unicode fixes, and [the v1.0.0 release notes](RELEASE_NOTES_v1.0.0.md) for the complete feature list since v0.2.0.
 
 ## Install MSYS2, rsync, and SSH
 
@@ -220,6 +220,28 @@ Create or edit a profile with:
 
 If the host is `ssh1.qriscloud.org.au` or `ssh2.qriscloud.org.au`, the app automatically tries the other host as a fallback.
 
+### Use your profiles on another computer
+
+The **Profiles ▾** menu (in the Profile box) has **Export profiles…** and
+**Import profiles…**:
+
+1. On this computer, choose **Export profiles…**, then all profiles or only the
+   selected one, and save the file. It contains no passwords or passphrases.
+2. On the other computer, open the app and choose **Import profiles…**. A plain
+   `profiles.json` copied from `%APPDATA%\QRISRsyncManager` also works.
+
+On import:
+
+- Each profile's SSH key path is pointed at the same key file name in that
+  user's `.ssh` folder.
+- The rsync path is pointed at that computer's MSYS2.
+- If a profile with the same name already exists, you choose to replace yours
+  or keep yours.
+- On a new install, the placeholder "Default QRIScloud" profile is replaced.
+
+The SSH key itself is never exported. Copy it privately to the other computer,
+or create and register a new key there (see the beginner guide).
+
 ## Automatic Archives
 
 When **Upload folder** or **Compare upload folder** scans a directory tree, each
@@ -323,7 +345,7 @@ How it works and what to expect:
 - The source's owner and group are not copied (`--no-o --no-g`). Copied files
   are owned the same way as files this account uploads.
 - Files on Medici tape are recalled when rsync reads them, which can be slow.
-  For large folders, use **Recall from tape** first.
+  For large folders, recall them first (**Tape status and recall** menu).
 - **Stop** closes the SSH connection. The server-side rsync normally stops
   within seconds, but may continue briefly, for example while it waits on a tape
   recall. Running the copy again skips files already copied.
@@ -335,7 +357,55 @@ How it works and what to expect:
 
 ## Recall from Tape
 
-Use **Recall from tape** when visible files have been migrated from QRIScloud
+The tape actions are in the **Tape status and recall ▾** menu, under the QRIScloud pane.
+
+Choose **Check tape status…** to find out whether files are ready to download or
+are on tape. It checks the selected QRIScloud items (files and folders, with
+everything inside them), or the open folder when nothing is selected, and
+shows:
+
+- how many files are on disk and can be downloaded straight away
+- which files are on tape, with their total size
+- two ways to recall exactly those files:
+  - **Submit to Bunya** (recommended): submits a Slurm recall job to UQ RCC's
+    Bunya cluster. The recall keeps going after you close the app or turn off
+    your computer. Bunya logins need your Bunya SSH key and MFA: the key
+    passphrase and the MFA prompt open in small app windows, once per
+    submission. Codes are never stored. Set your Bunya account, username, key
+    (default `~/.ssh/bunya_ed25519`) and folder (default
+    `/scratch/user/<username>/qris_recall`) in the window; the app remembers
+    them. The job and its log go in that folder, and a copy of the job files is
+    kept in `%APPDATA%\QRISRsyncManager\bunya_jobs`.
+  - **Save job files only…**: saves the Slurm script and file list so you can
+    copy them to Bunya and run `sbatch recall_medici_<date>.slurm` yourself.
+
+Choose **Recall jobs on Bunya…** to follow jobs submitted from the app:
+
+- **Check progress** asks QRIScloud how many of the job's files are back on
+  disk, for example "3,150 of 4,201 files are back on disk (75%)". It uses your
+  usual QRIScloud key, so no MFA is needed. This works because Bunya and
+  QRIScloud share the same disk cache.
+- **Show Bunya job log (MFA)** logs in to Bunya (one MFA approval) and shows
+  the Slurm state, how many files were recalled or failed, and the end of the
+  job log.
+
+On Bunya, the job log (`recall_medici_<date>_<jobid>.log`) prints progress every
+5 minutes and lists any files that could not be recalled, and
+`recall_medici_<date>_<jobid>_done.txt` lists each finished file as `OK` or
+`FAILED`. The job ends with status 1 if any file failed. The job follows
+    [RCC's guidance](https://docs.hpc.rcc.uq.edu.au/guides/data/bunya-userdata-guide/):
+    it runs on a compute node and recalls at most 4 files at a time. The Bunya
+    account defaults to `a_jcu_hpc`.
+  - **Recall now**: runs from the app over SSH. Fine for a few files, but the
+    app must stay open until it finishes.
+
+The check reads no file data, so it never starts a recall itself.
+QRIScloud keeps recent files on disk and moves older ones to tape. A file on
+tape still lists with its full size but leaves only a tiny stub on disk, and
+that is what the check looks for. Files of 4 KB or less cannot be told apart
+and are counted as on disk.
+
+Choose **Recall files in this folder now** when visible files have been migrated from QRIScloud
 disk cache to Medici tape. The action requests retrieval; it does not download
 the files. Recall runs in cancellable batches, reports periodic status, and can
 fall back between the two QRIScloud SSH hosts.
@@ -582,9 +652,9 @@ dist\QRIS_Rsync_Manager_Windows_Guide.pdf
 After building the executable:
 
 ```powershell
-git tag v1.3.0
-git push origin main v1.3.0
-gh release create v1.3.0 .\dist\QRISRsyncManager.exe --title "QRIS Rsync Manager v1.3.0" --notes-file .\RELEASE_NOTES_v1.3.0.md
+git tag v1.3.1
+git push origin main v1.3.1
+gh release create v1.3.1 .\dist\QRISRsyncManager.exe --title "QRIS Rsync Manager v1.3.1" --notes-file .\RELEASE_NOTES_v1.3.1.md
 ```
 
 If GitHub CLI is not authenticated:

@@ -4,7 +4,7 @@ import json
 import os
 import tempfile
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Literal
 
 from .paths import detect_rsync, profiles_path
@@ -163,6 +163,94 @@ def save_profiles(profiles: list[Profile], path: str | Path | None = None) -> No
                     temporary.unlink(missing_ok=True)
                 except OSError:
                     pass
+
+
+# --- Export and import -----------------------------------------------------------------
+#
+# Profiles hold no secrets (passphrases are never saved), so they can be copied
+# between computers. Key and rsync paths are machine-specific, so imports point
+# them at the same key file name in this user's .ssh folder and at this
+# computer's rsync.
+
+PROFILE_EXPORT_FORMAT = "qris-rsync-manager-profiles"
+
+
+def export_profiles(profiles: list[Profile], path: str | Path) -> None:
+    data = {
+        "format": PROFILE_EXPORT_FORMAT,
+        "version": 1,
+        "note": "QRIS Rsync Manager profiles. Contains no passwords or passphrases.",
+        "profiles": [asdict(profile.normalized()) for profile in profiles],
+    }
+    Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def read_profile_file(path: str | Path) -> tuple[list[Profile], list[str]]:
+    """Read an export file or a copied profiles.json. Returns (profiles, problems)."""
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"This is not a QRIS Rsync Manager profile file: {exc}") from exc
+    if isinstance(raw, dict) and raw.get("format") == PROFILE_EXPORT_FORMAT:
+        raw = raw.get("profiles")
+    if not isinstance(raw, list):
+        raise ValueError("This is not a QRIS Rsync Manager profile file.")
+    profiles: list[Profile] = []
+    problems: list[str] = []
+    for index, item in enumerate(raw, start=1):
+        try:
+            if not isinstance(item, dict):
+                raise ValueError("record is not an object")
+            profiles.append(Profile.from_dict(item))
+        except (TypeError, ValueError) as exc:
+            problems.append(f"Skipped profile {index}: {exc}")
+    return profiles, problems
+
+
+def adapt_profile_to_this_computer(profile: Profile, ssh_dir: str | Path | None = None) -> tuple[Profile, str]:
+    """Point the key and rsync paths at this computer. Returns (profile, note)."""
+    ssh_dir = Path(ssh_dir) if ssh_dir else Path.home() / ".ssh"
+    adapted = Profile(**asdict(profile))
+    note = ""
+    key = profile.ssh_key_path.strip()
+    if key and not Path(key).expanduser().is_file():
+        # The name of a Windows path from another computer, e.g. qriscloud_ed25519.
+        local_key = ssh_dir / PureWindowsPath(key).name
+        adapted.ssh_key_path = str(local_key)
+        if not local_key.is_file():
+            note = f"SSH key not found on this computer: {local_key}"
+    if not profile.rsync_path or not Path(profile.rsync_path).is_file():
+        adapted.rsync_path = detect_rsync()
+    return adapted, note
+
+
+@dataclass
+class ProfileImport:
+    profiles: list[Profile]
+    added: list[str]
+    replaced: list[str]
+    skipped: list[str]
+
+
+def merge_imported_profiles(existing: list[Profile], incoming: list[Profile], replace: bool) -> ProfileImport:
+    """Add *incoming* profiles; same-named ones replace or are skipped."""
+    merged = list(existing)
+    by_name = {profile.name: index for index, profile in enumerate(merged)}
+    added: list[str] = []
+    replaced: list[str] = []
+    skipped: list[str] = []
+    for profile in incoming:
+        if profile.name in by_name:
+            if replace:
+                merged[by_name[profile.name]] = profile
+                replaced.append(profile.name)
+            else:
+                skipped.append(profile.name)
+            continue
+        by_name[profile.name] = len(merged)
+        merged.append(profile)
+        added.append(profile.name)
+    return ProfileImport(merged, added, replaced, skipped)
 
 
 def _write_temporary(directory: Path, prefix: str, payload: bytes) -> Path:

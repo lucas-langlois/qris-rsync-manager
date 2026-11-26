@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
@@ -20,6 +21,9 @@ from PySide6.QtWidgets import (
     QFileSystemModel,
     QFormLayout,
     QGridLayout,
+    QMenu,
+    QToolButton,
+    QStyle,
     QGroupBox,
     QHBoxLayout,
     QAbstractItemView,
@@ -61,8 +65,12 @@ from app.core.medici import build_recall_medici_files_command, medici_path_for_r
 from app.core.paths import detect_ssh, is_executable_file
 from app.core.profiles import (
     Profile,
+    adapt_profile_to_this_computer,
+    export_profiles,
     fallback_hosts,
     load_profiles_result,
+    merge_imported_profiles,
+    read_profile_file,
     profile_with_host,
     save_profiles,
     suggest_ssh_key_path,
@@ -104,6 +112,9 @@ from app.core.sync_compare import (
 from app.gui.profile_dialog import ProfileDialog
 from app.gui.remote_folder_loader import RemoteFolderLoader
 from app.gui.sync_dialog import SynchronizeDialog
+from app.core.bunya import BunyaJob, record_job
+from app.gui.recall_jobs import RecallJobsDialog
+from app.gui.tape_status import BunyaSubmitWorker, TapeStatusDialog, TapeStatusWorker
 from app.gui.collection_pane import (
     CollectionPane,
     exclude_collection,
@@ -1089,7 +1100,8 @@ class RecallMediciWorker(QObject):
 
             if item is None:
                 output_done = True
-            elif item:
+            elif item and not item.lstrip().startswith("**"):
+                # Skip OpenSSH's multi-line "** WARNING ... post-quantum" notice.
                 self._write_and_emit(log_file, item)
 
             if self._cancelled.is_set():
@@ -1734,6 +1746,8 @@ class MainWindow(QMainWindow):
         self.build_selection_button = QPushButton("Synchronise…")
         self.upload_button = QPushButton("Upload folder")
         self.recall_button = QPushButton("Recall from tape")
+        self.tape_status_button = QPushButton("Check tape status")
+        self.recall_jobs_button = QPushButton("Recall jobs…")
         self.download_button = QPushButton("Download folder")
         self.stop_button = QPushButton("Stop")
         self.stop_button.setEnabled(False)
@@ -1745,6 +1759,10 @@ class MainWindow(QMainWindow):
             "Compare the local and QRIScloud folders side by side, then tick what to upload or download."
         )
         self.recall_button.setToolTip("Request retrieval from Medici tape; this does not download files.")
+        self.tape_status_button.setToolTip(
+            "Check whether the selected QRIScloud items (or the open folder) are on disk or on tape. "
+            "Reads no file data."
+        )
 
         self._build_ui()
         self._set_local_root(str(Path.home()))
@@ -1766,14 +1784,16 @@ class MainWindow(QMainWindow):
         new_button = QPushButton("New")
         edit_button = QPushButton("Edit")
         delete_button = QPushButton("Delete")
-        save_button = QPushButton("Save profiles")
         self.setup_guide_button = QPushButton("First-time setup")
         profile_layout.addWidget(new_button, 0, 2)
         profile_layout.addWidget(edit_button, 0, 3)
         profile_layout.addWidget(delete_button, 0, 4)
-        profile_layout.addWidget(save_button, 0, 5)
+        profile_layout.addWidget(self._profiles_menu_button(), 0, 5)
         profile_layout.addWidget(self.setup_guide_button, 0, 6)
-        profile_layout.addWidget(self.status_label, 1, 0, 1, 7)
+        # Test SSH checks this profile's connection, so it lives with the profile.
+        profile_layout.addWidget(self.ssh_button, 0, 7)
+        profile_layout.addWidget(self.status_label, 1, 0, 1, 8)
+        profile_layout.setColumnStretch(1, 1)
         layout.addWidget(self.profile_box)
 
         mode_row = QHBoxLayout()
@@ -1786,30 +1806,24 @@ class MainWindow(QMainWindow):
         browser = QSplitter()
         self.left_stack.addWidget(self._local_panel())
         self.left_stack.addWidget(self.collection_pane)
-        browser.addWidget(self.left_stack)
-        browser.addWidget(self._remote_panel())
+        # Each side's transfer buttons sit right under it, like WinSCP: upload under
+        # the local pane, download and tape under the QRIScloud pane. They live
+        # outside the panes so they stay visible when the left pane is swapped
+        # for the second-collection browser.
+        browser.addWidget(self._pane_column(self.left_stack, self._upload_row()))
+        browser.addWidget(self._pane_column(self._remote_panel(), self._download_row()))
         browser.setSizes([480, 480])
         layout.addWidget(browser, stretch=2)
 
-        button_row = QGridLayout()
-        button_row.addWidget(QLabel("Transfer scope"), 0, 0)
-        button_row.addWidget(self.transfer_scope_combo, 0, 1)
-        button_row.addWidget(self.selection_status_label, 0, 2)
-        button_row.addWidget(self.ssh_button, 0, 3)
-        button_row.addWidget(self.dry_run_button, 0, 4)
-        button_row.addWidget(self.download_dry_run_button, 0, 5)
-        button_row.addWidget(self.build_selection_button, 0, 6)
-        button_row.addWidget(self.upload_button, 1, 4)
-        button_row.addWidget(self.recall_button, 1, 5)
-        button_row.addWidget(self.download_button, 1, 6)
-        button_row.addWidget(self.stop_button, 1, 7)
-        button_row.setColumnStretch(2, 1)
-        layout.addLayout(button_row)
+        layout.addLayout(self._bottom_bar())
 
         progress_row = QHBoxLayout()
         progress_row.addWidget(QLabel("Progress"))
         progress_row.addWidget(self.transfer_progress, stretch=1)
         progress_row.addWidget(self.transfer_status_label)
+        # Stop sits with the progress it stops.
+        self.stop_button.setMinimumWidth(90)
+        progress_row.addWidget(self.stop_button)
         layout.addLayout(progress_row)
 
         layout.addWidget(QLabel("Log"))
@@ -1825,7 +1839,6 @@ class MainWindow(QMainWindow):
         new_button.clicked.connect(self._new_profile)
         edit_button.clicked.connect(self._edit_profile)
         delete_button.clicked.connect(self._delete_profile)
-        save_button.clicked.connect(self._save_profiles)
         self.setup_guide_button.clicked.connect(self._open_setup_guide)
         self.ssh_button.clicked.connect(self._start_ssh_test)
         self.local_up_button.clicked.connect(self._local_go_up)
@@ -1852,6 +1865,9 @@ class MainWindow(QMainWindow):
         self.build_selection_button.clicked.connect(self._build_sync_selection)
         self.upload_button.clicked.connect(lambda: self._start_rsync(dry_run=False, direction="upload"))
         self.recall_button.clicked.connect(self._recall_medici)
+        self.tape_status_button.clicked.connect(self._check_tape_status)
+        self.recall_jobs_button.clicked.connect(self._show_recall_jobs)
+        self.recall_jobs_button.setToolTip("Follow tape recall jobs submitted to Bunya from this app.")
         self.download_button.clicked.connect(lambda: self._start_rsync(dry_run=False, direction="download"))
         self.stop_button.clicked.connect(self._cancel_current)
         self.transfer_scope_combo.currentIndexChanged.connect(self._update_transfer_scope_ui)
@@ -1860,6 +1876,78 @@ class MainWindow(QMainWindow):
         self.remote_table.itemSelectionChanged.connect(self._update_transfer_scope_ui)
         self.remote_table.moveDropped.connect(self._move_remote_items_by_drop)
         self._install_pane_actions()
+
+    def _pane_column(self, pane: QWidget, actions: QHBoxLayout) -> QWidget:
+        column = QWidget()
+        layout = QVBoxLayout(column)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        layout.addWidget(pane, stretch=1)
+        layout.addLayout(actions)
+        return column
+
+    def _emphasise(self, button: QPushButton, icon: QStyle.StandardPixmap) -> None:
+        button.setIcon(self.style().standardIcon(icon))
+        font = button.font()
+        font.setBold(True)
+        button.setFont(font)
+
+    def _upload_row(self) -> QHBoxLayout:
+        self._emphasise(self.upload_button, QStyle.SP_ArrowRight)
+        row = QHBoxLayout()
+        row.addStretch()
+        row.addWidget(self.dry_run_button)
+        row.addWidget(self.upload_button)
+        return row
+
+    def _download_row(self) -> QHBoxLayout:
+        self._emphasise(self.download_button, QStyle.SP_ArrowLeft)
+        row = QHBoxLayout()
+        row.addWidget(self.download_button)
+        row.addWidget(self.download_dry_run_button)
+        row.addStretch()
+        row.addWidget(self._tape_menu_button())
+        return row
+
+    def _tape_menu_button(self) -> QToolButton:
+        """One menu for the three tape actions. The menu items run the existing
+        buttons (kept hidden), so they follow the same enabled rules."""
+        self.tape_menu_button = QToolButton()
+        self.tape_menu_button.setText("Tape status and recall")
+        self.tape_menu_button.setIcon(self.style().standardIcon(QStyle.SP_DriveHDIcon))
+        self.tape_menu_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.tape_menu_button.setPopupMode(QToolButton.InstantPopup)
+        self.tape_menu_button.setToolTip("Check whether QRIScloud files are on tape, and recall them.")
+        menu = QMenu(self.tape_menu_button)
+        self.tape_menu_actions = []
+        for text, button in (
+            ("Check tape status…", self.tape_status_button),
+            ("Recall files in this folder now", self.recall_button),
+            ("Recall jobs on Bunya…", self.recall_jobs_button),
+        ):
+            action = menu.addAction(text)
+            action.setToolTip(button.toolTip())
+            action.triggered.connect(button.click)
+            self.tape_menu_actions.append((action, button))
+            button.setParent(self)
+            button.hide()
+        menu.aboutToShow.connect(self._sync_tape_menu)
+        self.tape_menu_button.setMenu(menu)
+        return self.tape_menu_button
+
+    def _sync_tape_menu(self) -> None:
+        for action, button in self.tape_menu_actions:
+            action.setEnabled(button.isEnabled())
+
+    def _bottom_bar(self) -> QHBoxLayout:
+        bar = QHBoxLayout()
+        bar.addWidget(QLabel("Transfer scope"))
+        bar.addWidget(self.transfer_scope_combo)
+        bar.addWidget(self.selection_status_label)
+        bar.addStretch()
+        self.build_selection_button.setIcon(self.style().standardIcon(QStyle.SP_BrowserReload))
+        bar.addWidget(self.build_selection_button)
+        return bar
 
     def _local_panel(self) -> QGroupBox:
         box = QGroupBox("Local")
@@ -2003,6 +2091,121 @@ class MainWindow(QMainWindow):
             if self._persist_profiles(candidate):
                 self.profiles = candidate
                 self._load_profile_combo(candidate[min(index, len(candidate) - 1)].name)
+
+    def _profiles_menu_button(self) -> QToolButton:
+        button = QToolButton()
+        button.setText("Profiles")
+        button.setPopupMode(QToolButton.InstantPopup)
+        button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        button.setMinimumHeight(self.ssh_button.sizeHint().height())
+        button.setMinimumWidth(90)
+        button.setToolTip("Save, export or import profiles (for example to use them on another computer).")
+        menu = QMenu(button)
+        menu.addAction("Save profiles", self._save_profiles)
+        menu.addSeparator()
+        menu.addAction("Export profiles…", self._export_profiles)
+        menu.addAction("Import profiles…", self._import_profiles)
+        button.setMenu(menu)
+        self.profiles_menu_button = button
+        return button
+
+    def _ask_export_scope(self) -> list[Profile] | None:
+        current = self.current_profile()
+        if current is None or len(self.profiles) == 1:
+            return list(self.profiles)
+        box = QMessageBox(self)
+        box.setWindowTitle("Export profiles")
+        box.setText("Which profiles do you want to export?")
+        all_button = box.addButton(f"All profiles ({len(self.profiles)})", QMessageBox.AcceptRole)
+        one_button = box.addButton(f"Only '{current.name}'", QMessageBox.AcceptRole)
+        box.addButton(QMessageBox.Cancel)
+        box.exec()
+        if box.clickedButton() is all_button:
+            return list(self.profiles)
+        if box.clickedButton() is one_button:
+            return [current]
+        return None
+
+    def _export_profiles(self) -> None:
+        chosen = self._ask_export_scope()
+        if not chosen:
+            return
+        start = str(Path.home() / "Documents" / "qris_rsync_profiles.json")
+        path, _filter = QFileDialog.getSaveFileName(self, "Export profiles", start, "Profiles (*.json)")
+        if not path:
+            return
+        try:
+            export_profiles(chosen, path)
+        except OSError as exc:
+            QMessageBox.warning(self, "Export failed", str(exc))
+            return
+        QMessageBox.information(
+            self,
+            "Profiles exported",
+            f"Exported {len(chosen)} profile(s) to:\n{path}\n\n"
+            "The file contains no passwords or passphrases. To use the profiles on another computer, "
+            "choose Profiles → Import profiles… there. The SSH key itself is not included: copy it "
+            "privately, or create and register a new key on that computer.",
+        )
+
+    def _import_profiles(self) -> None:
+        start = str(Path.home() / "Documents")
+        path, _filter = QFileDialog.getOpenFileName(self, "Import profiles", start, "Profiles (*.json);;All files (*)")
+        if not path:
+            return
+        try:
+            incoming, problems = read_profile_file(path)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Import failed", str(exc))
+            return
+        if not incoming:
+            QMessageBox.warning(self, "Import failed", "No profiles found.\n" + "\n".join(problems[:5]))
+            return
+        adapted = [adapt_profile_to_this_computer(profile) for profile in incoming]
+        incoming = [profile for profile, _note in adapted]
+        notes = sorted({note for _profile, note in adapted if note})
+        existing_names = {profile.name for profile in self.profiles}
+        clashes = [profile.name for profile in incoming if profile.name in existing_names]
+        replace = False
+        if clashes:
+            box = QMessageBox(self)
+            box.setWindowTitle("Import profiles")
+            box.setText(
+                f"{len(clashes)} imported profile(s) have the same name as one you already have, "
+                f"for example '{clashes[0]}'."
+            )
+            replace_button = box.addButton("Replace mine", QMessageBox.AcceptRole)
+            keep_button = box.addButton("Keep mine", QMessageBox.AcceptRole)
+            box.addButton(QMessageBox.Cancel)
+            box.exec()
+            if box.clickedButton() is replace_button:
+                replace = True
+            elif box.clickedButton() is not keep_button:
+                return
+        # A brand-new install has only the placeholder profile; drop it.
+        existing = [profile for profile in self.profiles if not self._is_placeholder_profile(profile)]
+        result = merge_imported_profiles(existing, incoming, replace)
+        if not self._persist_profiles(result.profiles):
+            return
+        self.profiles = result.profiles
+        current = self.current_profile()
+        names = [profile.name for profile in self.profiles]
+        self._load_profile_combo(current.name if current and current.name in names else names[0])
+        lines = [f"Added {len(result.added)} profile(s)."]
+        if result.replaced:
+            lines.append(f"Replaced {len(result.replaced)}.")
+        if result.skipped:
+            lines.append(f"Kept your own {len(result.skipped)} with the same name.")
+        lines.extend(problems[:5])
+        if notes:
+            lines.append("")
+            lines.extend(notes)
+            lines.append("Copy that SSH key to this computer, or set another key with Edit.")
+        QMessageBox.information(self, "Profiles imported", "\n".join(lines))
+
+    @staticmethod
+    def _is_placeholder_profile(profile: Profile) -> bool:
+        return profile.name == "Default QRIScloud" and not profile.username
 
     def _save_profiles(self) -> None:
         if self._persist_profiles(self.profiles):
@@ -2913,6 +3116,99 @@ class MainWindow(QMainWindow):
             "Recall tape",
         )
 
+    def _check_tape_status(self) -> None:
+        """Report which selected items (or the open folder) are on tape."""
+        profile = self.current_profile()
+        if not profile:
+            return
+        errors = self._profile_errors(profile, require_rsync=False)
+        if errors:
+            self._show_errors(errors)
+            return
+        current = self.remote_path_edit.text().strip().rstrip("/")
+        selected = self._selected_remote_entries()
+        paths = [entry.path for entry in selected] or [current]
+        try:
+            medici_path_for_remote_path(paths[0])
+        except ValueError as exc:
+            self._show_errors([str(exc)])
+            return
+        passphrase = self._get_session_passphrase(profile)
+        if passphrase is None:
+            return
+
+        def show_result(worker, _code: int) -> None:
+            if worker.result is None:
+                QMessageBox.warning(self, "Tape status", "The tape status check did not finish. See the log for details.")
+                return
+            dialog = TapeStatusDialog(worker.result, paths, self, default_username=profile.username)
+            outcome = dialog.exec()
+            if outcome == QDialog.Accepted:
+                self._recall_files(profile, [item.path for item in worker.result.needs_recall])
+            elif outcome == TapeStatusDialog.BUNYA_SUBMIT and dialog.created_job and dialog.submit_settings:
+                self._submit_bunya_job(dialog.submit_settings, *dialog.created_job)
+
+        self._start_worker(
+            TapeStatusWorker(profile, paths, self.detected_ssh, passphrase=passphrase),
+            "Check tape status",
+            after_finish=show_result,
+        )
+
+    def _show_recall_jobs(self) -> None:
+        RecallJobsDialog(self.current_profile, self._get_session_passphrase, self.detected_ssh, self).exec()
+
+    def _submit_bunya_job(self, settings, script: Path, file_list: Path) -> None:
+        def show_result(worker, _code: int) -> None:
+            if worker.job_id:
+                try:
+                    file_count = sum(1 for line in file_list.read_text(encoding="utf-8").splitlines() if line.strip())
+                except OSError:
+                    file_count = 0
+                record_job(
+                    BunyaJob(
+                        job_id=worker.job_id,
+                        submitted=datetime.now().strftime("%Y-%m-%d %H:%M"),
+                        username=settings.username,
+                        folder=settings.folder,
+                        script_name=script.name,
+                        local_list=str(file_list),
+                        file_count=file_count,
+                    )
+                )
+                QMessageBox.information(
+                    self,
+                    "Recall submitted to Bunya",
+                    f"Bunya job {worker.job_id} is queued. It keeps running after you close this app.\n\n"
+                    f"Job files and its log ({script.stem}_{worker.job_id}.log) are in "
+                    f"{settings.folder} on Bunya. A copy of the job files is in {script.parent}.\n\n"
+                    "To follow it, open Tape status and recall → Recall jobs on Bunya… and click Check progress. That asks QRIScloud how many "
+                    "of the job's files are back on disk, with no MFA needed.",
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "Bunya submission failed",
+                    "The job was not submitted. See the log for Bunya's message.\n\n"
+                    "Common causes: the MFA request was not approved, the SSH key is not registered "
+                    "for Bunya, or the Bunya account name is wrong.\n\n"
+                    f"The job files are saved in {script.parent}, so you can also submit them yourself.",
+                )
+
+        self._start_worker(
+            BunyaSubmitWorker(settings, script, file_list, self.detected_ssh),
+            "Submit recall to Bunya",
+            after_finish=show_result,
+        )
+
+    def _recall_files(self, profile: Profile, remote_files: list[str]) -> None:
+        passphrase = self._get_session_passphrase(profile)
+        if passphrase is None or not remote_files:
+            return
+        self._start_worker(
+            RecallMediciWorker(profile, remote_files, self.detected_ssh, passphrase=passphrase, batch_size=25),
+            "Recall tape",
+        )
+
     def _build_sync_selection(self) -> None:
         profile = self.current_profile()
         if not profile:
@@ -3773,7 +4069,7 @@ class MainWindow(QMainWindow):
     def _cancel_current(self) -> None:
         if isinstance(
             self.current_worker,
-            (CommandWorker, SshTestWorker, RecallMediciWorker, FolderScanWorker, UploadAnalysisWorker, PackagedUploadWorker, LocalDeleteWorker, LocalMoveWorker),
+            (CommandWorker, SshTestWorker, RecallMediciWorker, FolderScanWorker, UploadAnalysisWorker, PackagedUploadWorker, LocalDeleteWorker, LocalMoveWorker, TapeStatusWorker, BunyaSubmitWorker),
         ):
             if isinstance(self.current_worker, (LocalDeleteWorker, LocalMoveWorker)):
                 self._append_log("\nThe current local filesystem operation cannot be interrupted safely.\n")
@@ -3867,6 +4163,7 @@ class MainWindow(QMainWindow):
         self.build_selection_button.setEnabled(not running and self.compare_thread is None)
         self.upload_button.setEnabled(not running)
         self.recall_button.setEnabled(not running)
+        self.tape_status_button.setEnabled(not running)
         self.download_button.setEnabled(not running)
         self.transfer_scope_combo.setEnabled(not running)
         self.stop_button.setEnabled(running)
@@ -3893,6 +4190,7 @@ class MainWindow(QMainWindow):
         self.download_button.setEnabled(not busy and self.current_thread is None and self.compare_thread is None)
         self.build_selection_button.setEnabled(not busy and self.current_thread is None and self.compare_thread is None)
         self.recall_button.setEnabled(not busy and self.current_thread is None and self.compare_thread is None)
+        self.tape_status_button.setEnabled(not busy and self.current_thread is None and self.compare_thread is None)
         self._update_mode_controls()
         if not busy:
             self._update_transfer_scope_ui()
@@ -3910,6 +4208,7 @@ class MainWindow(QMainWindow):
         self.local_move_button.setEnabled(not running and self.current_thread is None)
         self.local_delete_button.setEnabled(not running and self.current_thread is None)
         self.recall_button.setEnabled(not running and self.current_thread is None)
+        self.tape_status_button.setEnabled(not running and self.current_thread is None)
         self.remote_new_folder_button.setEnabled(not running and self.current_thread is None and self.remote_thread is None)
         self.remote_rename_button.setEnabled(not running and self.current_thread is None and self.remote_thread is None)
         self.remote_move_button.setEnabled(not running and self.current_thread is None and self.remote_thread is None)

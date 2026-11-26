@@ -1666,3 +1666,114 @@ def test_failed_folder_listing_shows_why_and_can_be_retried(monkeypatch, tmp_pat
     raw.setExpanded(True)
     assert requested == ["/data/Q0101/raw"]
     window.close()
+
+
+# --- Check tape status ------------------------------------------------------------
+
+
+def test_check_tape_status_uses_selection_and_recall_follows(monkeypatch, tmp_path) -> None:
+    import app.gui.main_window as main_window_module
+    from PySide6.QtWidgets import QDialog
+
+    from app.core.medici import TapeFile, TapeStatus
+    from app.gui.main_window import RecallMediciWorker
+    from app.gui.tape_status import TapeStatusWorker
+
+    window = _window(monkeypatch, tmp_path)
+    monkeypatch.setattr(window, "_profile_errors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(window, "_get_session_passphrase", lambda _profile: "")
+    started: list[tuple[object, str, dict]] = []
+    monkeypatch.setattr(window, "_start_worker", lambda worker, label, **kwargs: started.append((worker, label, kwargs)))
+    window.remote_path_edit.setText("/data/Q0101")
+    window._apply_remote_entries(
+        [RemoteEntry("d", "raw", 0, "now", "/data/Q0101/raw"), RemoteEntry("f", "a.txt", 1, "now", "/data/Q0101/a.txt")],
+        "/data/Q0101",
+    )
+
+    window._check_tape_status()  # nothing selected: the open folder
+    assert isinstance(started[0][0], TapeStatusWorker) and started[0][0].remote_paths == ["/data/Q0101"]
+
+    _select_tree_row(window.remote_table, 1)  # "raw"
+    window._check_tape_status()
+    worker, label, kwargs = started[1]
+    assert worker.remote_paths == ["/data/Q0101/raw"] and label == "Check tape status"
+
+    class Recall:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def exec(self):
+            return QDialog.Accepted
+
+    monkeypatch.setattr(main_window_module, "TapeStatusDialog", Recall)
+    worker.result = TapeStatus()
+    worker.result.add(TapeFile("/data/Q0101/raw/big.tif", 9_000_000, 0))
+    kwargs["after_finish"](worker, 0)
+
+    recall, label, _kwargs = started[2]
+    assert isinstance(recall, RecallMediciWorker) and label == "Recall tape"
+    assert recall.remote_files == ["/data/Q0101/raw/big.tif"]
+    window.close()
+
+
+def test_bunya_submit_from_tape_window_starts_the_submit_worker(monkeypatch, tmp_path) -> None:
+    import app.gui.main_window as main_window_module
+
+    from app.core.bunya import BunyaSettings
+    from app.core.medici import TapeFile, TapeStatus
+    from app.gui.tape_status import BunyaSubmitWorker, TapeStatusDialog
+
+    window = _window(monkeypatch, tmp_path)
+    monkeypatch.setattr(window, "_profile_errors", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(window, "_get_session_passphrase", lambda _profile: "")
+    started: list[tuple[object, str, dict]] = []
+    monkeypatch.setattr(window, "_start_worker", lambda worker, label, **kwargs: started.append((worker, label, kwargs)))
+    window.remote_path_edit.setText("/data/Q0101")
+    script = tmp_path / "recall_medici_1.slurm"
+    file_list = tmp_path / "recall_medici_1_files.txt"
+    settings = BunyaSettings("a_jcu_hpc", "uqjsmith", "", "/scratch/user/uqjsmith/qris_recall")
+
+    class Submit:
+        BUNYA_SUBMIT = TapeStatusDialog.BUNYA_SUBMIT
+
+        def __init__(self, *_args, **kwargs) -> None:
+            assert kwargs["default_username"] == window.current_profile().username
+            self.created_job = (script, file_list)
+            self.submit_settings = settings
+
+        def exec(self):
+            return TapeStatusDialog.BUNYA_SUBMIT
+
+    monkeypatch.setattr(main_window_module, "TapeStatusDialog", Submit)
+    window._check_tape_status()
+    tape_worker, _label, kwargs = started[0]
+    tape_worker.result = TapeStatus()
+    tape_worker.result.add(TapeFile("/data/Q0101/big.tif", 9_000_000, 0))
+
+    kwargs["after_finish"](tape_worker, 0)
+
+    submit, label, _kwargs = started[1]
+    assert isinstance(submit, BunyaSubmitWorker) and label == "Submit recall to Bunya"
+    assert submit.script == script and submit.settings is settings
+    window.close()
+
+
+def test_tape_menu_items_follow_their_buttons(monkeypatch, tmp_path) -> None:
+    window = _window(monkeypatch, tmp_path)
+    clicked: list[str] = []
+    window.tape_status_button.clicked.disconnect()
+    window.tape_status_button.clicked.connect(lambda: clicked.append("status"))
+    actions = {action.text(): (action, button) for action, button in window.tape_menu_actions}
+    assert list(actions) == ["Check tape status…", "Recall files in this folder now", "Recall jobs on Bunya…"]
+    assert window.tape_status_button.isHidden() and window.recall_button.isHidden()
+
+    window._set_remote_busy(True)
+    window._sync_tape_menu()
+    assert not actions["Recall files in this folder now"][0].isEnabled()
+    window._set_remote_busy(False)
+    window._sync_tape_menu()
+    assert actions["Check tape status…"][0].isEnabled()
+
+    actions["Check tape status…"][0].trigger()
+    assert clicked == ["status"]
+    window.close()
