@@ -95,7 +95,7 @@ def page_decoration(canvas, doc):
     canvas.setStrokeColor(RULE)
     canvas.line(MARGIN, 34, PAGE_W - MARGIN, 34)
     canvas.setFont("Guide", 8)
-    canvas.drawString(MARGIN, 21, "Setup and first transfers  |  v1.2.0  |  25 November 2026")
+    canvas.drawString(MARGIN, 21, "Setup and first transfers  |  v1.2.0  |  26 November 2026")
     canvas.drawRightString(PAGE_W - MARGIN, 21, str(doc.page))
     canvas.restoreState()
 
