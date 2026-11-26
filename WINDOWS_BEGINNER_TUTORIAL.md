@@ -18,7 +18,7 @@ The left browser shows **Local** files on your computer. The right browser shows
 ### Your route through this guide
 
 1. Confirm your account details.
-2. Download the Windows app.
+2. Open the app from the shared folder.
 3. Install and update MSYS2.
 4. Install and check rsync and OpenSSH.
 5. Create or reuse an SSH key safely.
@@ -55,15 +55,17 @@ You have already been invited through [QRIScloud services](https://services.qris
 
 **Checkpoint:** you know your username, collection ID, and whether you can write to the collection. The official [UQ RDM collection guide](https://www.qriscloud.org.au/support/qriscloud-documentation/93-using-qrisdata-collections) explains why the account identity matters. This guide does not require you to create another portal account.
 
-## 2. Download and open the app
+## 2. Open the app
 
-**Window: your web browser, then File Explorer.**
+You do not download or install the app. It is kept in the same shared folder as this guide, and that copy is always the latest version.
 
-1. Open the [latest QRIS Rsync Manager release](https://github.com/lucas-langlois/qris-rsync-manager/releases/latest).
-2. Find **Assets** on that release. Click **QRISRsyncManager.exe**. Choose the executable, rather than either **Source code** archive.
-3. In File Explorer, open **Downloads**. Move the executable into a folder where you can find it again, for example `Documents\QRIS Rsync Manager`.
-4. Double-click the executable. It may take a moment to open.
-5. If Windows shows a SmartScreen warning, check that the file came from the project's release page. If you trust that download and your institution permits it, choose **More info**, then **Run anyway**. If IT blocks it or the option is unavailable, ask IT for help.
+**Window: File Explorer.**
+
+1. Open the shared folder where you found this guide.
+2. Double-click **QRISRsyncManager.exe**. It may take a moment to open.
+3. If Windows shows a security or SmartScreen warning, check that you opened the file from that shared folder. If your institution permits it, choose **Run**, or **More info** then **Run anyway**. If IT blocks it or the option is unavailable, ask IT for help.
+
+If you cannot open the shared folder, ask the person who manages the app for your team.
 
 **Expected result:** the app opens with profile controls at the top, Local and Remote browsers, transfer buttons, and a Log panel. It may report that rsync or SSH is missing; the next steps install them.
 
@@ -523,6 +525,8 @@ Choose the log from the failed operation. The Log panel also shows the saved log
 
 Include your app version, username, Q number, operation, exact error, and relevant log. Review logs before sharing because paths and filenames can identify research material. Never include your private key, UQ password, or key passphrase.
 
+For questions about the app itself, ask the person who manages the app for your team. The latest app and the latest copy of this guide are always in the shared folder.
+
 ### A short checklist for your next transfer
 
 1. Select the correct profile and check the local and remote paths.
@@ -537,7 +541,6 @@ Include your app version, username, Q number, operation, exact error, and releva
 
 Links in the PDF are clickable. Installation and account instructions were checked against these official sources on **12 October 2026**:
 
-- [Project releases](https://github.com/lucas-langlois/qris-rsync-manager/releases/latest) for the downloadable executable.
 - [MSYS2 installation](https://www.msys2.org/) and [updating](https://www.msys2.org/docs/updating/) for installer and restart instructions.
 - MSYS2's [rsync package](https://packages.msys2.org/packages/rsync) and [OpenSSH package](https://packages.msys2.org/packages/openssh) for tool names and installation.
 - [QRIScloud UQ RDM collection guide](https://www.qriscloud.org.au/support/qriscloud-documentation/93-using-qrisdata-collections) for account identity, SSH access, storage behavior, and support.
