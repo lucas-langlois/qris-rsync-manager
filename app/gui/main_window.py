@@ -22,7 +22,6 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
-    QHeaderView,
     QAbstractItemView,
     QLabel,
     QLineEdit,
@@ -33,8 +32,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSplitter,
     QStackedWidget,
-    QTableWidget,
-    QTableWidgetItem,
     QTextEdit,
     QTreeView,
     QVBoxLayout,
@@ -54,13 +51,14 @@ from app.core.archive_upload import (
     analyze_upload_tree,
     prepare_upload_package,
     revalidate_upload_plan,
+    subset_upload_plan,
 )
 from app.core.logging_utils import new_log_file
 from app.core.file_scan import FolderScan, scan_folder
 from app.core.local_delete import LocalDeleteResult, delete_local_paths
 from app.core.local_move import move_local_paths, plan_local_moves
 from app.core.medici import build_recall_medici_files_command, medici_path_for_remote_path
-from app.core.paths import app_data_dir, detect_ssh, is_executable_file
+from app.core.paths import detect_ssh, is_executable_file
 from app.core.profiles import (
     Profile,
     fallback_hosts,
@@ -95,14 +93,17 @@ from app.core.rsync_command import (
 from app.core.rsync_runner import RsyncRunner
 from app.core.ssh_test import run_ssh_test
 from app.core.sync_compare import (
-    ManifestScanProgress,
+    DOWNLOAD,
+    UPLOAD,
     RemoteManifestCollector,
     build_remote_manifest_command,
-    compare_manifests,
-    scan_local_manifest,
+    build_sync_plan,
+    scan_local_for_sync,
     write_files_from,
 )
 from app.gui.profile_dialog import ProfileDialog
+from app.gui.remote_folder_loader import RemoteFolderLoader
+from app.gui.sync_dialog import SynchronizeDialog
 from app.gui.collection_pane import (
     CollectionPane,
     exclude_collection,
@@ -112,7 +113,9 @@ from app.gui.collection_pane import (
 from app.gui.pane_actions import PaneAction, install_pane_actions
 from app.gui.drag_views import (
     LocalMoveTreeView,
-    RemoteMoveTable,
+    IS_DIR_ROLE,
+    PATH_ROLE,
+    RemoteMoveTree,
     populate_remote_table,
     selected_remote_entries,
 )
@@ -681,6 +684,133 @@ class PackagedUploadWorker(QObject):
         self.runner.cancel()
 
 
+class SyncUploadWorker(PackagedUploadWorker):
+    """Upload the files ticked in the Synchronise window.
+
+    Loose files go up as an exact ``--files-from`` list. Ticked archive
+    folders are packed into ``.tar`` archives first, exactly as a packaged
+    upload would pack them, and only those archives are sent. It reuses the
+    packaged upload's host checks, automatic retries and receipts.
+    """
+
+    def __init__(
+        self,
+        profile: Profile,
+        local_root: Path,
+        remote_path: str,
+        loose_list: Path | None,
+        archive_plan: UploadArchivePlan | None,
+        *,
+        passphrase: str = "",
+        ssh_path: str | None = None,
+    ) -> None:
+        super().__init__(
+            profile,
+            archive_plan,
+            remote_path,
+            dry_run=False,
+            passphrase=passphrase,
+            ssh_path=ssh_path,
+        )
+        self.local_root = local_root
+        self.loose_list = loose_list
+        self.archive_plan = archive_plan
+
+    @Slot()
+    def run(self) -> None:
+        package: UploadPackage | None = None
+        log_file: Path | None = None
+        code = 1
+        try:
+            log_file = new_log_file(f"sync_upload_{self.profile.name}")
+            self._log_file = log_file
+            if self._available_profile() is None:
+                code = 130 if self._cancelled.is_set() else 124
+                return
+            if self.archive_plan is not None and self.archive_plan.folders:
+                self._emit(
+                    "Packing ticked folders into uncompressed TAR archives. "
+                    "Source files will not be changed; press Stop to cancel.\n"
+                )
+                package = prepare_upload_package(
+                    self.archive_plan,
+                    cancel_event=self._cancelled,
+                    progress_callback=lambda message: self._emit(message + "\n"),
+                    build_archives=True,
+                )
+                if self._cancelled.is_set():
+                    code = 130
+                    return
+            self._receipt_plan = ReceiptPlan("upload", self.local_root, self.remote_path)
+            code = 0
+            if self.loose_list is not None:
+                self._collector = self._receipt_plan.add_phase(self.local_root, self.remote_path)
+                code = self._run_transfer_with_retries(
+                    lambda attempt_profile, is_retry: build_rsync_command(
+                        attempt_profile,
+                        self.local_root,
+                        remote_path=self.remote_path,
+                        ssh_path=self.ssh_path,
+                        batch_mode=not bool(self.passphrase),
+                        files_from=self.loose_list,
+                        direction="upload",
+                        resume_partial=is_retry,
+                        itemize=True,
+                    ),
+                    log_file,
+                    "Uploading ticked files",
+                )
+            if code != 0 or package is None:
+                return
+            revalidate_upload_plan(self.archive_plan, cancel_event=self._cancelled)
+            if self._cancelled.is_set():
+                code = 130
+                return
+            self._collector = self._receipt_plan.add_phase(package.payload_dir, self.remote_path)
+            code = self._run_transfer_with_retries(
+                lambda attempt_profile, is_retry: build_rsync_command(
+                    attempt_profile,
+                    package.payload_dir,
+                    remote_path=self.remote_path,
+                    ssh_path=self.ssh_path,
+                    batch_mode=not bool(self.passphrase),
+                    direction="upload",
+                    # Archives use source-derived mtimes; always send them.
+                    ignore_times=True,
+                    resume_partial=is_retry,
+                    itemize=True,
+                ),
+                log_file,
+                "Uploading TAR archives and inventories",
+            )
+        except ArchiveCancelled:
+            self._emit("Archive preparation was cancelled.\n")
+            code = 130
+        except Exception as exc:
+            self._emit(f"Synchronise upload failed: {exc}\n")
+            code = 1
+        finally:
+            if self._receipt_plan is not None and self._last_attempt_profile is not None and log_file is not None:
+                self._write_receipt(code == 0, log_file)
+            if package is not None:
+                if code in {0, 130}:
+                    cleanup_error = package.cleanup()
+                    if cleanup_error:
+                        self._emit(cleanup_error + "\n")
+                        if code == 0:
+                            code = 1
+                    else:
+                        self._emit("Removed temporary archive files.\n")
+                else:
+                    self._emit(
+                        "The upload did not complete. Temporary archive files were kept at: "
+                        f"{package.work_dir}\n"
+                    )
+            if log_file is not None and log_file.exists():
+                self.output.emit(f"\nLog saved to: {log_file}\n")
+            self.finished.emit(code)
+
+
 class LocalDeleteWorker(QObject):
     output = Signal(str)
     finished = Signal(int)
@@ -1079,15 +1209,19 @@ class SyncCompareWorker(QObject):
                 self._finish(None, "Sync comparison was cancelled.")
                 return
             self.output.emit("Scanning local files...\n")
-            local_manifest = scan_local_manifest(
+            local_scan = scan_local_for_sync(
                 self.local_folder,
                 cancel_event=self._cancelled,
                 progress_callback=self._report_local_progress,
             )
-            if self._cancelled.is_set():
+            if self._cancelled.is_set() or local_scan.cancelled:
                 self._finish(None, "Sync comparison was cancelled.")
                 return
-            self.output.emit(f"Local manifest: {len(local_manifest):,} files.\n")
+            self.output.emit(
+                f"Local folder: {len(local_scan.records):,} files"
+                + (f", {len(local_scan.archives):,} folder(s) packed into archives on upload" if local_scan.archives else "")
+                + ".\n"
+            )
 
             creationflags = subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") else 0
             returncode = 1
@@ -1146,10 +1280,12 @@ class SyncCompareWorker(QObject):
                     return
                 if returncode == 0:
                     if collector.malformed_line_count:
+                        examples = "\n".join(f"    {line}" for line in collector.malformed_examples)
                         self._finish(
                             None,
                             f"Remote manifest contained {collector.malformed_line_count:,} malformed line(s); "
-                            "comparison was stopped to avoid an incomplete selection.",
+                            "comparison was stopped to avoid an incomplete selection.\n\n"
+                            f"Unexpected output from QRIScloud:\n{examples}",
                         )
                         return
                     self.output.emit(f"Remote manifest succeeded using {host}.\n")
@@ -1160,32 +1296,20 @@ class SyncCompareWorker(QObject):
                 self._finish(None, last_error or f"Remote manifest failed with exit code {returncode}.")
                 return
 
-            self.output.emit(f"Remote manifest: {len(remote_manifest):,} files.\n")
-            selection = compare_manifests(local_manifest, remote_manifest)
-            selected = selection.selected
+            self.output.emit(f"QRIScloud folder: {len(remote_manifest):,} files.\n")
+            plan = build_sync_plan(local_scan.records, remote_manifest, local_scan.archives)
             if self._cancelled.is_set():
-                self._finish(None, "Sync comparison was cancelled.")
-                return
-            file_list = write_files_from(selected, f"sync_selection_{time.time_ns()}")
-            if self._cancelled.is_set():
-                try:
-                    file_list.unlink()
-                except OSError:
-                    pass
                 self._finish(None, "Sync comparison was cancelled.")
                 return
             self.output.emit(
-                f"Sync selection: {len(selection.missing):,} missing, {len(selection.changed):,} changed, "
-                f"{len(selected):,} total selected.\n"
+                f"Comparison finished: {len(plan.items):,} difference(s), "
+                f"{plan.identical_files + plan.identical_archives:,} item(s) already the same.\n"
             )
-            self.output.emit(f"Selection file list: {file_list}\n")
             self._finish_success(
-                file_list,
+                None,
                 {
-                    "missing": len(selection.missing),
-                    "changed": len(selection.changed),
-                    "selected": len(selected),
-                    "file_list": str(file_list),
+                    "plan": plan,
+                    "upload_plan": local_scan.plan,
                     "local_folder": self.local_folder,
                     "remote_path": self.remote_path,
                 },
@@ -1196,12 +1320,12 @@ class SyncCompareWorker(QObject):
             with self._process_lock:
                 self._process = None
 
-    def _report_local_progress(self, progress: ManifestScanProgress) -> None:
-        if progress.files_scanned - self._last_local_progress >= 1000:
-            self._last_local_progress = progress.files_scanned
+    def _report_local_progress(self, progress: FolderScan) -> None:
+        if progress.file_count - self._last_local_progress >= 1000:
+            self._last_local_progress = progress.file_count
             self.output.emit(
-                f"Local manifest: scanned {progress.files_scanned:,} files in "
-                f"{progress.directories_scanned:,} folders...\n"
+                f"Local folder: scanned {progress.file_count:,} files in "
+                f"{progress.directory_count:,} folders...\n"
             )
 
     def _collect_remote_manifest(
@@ -1454,7 +1578,7 @@ class SyncCompareWorker(QObject):
             self._did_finish = True
         self.finished.emit(result, error)
 
-    def _finish_success(self, file_list: Path, result: object) -> None:
+    def _finish_success(self, file_list: Path | None, result: object) -> None:
         cancelled = False
         with self._finish_lock:
             if self._did_finish:
@@ -1463,10 +1587,11 @@ class SyncCompareWorker(QObject):
                 cancelled = True
             self._did_finish = True
         if cancelled:
-            try:
-                file_list.unlink()
-            except OSError:
-                pass
+            if file_list is not None:
+                try:
+                    file_list.unlink()
+                except OSError:
+                    pass
             self.finished.emit(None, "Sync comparison was cancelled.")
         else:
             self.finished.emit(result, "")
@@ -1517,7 +1642,6 @@ class MainWindow(QMainWindow):
         self.remote_directory_cache = RemoteDirectoryCache()
         self.compare_thread: QThread | None = None
         self.compare_worker: SyncCompareWorker | None = None
-        self.sync_selection: dict[str, object] | None = None
         self.remote_entries: list[RemoteEntry] = []
         self.remote_entries_path = ""
         # SSH key passphrases for this app session only, keyed by key file, so
@@ -1571,18 +1695,21 @@ class MainWindow(QMainWindow):
         self.local_tree.setToolTip("Drag selected local items onto a local folder to move them.")
         self.local_tree.doubleClicked.connect(self._local_double_clicked)
 
-        self.remote_table = RemoteMoveTable(0, 4)
-        self.remote_table.setHorizontalHeaderLabels(["Name", "Size", "Type", "Date Modified"])
-        self.remote_table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        self.remote_table.setColumnWidth(0, 260)
-        self.remote_table.setColumnWidth(1, 90)
-        self.remote_table.setColumnWidth(2, 110)
-        self.remote_table.setColumnWidth(3, 150)
-        self.remote_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.remote_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.remote_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.remote_table.setToolTip("Drag selected remote items onto a remote folder to move them within this collection.")
+        self.remote_table = RemoteMoveTree()
+        self.remote_table.setToolTip(
+            "Click a folder's arrow to look inside it; double-click to open it. "
+            "Drag selected items onto a folder to move them within this collection."
+        )
         self.remote_table.itemDoubleClicked.connect(self._remote_double_clicked)
+        self.remote_folder_loader = RemoteFolderLoader(
+            self.remote_table,
+            self.current_profile,
+            self._get_session_passphrase,
+            lambda: self.detected_ssh,
+            self.remote_directory_cache,
+            on_error=self._forget_passphrase_if_rejected,
+            parent=self,
+        )
         self.remote_status_label = QLabel("Remote browser not loaded.")
 
         self.ssh_button = QPushButton("Test SSH")
@@ -1604,9 +1731,7 @@ class MainWindow(QMainWindow):
         self.transfer_scope_combo.addItem("Selected items", "selected")
         self.dry_run_button = QPushButton("Compare upload")
         self.download_dry_run_button = QPushButton("Compare download")
-        self.build_selection_button = QPushButton("Find changed files")
-        self.upload_selection_button = QPushButton("Upload changed files")
-        self.upload_selection_button.setEnabled(False)
+        self.build_selection_button = QPushButton("Synchronise…")
         self.upload_button = QPushButton("Upload folder")
         self.recall_button = QPushButton("Recall from tape")
         self.download_button = QPushButton("Download folder")
@@ -1616,8 +1741,9 @@ class MainWindow(QMainWindow):
 
         self.dry_run_button.setToolTip("Compare upload changes only; does not transfer or delete files.")
         self.download_dry_run_button.setToolTip("Compare download changes only; does not transfer or delete files.")
-        self.build_selection_button.setToolTip("Create a list of local files that are missing or changed remotely.")
-        self.upload_selection_button.setToolTip("Upload the missing or changed files found by Find changed files.")
+        self.build_selection_button.setToolTip(
+            "Compare the local and QRIScloud folders side by side, then tick what to upload or download."
+        )
         self.recall_button.setToolTip("Request retrieval from Medici tape; this does not download files.")
 
         self._build_ui()
@@ -1673,7 +1799,6 @@ class MainWindow(QMainWindow):
         button_row.addWidget(self.dry_run_button, 0, 4)
         button_row.addWidget(self.download_dry_run_button, 0, 5)
         button_row.addWidget(self.build_selection_button, 0, 6)
-        button_row.addWidget(self.upload_selection_button, 1, 3)
         button_row.addWidget(self.upload_button, 1, 4)
         button_row.addWidget(self.recall_button, 1, 5)
         button_row.addWidget(self.download_button, 1, 6)
@@ -1725,7 +1850,6 @@ class MainWindow(QMainWindow):
         self.dry_run_button.clicked.connect(lambda: self._start_rsync(dry_run=True, direction="upload"))
         self.download_dry_run_button.clicked.connect(lambda: self._start_rsync(dry_run=True, direction="download"))
         self.build_selection_button.clicked.connect(self._build_sync_selection)
-        self.upload_selection_button.clicked.connect(self._upload_sync_selection)
         self.upload_button.clicked.connect(lambda: self._start_rsync(dry_run=False, direction="upload"))
         self.recall_button.clicked.connect(self._recall_medici)
         self.download_button.clicked.connect(lambda: self._start_rsync(dry_run=False, direction="download"))
@@ -1807,10 +1931,11 @@ class MainWindow(QMainWindow):
         self._profile_changed()
 
     def _profile_changed(self) -> None:
+        if hasattr(self, "remote_folder_loader"):
+            self.remote_folder_loader.cancel()
         self._pending_remote_path = None
         self._pending_remote_force = False
         self._cut_clipboard = None
-        self._clear_sync_selection()
         profile = self.current_profile()
         if profile:
             self.remote_path_edit.setText(profile.remote_path)
@@ -1912,7 +2037,6 @@ class MainWindow(QMainWindow):
             # Delete, Rename, Cut and the Paste target.
             self.local_tree.clearSelection()
         self.local_folder_edit.setText(str(local))
-        self._clear_sync_selection()
         self.local_tree.setRootIndex(self.local_model.setRootPath(str(local)))
 
     def _refresh_local_tree(self) -> None:
@@ -2320,7 +2444,7 @@ class MainWindow(QMainWindow):
                 else:
                     self.remote_entries = []
                     self.remote_entries_path = ""
-                    self.remote_table.setRowCount(0)
+                    self.remote_table.clear()
                     self.remote_status_label.setText("Remote directory changed while loading. Refresh to view it.")
                 return
             if error:
@@ -2369,16 +2493,15 @@ class MainWindow(QMainWindow):
     def _populate_remote_table(self, entries: list[RemoteEntry]) -> None:
         populate_remote_table(self.remote_table, entries, self.remote_table.current_remote_path or "/")
 
-    def _remote_double_clicked(self, item: QTableWidgetItem) -> None:
-        if item.data(Qt.UserRole + 1):
-            path = str(item.data(Qt.UserRole))
+    def _remote_double_clicked(self, item, _column: int = 0) -> None:
+        if item.data(0, IS_DIR_ROLE):
+            path = str(item.data(0, PATH_ROLE))
             QTimer.singleShot(0, lambda path=path: self._navigate_remote_path(path))
 
     def _navigate_remote_path(self, path: str) -> None:
         target = path.strip().rstrip("/") or "/"
         self.remote_path_edit.setText(target)
         self._sync_remote_collection_combo()
-        self._clear_sync_selection()
         self._refresh_remote_table()
 
     def _selected_remote_files(self) -> list[RemoteEntry]:
@@ -2738,8 +2861,15 @@ class MainWindow(QMainWindow):
         return path
 
     def _selected_remote_file_list(self, entries: list[RemoteEntry]) -> Path:
+        """rsync --files-from list, relative to the displayed folder.
+
+        Files picked inside an expanded subfolder keep their subfolder, so
+        they download into the matching local subfolder.
+        """
+        base = (self.remote_path_edit.text().strip().rstrip("/") or "") + "/"
+        names = [entry.path[len(base):] if entry.path.startswith(base) else entry.name for entry in entries]
         path = new_log_file("download_selected_files").with_suffix(".txt")
-        path.write_text("\n".join(entry.name for entry in entries) + "\n", encoding="utf-8", newline="\n")
+        path.write_text("\n".join(names) + "\n", encoding="utf-8", newline="\n")
         return path
 
     def _recall_medici(self) -> None:
@@ -2798,12 +2928,11 @@ class MainWindow(QMainWindow):
         passphrase = self._get_session_passphrase(profile)
         if passphrase is None:
             return
-        self._clear_sync_selection()
         self.log_output.clear()
         self._set_compare_running(True)
         self.transfer_progress.setRange(0, 0)
-        self.transfer_status_label.setText("Building sync selection...")
-        self._append_log("Building sync selection by name, size, and modified time...\n")
+        self.transfer_status_label.setText("Comparing folders...")
+        self._append_log("Comparing the local and QRIScloud folders by name, size, and modified time...\n")
         worker = SyncCompareWorker(
             profile,
             self.detected_ssh,
@@ -2830,78 +2959,131 @@ class MainWindow(QMainWindow):
         self.transfer_progress.setRange(0, 100)
         if error:
             self.transfer_progress.setValue(0)
-            self.transfer_status_label.setText("Sync comparison failed.")
+            self.transfer_status_label.setText("Comparison failed.")
             self._append_log(f"\n{error}\n")
-            QMessageBox.warning(self, "Sync comparison failed", error)
+            self._forget_passphrase_if_rejected(error)
+            QMessageBox.warning(self, "Comparison failed", error)
             return
-        self.sync_selection = dict(result)
-        selected = int(self.sync_selection["selected"])
-        self.upload_selection_button.setEnabled(selected > 0)
-        if selected == 0:
-            self.transfer_progress.setValue(100)
-            self.transfer_status_label.setText("Sync comparison complete: no files selected.")
-            self._append_log("\nNo missing or changed files found.\n")
-        else:
-            self.transfer_progress.setValue(100)
-            self.transfer_status_label.setText(f"Sync comparison complete: {selected:,} files selected.")
-            self._append_log("\nUse Upload selection to transfer only these files.\n")
+        self.transfer_progress.setValue(100)
+        result = dict(result)
+        plan = result["plan"]
+        local_folder = str(result["local_folder"])
+        remote_path = str(result["remote_path"])
+        if not plan.items:
+            same = plan.identical_files + plan.identical_archives
+            self.transfer_status_label.setText("Folders are already in sync.")
+            QMessageBox.information(
+                self,
+                "Already in sync",
+                f"Nothing to do: all {same:,} item(s) are the same on this computer and on QRIScloud.",
+            )
+            return
+        self.transfer_status_label.setText(f"Comparison finished: {len(plan.items):,} difference(s).")
+        dialog = SynchronizeDialog(
+            plan,
+            local_folder,
+            remote_path,
+            self,
+            suggested_remote_path=self._suggested_sync_folder(plan, local_folder, remote_path),
+        )
+        outcome = dialog.exec()
+        if outcome == SynchronizeDialog.RECOMPARE:
+            self._build_sync_selection()
+        elif outcome == SynchronizeDialog.RECOMPARE_SUGGESTED and dialog.suggested_remote_path:
+            self.remote_path_edit.setText(dialog.suggested_remote_path)
+            self._refresh_remote_table()
+            self._build_sync_selection()
+        elif outcome == QDialog.Accepted:
+            self._start_sync_transfer(plan, result.get("upload_plan"), local_folder, remote_path)
+
+    def _suggested_sync_folder(self, plan, local_folder: str, remote_path: str) -> str | None:
+        """Spot the common slip of comparing a folder with the parent it was uploaded into."""
+        if plan.identical_files or plan.identical_archives or any(item.local and item.remote for item in plan.items):
+            return None
+        name = Path(local_folder).name
+        if not name or self.remote_entries_path.rstrip("/") != remote_path.rstrip("/"):
+            return None
+        if any(entry.kind == "d" and entry.name == name for entry in self.remote_entries):
+            return f"{remote_path.rstrip('/')}/{name}"
+        return None
 
     def _compare_thread_finished(self) -> None:
         self.compare_thread = None
         self.compare_worker = None
 
-    def _upload_sync_selection(self) -> None:
+    def _start_sync_transfer(self, plan, upload_plan, local_folder: str, remote_path: str) -> None:
+        """Run the ticked uploads, then the ticked downloads, from the Synchronise window."""
         profile = self.current_profile()
-        if not profile or not self.sync_selection:
-            QMessageBox.information(self, "No selection", "Build a sync selection first.")
-            return
-        if self.sync_selection.get("local_folder") != self.local_folder_edit.text() or self.sync_selection.get("remote_path") != self.remote_path_edit.text():
-            self._clear_sync_selection()
-            QMessageBox.information(self, "Selection out of date", "The local or remote path changed. Build the sync selection again.")
-            return
-        selected = int(self.sync_selection.get("selected", 0))
-        if selected == 0:
-            QMessageBox.information(self, "No files selected", "No missing or changed files were found.")
+        if not profile:
             return
         passphrase = self._get_session_passphrase(profile)
         if passphrase is None:
             return
-        if (
-            QMessageBox.question(
-                self,
-                "Upload selection",
-                f"Upload {selected:,} missing or changed files to {self.remote_path_edit.text()}?",
-            )
-            != QMessageBox.Yes
-        ):
-            return
-        def command_factory(attempt_profile: Profile) -> list[str]:
-            return build_rsync_command(
-                attempt_profile,
-                self.local_folder_edit.text(),
-                remote_path=self.remote_path_edit.text(),
-                dry_run=False,
-                ssh_path=self.detected_ssh,
-                batch_mode=not bool(passphrase),
-                files_from=str(self.sync_selection["file_list"]),
-                itemize=True,
+        uploads = plan.chosen(UPLOAD)
+        downloads = plan.chosen(DOWNLOAD)
+        stamp = time.time_ns()
+        loose_list = None
+        loose = [item.local for item in uploads if not item.is_archive and item.local is not None]
+        if loose:
+            loose_list = write_files_from(loose, f"sync_upload_{stamp}")
+        archive_folders = {item.archive.relative_folder for item in uploads if item.is_archive}
+        archive_plan = subset_upload_plan(upload_plan, archive_folders) if archive_folders and upload_plan else None
+        download_list = None
+        if downloads:
+            download_list = write_files_from([item.remote for item in downloads], f"sync_download_{stamp}")
+
+        def start_downloads(_worker=None, code: int = 0) -> None:
+            if download_list is None:
+                return
+            if code != 0:
+                self._append_log("\nDownloads were not started because the upload did not finish.\n")
+                return
+
+            def command_factory(attempt_profile: Profile) -> list[str]:
+                return build_rsync_command(
+                    attempt_profile,
+                    local_folder,
+                    remote_path=remote_path,
+                    dry_run=False,
+                    ssh_path=self.detected_ssh,
+                    batch_mode=not bool(passphrase),
+                    files_from=str(download_list),
+                    direction="download",
+                    itemize=True,
+                )
+
+            self._start_worker(
+                FallbackCommandWorker(
+                    profile,
+                    command_factory,
+                    f"sync_download_{profile.name}",
+                    passphrase=passphrase,
+                    ssh_path=self.detected_ssh,
+                    receipt_plan=ReceiptPlan("download", Path(local_folder), remote_path),
+                    receipt_base=(Path(local_folder), remote_path),
+                ),
+                "Synchronise: download",
+                refresh_local=True,
+                clear_log=loose_list is None and archive_plan is None,
             )
 
-        local_folder = self.local_folder_edit.text()
-        remote_folder = self.remote_path_edit.text()
+        if loose_list is None and archive_plan is None:
+            start_downloads()
+            return
         self._start_worker(
-            FallbackCommandWorker(
+            SyncUploadWorker(
                 profile,
-                command_factory,
-                f"sync_selection_upload_{profile.name}",
+                Path(local_folder),
+                remote_path,
+                loose_list,
+                archive_plan,
                 passphrase=passphrase,
                 ssh_path=self.detected_ssh,
-                receipt_plan=ReceiptPlan("upload", Path(local_folder), remote_folder),
-                receipt_base=(Path(local_folder), remote_folder),
             ),
-            "Upload selection",
+            "Synchronise: upload",
             refresh_remote=True,
-            remote_cache_invalidations=[(profile, self.remote_path_edit.text(), True)],
+            remote_cache_invalidations=[(profile, remote_path, True)],
+            after_finish=start_downloads,
         )
 
     # Collection ↔ Collection mode -------------------------------------------
@@ -2984,10 +3166,8 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Operation running", "Wait for the current operation to finish before switching mode.")
             return
         collections = self._collection_mode()
-        self._clear_sync_selection()
         self.left_stack.setCurrentIndex(1 if collections else 0)
         self.build_selection_button.setVisible(not collections)
-        self.upload_selection_button.setVisible(not collections)
         if collections:
             self.mode_hint_label.setText(
                 "Both panes use the selected profile's account. Copies run on QRIScloud and never delete files."
@@ -3479,6 +3659,7 @@ class MainWindow(QMainWindow):
         remote_cache_invalidations: list[tuple[Profile, str, bool]] | None = None,
         after_finish=None,
         cleanup=None,
+        clear_log: bool = True,
     ) -> None:
         """Start a background operation.
 
@@ -3489,7 +3670,8 @@ class MainWindow(QMainWindow):
         if self.current_thread or self.remote_thread or self.compare_thread or self.collection_pane.is_busy():
             QMessageBox.information(self, "Operation running", "Another operation is already running.")
             return
-        self.log_output.clear()
+        if clear_log:
+            self.log_output.clear()
         thread = QThread(self)
         worker.moveToThread(thread)
         worker.output.connect(self._append_log)
@@ -3613,6 +3795,8 @@ class MainWindow(QMainWindow):
         ]
         if not active_threads:
             self._close_after_stop = False
+            self.remote_folder_loader.shutdown()
+            self.collection_pane.folder_loader.shutdown()
             event.accept()
             return
         if isinstance(self.current_worker, (LocalDeleteWorker, LocalMoveWorker)):
@@ -3681,7 +3865,6 @@ class MainWindow(QMainWindow):
         self.dry_run_button.setEnabled(not running)
         self.download_dry_run_button.setEnabled(not running)
         self.build_selection_button.setEnabled(not running and self.compare_thread is None)
-        self.upload_selection_button.setEnabled(not running and self.compare_thread is None and bool(self.sync_selection and self.sync_selection.get("selected")))
         self.upload_button.setEnabled(not running)
         self.recall_button.setEnabled(not running)
         self.download_button.setEnabled(not running)
@@ -3709,12 +3892,6 @@ class MainWindow(QMainWindow):
         self.upload_button.setEnabled(not busy and self.current_thread is None and self.compare_thread is None)
         self.download_button.setEnabled(not busy and self.current_thread is None and self.compare_thread is None)
         self.build_selection_button.setEnabled(not busy and self.current_thread is None and self.compare_thread is None)
-        self.upload_selection_button.setEnabled(
-            not busy
-            and self.current_thread is None
-            and self.compare_thread is None
-            and bool(self.sync_selection and self.sync_selection.get("selected"))
-        )
         self.recall_button.setEnabled(not busy and self.current_thread is None and self.compare_thread is None)
         self._update_mode_controls()
         if not busy:
@@ -3727,7 +3904,6 @@ class MainWindow(QMainWindow):
         self.dry_run_button.setEnabled(not running and self.current_thread is None)
         self.download_dry_run_button.setEnabled(not running and self.current_thread is None)
         self.build_selection_button.setEnabled(not running and self.current_thread is None)
-        self.upload_selection_button.setEnabled(not running and self.remote_thread is None and bool(self.sync_selection and self.sync_selection.get("selected")))
         self.upload_button.setEnabled(not running and self.current_thread is None)
         self.local_new_folder_button.setEnabled(not running and self.current_thread is None)
         self.local_rename_button.setEnabled(not running and self.current_thread is None)
@@ -3770,20 +3946,6 @@ class MainWindow(QMainWindow):
         self.dry_run_button.setEnabled(idle and (not selected_scope or bool(local_items)))
         self.download_button.setEnabled(idle and (not selected_scope or bool(remote_files)))
         self.download_dry_run_button.setEnabled(idle and (not selected_scope or bool(remote_files)))
-
-    def _clear_sync_selection(self) -> None:
-        selection = self.sync_selection
-        self.sync_selection = None
-        if selection and selection.get("file_list"):
-            file_list = Path(str(selection["file_list"]))
-            expected_parent = app_data_dir() / "filelists"
-            try:
-                if file_list.parent.resolve() == expected_parent.resolve() and file_list.name.startswith("sync_selection_"):
-                    file_list.unlink(missing_ok=True)
-            except OSError:
-                pass
-        if hasattr(self, "upload_selection_button"):
-            self.upload_selection_button.setEnabled(False)
 
     def _profile_errors(self, profile: Profile, require_rsync: bool) -> list[str]:
         errors: list[str] = []

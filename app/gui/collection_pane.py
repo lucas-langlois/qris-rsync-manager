@@ -4,24 +4,27 @@ from typing import Callable
 
 from PySide6.QtCore import QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtWidgets import (
-    QAbstractItemView,
     QComboBox,
     QGroupBox,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
-    QTableWidget,
-    QTableWidgetItem,
     QVBoxLayout,
 )
 
 from app.core.profiles import Profile, fallback_hosts, profile_with_host
 from app.core.remote_dirs import RemoteDirectoryCache, RemoteEntry, build_list_remote_entries_command
 from app.core.rsync_command import collection_key
-from app.gui.drag_views import RemoteMoveTable, populate_remote_table, selected_remote_entries
+from app.gui.drag_views import (
+    IS_DIR_ROLE,
+    PATH_ROLE,
+    RemoteMoveTree,
+    populate_remote_table,
+    selected_remote_entries,
+)
+from app.gui.remote_folder_loader import RemoteFolderLoader
 from app.gui.remote_browser_dialog import RemoteListWorker
 
 
@@ -125,17 +128,20 @@ class CollectionPane(QGroupBox):
         self.move_button = QPushButton("Move to…")
         self.delete_button = QPushButton("Delete")
         self.status_label = QLabel("Choose a collection and click Load.")
-        self.table = RemoteMoveTable(0, 4)
-        self.table.setHorizontalHeaderLabels(["Name", "Size", "Type", "Date Modified"])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        self.table.setColumnWidth(0, 260)
-        self.table.setColumnWidth(1, 90)
-        self.table.setColumnWidth(2, 110)
-        self.table.setColumnWidth(3, 150)
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.setToolTip("Drag selected items onto a folder (or '..') to move them within this collection.")
+        self.table = RemoteMoveTree()
+        self.table.setToolTip(
+            "Click a folder's arrow to look inside it; double-click to open it. "
+            "Drag selected items onto a folder (or '..') to move them within this collection."
+        )
+        self.folder_loader = RemoteFolderLoader(
+            self.table,
+            self._profile_provider,
+            self._passphrase_provider,
+            lambda: self.ssh_path,
+            self._cache,
+            on_error=lambda error: self._on_listing_error(error) if self._on_listing_error else None,
+            parent=self,
+        )
 
         layout = QVBoxLayout(self)
         pick_row = QHBoxLayout()
@@ -202,7 +208,7 @@ class CollectionPane(QGroupBox):
         self._cache.clear()
         self.entries = []
         self.entries_path = ""
-        self.table.setRowCount(0)
+        self.table.clear()
         self.status_label.setText("Choose a collection and click Load.")
 
     def invalidate(self, profile: Profile, path: str) -> None:
@@ -210,6 +216,7 @@ class CollectionPane(QGroupBox):
 
     def cancel(self) -> None:
         self._pending_path = None
+        self.folder_loader.cancel()
         if self.worker is not None:
             self.worker.cancel()
 
@@ -288,9 +295,9 @@ class CollectionPane(QGroupBox):
         if path:
             self.navigate(str(path))
 
-    def _double_clicked(self, item: QTableWidgetItem) -> None:
-        if item.data(Qt.UserRole + 1):
-            path = str(item.data(Qt.UserRole))
+    def _double_clicked(self, item, _column: int = 0) -> None:
+        if item.data(0, IS_DIR_ROLE):
+            path = str(item.data(0, PATH_ROLE))
             QTimer.singleShot(0, lambda path=path: self.navigate(path))
 
     @Slot(object, str)

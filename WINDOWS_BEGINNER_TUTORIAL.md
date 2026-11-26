@@ -426,7 +426,7 @@ A receipt is two files with the same name, for example `20261111T052430Z_upload.
 - **Not listed:** files that were already up to date were not transferred, so they are not in the new receipt. A transfer that copied nothing writes no receipt.
 - **Interrupted transfers:** a receipt ending in `_incomplete` is kept on your computer only. It shows what was sent before the problem.
 
-The app never copies `.qris-receipts` folders as ordinary data, and **Find changed files** ignores them. Leave them in place.
+The app never copies `.qris-receipts` folders as ordinary data, and **Synchronise** ignores them. Leave them in place.
 
 To check later that the files on QRIScloud still match, someone with command-line access to QRIScloud or an HPC system can open the transferred folder and run `sha256sum -c .qris-receipts/<receipt name>.sha256`. Each file should report `OK`. This reads every listed file, so it can take a while for large datasets.
 
@@ -547,6 +547,6 @@ Links in the PDF are clickable. Installation and account instructions were check
 - [Microsoft OpenSSH key management](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_keymanagement) for key-pair and passphrase guidance.
 - [OpenSSH authorized-key documentation](https://man.openbsd.org/sshd.8#AUTHORIZED_KEYS_FILE_FORMAT) for public-key registration on the server.
 
-App labels, profile fields, folder destinations, archive behavior, transfer receipts, file organising, and collection copies were checked against the repository's README, built-in setup guide, and implementation of **v1.2.0**. The registration command adapts the built-in method to use the installed MSYS2 SSH program explicitly and set accepted-key permissions. It has not been run against a live QRIScloud account for this guide.
+App labels, profile fields, folder destinations, archive behavior, transfer receipts, file organising, and collection copies were checked against the repository's README, built-in setup guide, and implementation of **v1.3.0**. The registration command adapts the built-in method to use the installed MSYS2 SSH program explicitly and set accepted-key permissions. It has not been run against a live QRIScloud account for this guide.
 
 The guide uses text path diagrams rather than simulated app screenshots. The editable source is `WINDOWS_BEGINNER_TUTORIAL.md` in the repository; the printable guide is built with `packaging/build_tutorial_pdf.py`.

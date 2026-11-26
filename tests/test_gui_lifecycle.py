@@ -5,7 +5,7 @@ import time
 
 from PySide6.QtCore import QItemSelectionModel, QThread, Qt
 from PySide6.QtGui import QCloseEvent
-from PySide6.QtWidgets import QApplication, QInputDialog, QMessageBox, QTableWidgetItem
+from PySide6.QtWidgets import QApplication, QInputDialog, QMessageBox, QTreeWidgetItem
 
 from app.core.archive_upload import analyze_upload_tree
 from app.core.remote_dirs import RemoteEntry
@@ -22,6 +22,15 @@ from app.gui.remote_browser_dialog import RemoteListWorker
 
 def _application() -> QApplication:
     return QApplication.instance() or QApplication([])
+
+
+def _select_tree_row(tree, row: int) -> None:
+    """Select one top-level row of a remote folder tree, like a click would."""
+    tree.clearSelection()
+    item = tree.topLevelItem(row)
+    if item.flags() & Qt.ItemIsSelectable:
+        item.setSelected(True)
+        tree.setCurrentItem(item)
 
 
 def _window(monkeypatch, tmp_path) -> MainWindow:
@@ -56,7 +65,7 @@ def test_stale_remote_listing_is_not_applied_to_changed_path(monkeypatch, tmp_pa
 
     assert window.remote_entries == []
     assert window.remote_entries_path == ""
-    assert window.remote_table.rowCount() == 0
+    assert window.remote_table.topLevelItemCount() == 0
     assert "changed while loading" in window.remote_status_label.text().lower()
     window.close()
 
@@ -71,9 +80,9 @@ def test_remote_double_click_queues_folder_until_previous_listing_thread_clears(
     window.remote_thread = thread
     thread.finished.connect(window._remote_thread_finished)
     thread.start()
-    item = QTableWidgetItem("child")
-    item.setData(Qt.UserRole, "/data/Q9560/child")
-    item.setData(Qt.UserRole + 1, True)
+    item = QTreeWidgetItem(["child"])
+    item.setData(0, Qt.UserRole, "/data/Q9560/child")
+    item.setData(0, Qt.UserRole + 1, True)
 
     window._remote_double_clicked(item)
     app.processEvents()
@@ -103,9 +112,9 @@ def test_remote_double_click_defers_navigation_until_signal_returns(monkeypatch,
     window = _window(monkeypatch, tmp_path)
     navigated: list[str] = []
     monkeypatch.setattr(window, "_navigate_remote_path", navigated.append)
-    item = QTableWidgetItem("child")
-    item.setData(Qt.UserRole, "/data/Q9560/child")
-    item.setData(Qt.UserRole + 1, True)
+    item = QTreeWidgetItem(["child"])
+    item.setData(0, Qt.UserRole, "/data/Q9560/child")
+    item.setData(0, Qt.UserRole + 1, True)
 
     window._remote_double_clicked(item)
 
@@ -132,11 +141,11 @@ def test_repeated_cached_double_click_navigation_keeps_table_items_valid(monkeyp
 
     for _ in range(100):
         # Row 0 is the ".." parent row; row 1 is the folder entry.
-        item = window.remote_table.item(1, 0)
+        item = window.remote_table.topLevelItem(1)
         assert item is not None
         window._remote_double_clicked(item)
         app.processEvents()
-        assert window.remote_table.rowCount() == 2
+        assert window.remote_table.topLevelItemCount() == 2
 
     assert window.remote_thread is None
     window.close()
@@ -175,7 +184,7 @@ def test_repeated_threaded_remote_navigation_keeps_workers_alive_until_result_de
             app.processEvents()
             time.sleep(0.001)
         assert window.remote_thread is None
-        item = window.remote_table.item(0, 0)
+        item = window.remote_table.topLevelItem(0)
         assert item is not None
         window._remote_double_clicked(item)
         app.processEvents()
@@ -224,7 +233,7 @@ def test_cached_remote_navigation_populates_immediately_while_previous_refresh_f
 
     assert window.remote_entries == entries
     assert window.remote_entries_path == target
-    assert window.remote_table.rowCount() == 2  # ".." plus ready.txt
+    assert window.remote_table.topLevelItemCount() == 2  # ".." plus ready.txt
     assert window.remote_table.isEnabled()
     assert window._pending_remote_path == target
     assert "cached" in window.remote_status_label.text().lower()
@@ -887,13 +896,13 @@ def test_parent_row_is_not_selectable_and_selection_maps_by_path(monkeypatch, tm
     window.remote_path_edit.setText("/data/Q0101/sub")
     window._apply_remote_entries(entries, "/data/Q0101/sub")
 
-    parent = window.remote_table.item(0, 0)
-    assert parent.text() == ".."
+    parent = window.remote_table.topLevelItem(0)
+    assert parent.text(0) == ".."
     assert not (parent.flags() & Qt.ItemIsSelectable)
-    window.remote_table.selectRow(0)
+    _select_tree_row(window.remote_table, 0)
     assert window._selected_remote_entries() == []
 
-    window.remote_table.selectRow(2)
+    _select_tree_row(window.remote_table, 2)
     assert window._selected_remote_entries() == [entries[1]]
     window.remote_table.selectAll()
     assert window._selected_remote_entries() == entries
@@ -905,7 +914,7 @@ def test_parent_row_is_a_drop_target_for_the_parent_folder(monkeypatch, tmp_path
     window.remote_path_edit.setText("/data/Q0101/sub")
     window._apply_remote_entries([], "/data/Q0101/sub")
 
-    position = window.remote_table.visualItemRect(window.remote_table.item(0, 0)).center()
+    position = window.remote_table.visualItemRect(window.remote_table.topLevelItem(0)).center()
     assert window.remote_table._target_folder(position) == "/data/Q0101"
     window.close()
 
@@ -914,7 +923,7 @@ def test_collection_root_listing_shows_parent_row_but_not_at_filesystem_root(mon
     window = _window(monkeypatch, tmp_path)
     window.remote_path_edit.setText("/")
     window._apply_remote_entries([], "/")
-    assert window.remote_table.rowCount() == 0
+    assert window.remote_table.topLevelItemCount() == 0
     window.close()
 
 
@@ -947,9 +956,9 @@ def _file_action_window(monkeypatch, tmp_path):
 
 def _select_by_name(table, name: str) -> None:
     table.clearSelection()
-    for row in range(table.rowCount()):
-        if table.item(row, 0).text() == name:
-            table.selectRow(row)
+    for row in range(table.topLevelItemCount()):
+        if table.topLevelItem(row).text(0) == name:
+            _select_tree_row(table, row)
             return
     raise AssertionError(name)
 
@@ -1065,11 +1074,11 @@ def test_right_click_selects_row_under_cursor_and_clears_on_empty_space(monkeypa
     _application().processEvents()
     _select_by_name(table, "archive")
 
-    a_row = next(row for row in range(table.rowCount()) if table.item(row, 0).text() == "a.txt")
-    _select_row_under_cursor(table, table.visualItemRect(table.item(a_row, 0)).center())
+    a_row = next(row for row in range(table.topLevelItemCount()) if table.topLevelItem(row).text(0) == "a.txt")
+    _select_row_under_cursor(table, table.visualItemRect(table.topLevelItem(a_row)).center())
     assert [entry.name for entry in window._selected_remote_entries()] == ["a.txt"]
 
-    _select_row_under_cursor(table, table.visualItemRect(table.item(0, 0)).center())  # ".." row
+    _select_row_under_cursor(table, table.visualItemRect(table.topLevelItem(0)).center())  # ".." row
     assert window._selected_remote_entries() == []
 
     _select_by_name(table, "a.txt")
@@ -1157,7 +1166,7 @@ def test_real_key_presses_reach_list_actions_but_not_the_path_field(monkeypatch,
     window._install_pane_actions()  # reinstalling must replace, not duplicate, the shortcuts
     table = window.remote_table
     table.setFocus()
-    table.selectRow(1)
+    _select_tree_row(table, 1)
     app.processEvents()
 
     for key in (Qt.Key_F2, Qt.Key_Delete, Qt.Key_Backspace):
@@ -1191,8 +1200,8 @@ def test_context_menu_runs_and_enables_actions_for_the_selection(monkeypatch, tm
     import app.gui.pane_actions as pane_actions_module
 
     monkeypatch.setattr(pane_actions_module, "_show_menu", fake_show)
-    a_row = next(row for row in range(table.rowCount()) if table.item(row, 0).text() == "a.txt")
-    table.customContextMenuRequested.emit(table.visualItemRect(table.item(a_row, 0)).center())
+    a_row = next(row for row in range(table.topLevelItemCount()) if table.topLevelItem(row).text(0) == "a.txt")
+    table.customContextMenuRequested.emit(table.visualItemRect(table.topLevelItem(a_row)).center())
     table.customContextMenuRequested.emit(QPoint(5, table.viewport().height() - 5))
 
     on_item, on_empty = seen
@@ -1290,7 +1299,7 @@ def test_refresh_keeps_selection_by_path_not_row_number(monkeypatch, tmp_path) -
         _select_by_name(table, "a.txt")
         # A refresh that adds an item above the selected one.
         apply([RemoteEntry("d", "IMPORTANT", 0, "now", f"{prefix}/IMPORTANT"), *entries], path)
-        selected = [table.item(index.row(), 0).text() for index in table.selectionModel().selectedRows()]
+        selected = [table.topLevelItem(index.row()).text(0) for index in table.selectionModel().selectedRows()]
         assert selected == ["a.txt"]
     window.close()
 
@@ -1471,4 +1480,189 @@ def test_failed_collection_pane_listing_with_rejected_key_forgets_passphrase(mon
 
     window._get_session_passphrase(window.current_profile())
     assert asked == ["A", "A"]
+    window.close()
+
+
+# --- Synchronise ----------------------------------------------------------------
+
+
+def test_synchronise_runs_ticked_uploads_then_downloads(monkeypatch, tmp_path) -> None:
+    import app.gui.main_window as main_window_module
+    from PySide6.QtWidgets import QDialog
+
+    from app.core.sync_compare import FileRecord, build_sync_plan
+    from app.gui.main_window import FallbackCommandWorker, SyncUploadWorker
+
+    window = _window(monkeypatch, tmp_path)
+    monkeypatch.setattr(window, "_get_session_passphrase", lambda _profile: "")
+    started: list[tuple[object, str, dict]] = []
+    monkeypatch.setattr(window, "_start_worker", lambda worker, label, **kwargs: started.append((worker, label, kwargs)))
+
+    class AcceptingDialog:
+        RECOMPARE = 2
+        RECOMPARE_SUGGESTED = 3
+
+        def __init__(self, plan, *_args, **_kwargs) -> None:
+            self.suggested_remote_path = None
+
+        def exec(self):
+            return QDialog.Accepted
+
+    monkeypatch.setattr(main_window_module, "SynchronizeDialog", AcceptingDialog)
+    plan = build_sync_plan(
+        {"up.txt": FileRecord("up.txt", 1, 10.0)},
+        {"down.txt": FileRecord("down.txt", 2, 10.0)},
+    )
+    local = tmp_path / "local"
+    local.mkdir()
+
+    window._sync_compare_finished(
+        {"plan": plan, "upload_plan": None, "local_folder": str(local), "remote_path": "/data/Q0101/x"}, ""
+    )
+
+    assert len(started) == 1
+    upload, label, kwargs = started[0]
+    assert isinstance(upload, SyncUploadWorker) and label == "Synchronise: upload"
+    assert upload.loose_list.read_text(encoding="utf-8") == "up.txt\n"
+    assert upload.archive_plan is None
+
+    kwargs["after_finish"](upload, 1)  # failed upload: no downloads
+    assert len(started) == 1
+
+    kwargs["after_finish"](upload, 0)
+    download, label, kwargs = started[1]
+    assert isinstance(download, FallbackCommandWorker) and label == "Synchronise: download"
+    assert kwargs["clear_log"] is False  # keep the upload's log visible
+    command = download.command_factory(window.current_profile())
+    assert any(part.startswith("--files-from=") for part in command)
+    assert command[-1].rstrip("/").endswith("local")  # local folder is the destination
+    window.close()
+
+
+def test_already_in_sync_shows_a_message_instead_of_the_window(monkeypatch, tmp_path) -> None:
+    from app.core.sync_compare import FileRecord, build_sync_plan
+
+    window = _window(monkeypatch, tmp_path)
+    shown: list[str] = []
+    monkeypatch.setattr(QMessageBox, "information", lambda _parent, _title, message, *_args: shown.append(message))
+    record = FileRecord("a.txt", 1, 10.0)
+    plan = build_sync_plan({"a.txt": record}, {"a.txt": record})
+
+    window._sync_compare_finished({"plan": plan, "upload_plan": None, "local_folder": "C:/x", "remote_path": "/data/Q1"}, "")
+
+    assert shown and "all 1 item(s) are the same" in shown[0]
+    window.close()
+
+
+def test_suggests_the_matching_subfolder_when_nothing_overlaps(monkeypatch, tmp_path) -> None:
+    from app.core.sync_compare import FileRecord, build_sync_plan
+
+    window = _window(monkeypatch, tmp_path)
+    window.remote_path_edit.setText("/data/Q0101")
+    window._apply_remote_entries([RemoteEntry("d", "survey", 0, "now", "/data/Q0101/survey")], "/data/Q0101")
+    plan = build_sync_plan({"a.txt": FileRecord("a.txt", 1, 1.0)}, {"other.txt": FileRecord("other.txt", 1, 1.0)})
+
+    suggestion = window._suggested_sync_folder(plan, str(tmp_path / "survey"), "/data/Q0101")
+
+    assert suggestion == "/data/Q0101/survey"
+    window.close()
+
+
+# --- Remote folder trees ------------------------------------------------------------
+
+
+def _tree_window(monkeypatch, tmp_path):
+    window = _window(monkeypatch, tmp_path)
+    window.remote_path_edit.setText("/data/Q0101")
+    window._apply_remote_entries(
+        [
+            RemoteEntry("d", "raw", 0, "now", "/data/Q0101/raw"),
+            RemoteEntry("f", "a.txt", 1, "now", "/data/Q0101/a.txt"),
+        ],
+        "/data/Q0101",
+    )
+    return window
+
+
+def _top(tree, name):
+    return next(tree.topLevelItem(i) for i in range(tree.topLevelItemCount()) if tree.topLevelItem(i).text(0) == name)
+
+
+def test_remote_folders_have_icons_and_expand_arrows(monkeypatch, tmp_path) -> None:
+    from PySide6.QtWidgets import QTreeWidgetItem as Item
+
+    window = _tree_window(monkeypatch, tmp_path)
+    tree = window.remote_table
+    raw = _top(tree, "raw")
+
+    assert raw.childIndicatorPolicy() == Item.ShowIndicator
+    assert _top(tree, "a.txt").childIndicatorPolicy() != Item.ShowIndicator
+    assert not raw.icon(0).isNull() and not _top(tree, "a.txt").icon(0).isNull()
+    window.close()
+
+
+def test_expanding_a_folder_lists_it_and_nested_items_can_be_selected(monkeypatch, tmp_path) -> None:
+    window = _tree_window(monkeypatch, tmp_path)
+    tree = window.remote_table
+    requested: list[str] = []
+    monkeypatch.setattr(window.remote_folder_loader, "request", requested.append)
+    tree.folderExpandRequested.disconnect()
+    tree.folderExpandRequested.connect(requested.append)
+    raw = _top(tree, "raw")
+
+    raw.setExpanded(True)
+
+    assert requested == ["/data/Q0101/raw"]
+    assert raw.child(0).text(0) == "Loading…"
+    nested = RemoteEntry("f", "photo.jpg", 5, "now", "/data/Q0101/raw/photo.jpg")
+    tree.set_children("/data/Q0101/raw", [nested])
+    assert raw.child(0).text(0) == "photo.jpg"
+
+    raw.child(0).setSelected(True)
+    assert window._selected_remote_entries() == [nested]
+    # Nested files download into the matching local subfolder.
+    file_list = window._selected_remote_file_list([nested])
+    assert file_list.read_text(encoding="utf-8") == "raw/photo.jpg\n"
+    window.close()
+
+
+def test_folder_loader_uses_the_cache_and_reopens_after_refresh(monkeypatch, tmp_path) -> None:
+    window = _tree_window(monkeypatch, tmp_path)
+    tree = window.remote_table
+    profile = window.current_profile()
+    window.remote_directory_cache.put(profile, "/data/Q0101/raw", [RemoteEntry("f", "x.csv", 1, "now", "/data/Q0101/raw/x.csv")])
+    raw = _top(tree, "raw")
+
+    raw.setExpanded(True)  # cached: filled straight away, no SSH
+    assert raw.child(0).text(0) == "x.csv"
+    assert window.remote_folder_loader.thread is None
+
+    # Redrawing the same folder keeps it open.
+    window._apply_remote_entries(list(window.remote_entries), "/data/Q0101")
+    raw = _top(tree, "raw")
+    assert raw.isExpanded() and raw.child(0).text(0) == "x.csv"
+
+    # Opening another folder starts with everything closed.
+    window.remote_path_edit.setText("/data/Q0101/raw")
+    window._apply_remote_entries([], "/data/Q0101/raw")
+    assert tree.expanded_paths == set()
+    window.close()
+
+
+def test_failed_folder_listing_shows_why_and_can_be_retried(monkeypatch, tmp_path) -> None:
+    window = _tree_window(monkeypatch, tmp_path)
+    tree = window.remote_table
+    tree.folderExpandRequested.disconnect()
+    raw = _top(tree, "raw")
+    raw.setExpanded(True)
+
+    tree.set_children("/data/Q0101/raw", None, "Permission denied\nmore detail")
+
+    assert raw.child(0).text(0) == "Could not load this folder: Permission denied"
+    assert not raw.child(0).flags() & Qt.ItemIsSelectable
+    requested: list[str] = []
+    tree.folderExpandRequested.connect(requested.append)
+    raw.setExpanded(False)
+    raw.setExpanded(True)
+    assert requested == ["/data/Q0101/raw"]
     window.close()
