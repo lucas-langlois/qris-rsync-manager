@@ -146,7 +146,8 @@ Remote and local file management already exists. Keep the current guardrails whe
 - Remote commands (mkdir, rename/move, delete) are built in `app/core/remote_ops.py` with `shlex` quoting and path validation.
 - Remote file actions are shared by both remote panes through the `side` argument (`"right"` or `"left"`) in `main_window.py`. Drag, Move to… and Paste all go through `_move_remote_items`, which reuses `build_remote_move_into_command`.
 - Remote moves stay inside the collection the items come from. Collection roots and unsafe paths are protected (`is_dangerous_remote_path`). Rename is name-only.
-- Remote tables select entries by stored path, never by row number, because the `..` row is display-only and is never part of the entries list.
+- Remote panes are folder trees (`RemoteMoveTree` in `app/gui/drag_views.py`). Expanding a folder lists it in the background through `RemoteFolderLoader` (read-only, its own thread, results cached). Double-click opens a folder.
+- Remote trees select entries by stored path, never by row position, because the `..` row and the "Loading…" note rows are display-only and never part of the entries list. Entries inside expanded folders are stored on their items; selected-file downloads keep their subfolder.
 - Right-click menus and keyboard shortcuts (`app/gui/pane_actions.py`) are scoped to the file list widget and gated on the matching button's enabled state.
 - Cut/Paste is internal (not the system clipboard), bound to the pane it was cut from, consumed by any paste attempt in that pane (a refused paste in another pane keeps it), and cleared on profile change.
 - Local drag moves stay inside the displayed folder. Local Move to… and Paste may reach any folder on the same drive and refuse other drives.
@@ -163,6 +164,15 @@ For sync selection, compare:
 - relative path
 - file size
 - modified timestamp
+
+The Synchronise window (`app/gui/sync_dialog.py`, rules in `build_sync_plan` in `app/core/sync_compare.py`):
+
+- Never deletes. One-sided rows can only be copied across or skipped.
+- Defaults: the newer copy wins; conflicts (same time, different size) and archives that exist only on QRIScloud start unticked.
+- A folder that qualifies for automatic archiving is one row. Its members are never uploaded loose; uploading it builds the archive through `prepare_upload_package` (see `SyncUploadWorker`).
+- An archive is up to date when the remote inventory's size and mtime match what `archive_expectations` computes locally. Do not read remote archives or inventories: they may be on tape.
+- The remote listing prunes `.afm` and `.qris-receipts`.
+- Uploads run first. Downloads start only if the upload exited 0. Both write receipts.
 
 No live QRIScloud access should be required for unit tests.
 

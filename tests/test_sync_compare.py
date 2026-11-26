@@ -129,5 +129,29 @@ def test_build_remote_manifest_command_is_read_only() -> None:
     command = build_remote_manifest_command(profile, "/data/Q8940", ssh_path="ssh.exe")
 
     assert "user@ssh1.qriscloud.org.au" in command
-    assert "find . -type f" in command[-1]
+    assert "find . " in command[-1] and "-type f" in command[-1]
+    # Skip the unreadable collection-root metadata folder and the app's receipts.
+    assert "-path ./.afm" in command[-1] and "-name .qris-receipts" in command[-1] and "-prune" in command[-1]
     assert "rm " not in command[-1]
+
+
+def test_openssh_post_quantum_notice_is_not_a_malformed_manifest_line() -> None:
+    collector = RemoteManifestCollector()
+    for line in (
+        "** WARNING: connection is not using a post-quantum key exchange algorithm.\n",
+        '** This session may be vulnerable to "store now, decrypt later" attacks.\n',
+        "** The server may need to be upgraded. See https://openssh.com/pq.html\n",
+        "a.txt\t1\t10.0\n",
+    ):
+        collector.feed_line(line)
+
+    assert collector.malformed_line_count == 0
+    assert list(collector.records) == ["a.txt"]
+
+
+def test_malformed_manifest_lines_are_kept_as_examples() -> None:
+    collector = RemoteManifestCollector()
+    collector.feed_line("find: './locked': Permission denied\n")
+
+    assert collector.malformed_line_count == 1
+    assert collector.malformed_examples == ["find: './locked': Permission denied"]

@@ -18,6 +18,7 @@ from typing import Protocol
 
 from .file_scan import FolderScan
 from .paths import detect_tar, is_executable_file
+from .receipts import RECEIPT_DIR_NAME
 
 
 # A folder is archived when more than this many of its direct files share one
@@ -97,6 +98,38 @@ class UploadArchivePlan:
 
 
 @dataclass(frozen=True)
+class ArchivePartExpectation:
+    """What one archive part and its inventory look like after an upload."""
+
+    archive_name: str
+    inventory_name: str
+    inventory_size: int
+    modified: float
+
+
+@dataclass(frozen=True)
+class ArchiveFolderExpectation:
+    """The archive(s) an automatic upload would create for one local folder.
+
+    ``member_paths`` are relative to the upload root, using ``/``. Uploaded
+    inventories are generated deterministically from the members, so a remote
+    inventory with the expected size and modification time means the archive
+    on QRIScloud still matches the local files, without reading the remote
+    archive (which may be on tape).
+    """
+
+    relative_folder: str
+    category: str
+    member_paths: tuple[str, ...]
+    member_bytes: int
+    parts: tuple[ArchivePartExpectation, ...]
+
+    @property
+    def member_count(self) -> int:
+        return len(self.member_paths)
+
+
+@dataclass(frozen=True)
 class UploadPackage:
     work_dir: Path
     payload_dir: Path
@@ -126,6 +159,7 @@ def analyze_upload_tree(
     *,
     min_same_type: int = ARCHIVE_MIN_SAME_TYPE,
     max_part_bytes: int = ARCHIVE_PART_BYTES,
+    file_callback: Callable[[FileSnapshot], None] | None = None,
 ) -> UploadArchivePlan:
     """Scan *root* and identify directories that need a TAR archive.
 
@@ -136,6 +170,10 @@ def analyze_upload_tree(
     stay directly usable, as ordinary files. Subdirectories are evaluated
     independently. Archives whose
     members exceed *max_part_bytes* are split into numbered parts.
+
+    Transfer-receipt folders are app records, never data, and are skipped.
+    *file_callback* receives every regular file found, so a caller can build
+    a file list from the same scan.
     """
     if max_part_bytes <= 0:
         raise ValueError("max_part_bytes must be positive.")
@@ -172,10 +210,13 @@ def analyze_upload_tree(
                     if _is_reparse(info):
                         scan.skipped_errors += 1
                     elif stat_module.S_ISDIR(info.st_mode):
-                        pending.append(Path(entry.path))
+                        if entry.name != RECEIPT_DIR_NAME:
+                            pending.append(Path(entry.path))
                     elif stat_module.S_ISREG(info.st_mode):
                         snapshot = FileSnapshot(Path(entry.path), info.st_size, info.st_mtime_ns)
                         snapshots.append(snapshot)
+                        if file_callback is not None:
+                            file_callback(snapshot)
                         scan.file_count += 1
                         scan.total_bytes += info.st_size
                         if info.st_size < 1_048_576:
@@ -287,7 +328,7 @@ def prepare_upload_package(
                                    progress_callback, tar_executable or "", display_name=archive_path.name)
                         os.replace(_windows_io_path(staged_archive_path), _windows_io_path(archive_path))
                         _write_inventory(inventory_path, group, members)
-                        stable_mtime = max(item.modified_ns for item in members) / 1_000_000_000
+                        stable_mtime = _stable_mtime(members)
                         os.utime(_windows_io_path(archive_path), (stable_mtime, stable_mtime))
                         os.utime(_windows_io_path(inventory_path), (stable_mtime, stable_mtime))
                         archive_count += 1
@@ -454,6 +495,54 @@ def _snapshot_flat_files(
             if not _is_reparse(info) and stat_module.S_ISREG(info.st_mode):
                 snapshots.append(FileSnapshot(Path(entry.path), info.st_size, info.st_mtime_ns))
     return snapshots
+
+
+def archive_expectations(
+    plan: UploadArchivePlan,
+    cancel_event: CancelSignal | None = None,
+) -> list[ArchiveFolderExpectation]:
+    """Describe the archives an upload of *plan* would put on QRIScloud."""
+    expectations: list[ArchiveFolderExpectation] = []
+    for folder_plan in plan.folders:
+        _raise_if_cancelled(cancel_event)
+        snapshots = _validated_folder_snapshots(plan, folder_plan, cancel_event)
+        member_map = dict(_archive_parts(snapshots, plan.max_part_bytes, plan.min_same_type))
+        member_paths: list[str] = []
+        member_bytes = 0
+        parts: list[ArchivePartExpectation] = []
+        for group in folder_plan.groups:
+            members = member_map[group.part_number]
+            member_paths.extend(_relative_posix(member.path, plan.root) for member in members)
+            member_bytes += sum(member.size for member in members)
+            parts.append(
+                ArchivePartExpectation(
+                    archive_name=group.archive_name,
+                    inventory_name=group.inventory_name,
+                    inventory_size=len(_inventory_text(group, members).encode("utf-8")),
+                    modified=_stable_mtime(members),
+                )
+            )
+        expectations.append(
+            ArchiveFolderExpectation(
+                relative_folder=folder_plan.relative_folder,
+                category=", ".join(dict.fromkeys(group.category for group in folder_plan.groups)),
+                member_paths=tuple(member_paths),
+                member_bytes=member_bytes,
+                parts=tuple(parts),
+            )
+        )
+    return expectations
+
+
+def subset_upload_plan(plan: UploadArchivePlan, relative_folders: set[str]) -> UploadArchivePlan:
+    """Return a copy of *plan* that only archives the given folders."""
+    return UploadArchivePlan(
+        root=plan.root,
+        scan=plan.scan,
+        folders=[folder for folder in plan.folders if folder.relative_folder in relative_folders],
+        max_part_bytes=plan.max_part_bytes,
+        min_same_type=plan.min_same_type,
+    )
 
 
 def revalidate_upload_plan(
@@ -673,16 +762,28 @@ def _stop_native_tar(process: subprocess.Popen[str]) -> None:
 
 def _write_inventory(destination: Path, group: ArchiveGroupPlan, members: list[FileSnapshot]) -> None:
     with open(_windows_io_path(destination), "w", encoding="utf-8", newline="\n") as inventory:
-        inventory.write("# QRIS Rsync Manager archive inventory v1\n")
-        inventory.write(f"# archive: {group.archive_name}\n")
-        inventory.write(f"# types: {group.category}\n")
-        if group.part_count > 1:
-            inventory.write(f"# part: {group.part_number} of {group.part_count}\n")
-        inventory.write(f"# files: {len(members)}\n")
-        inventory.write("filename\tbytes\tmodified_utc\n")
-        for member in members:
-            modified = datetime.fromtimestamp(member.modified_ns / 1_000_000_000, timezone.utc)
-            inventory.write(f"{member.path.name}\t{member.size}\t{modified.isoformat()}\n")
+        inventory.write(_inventory_text(group, members))
+
+
+def _inventory_text(group: ArchiveGroupPlan, members: list[FileSnapshot]) -> str:
+    lines = [
+        "# QRIS Rsync Manager archive inventory v1",
+        f"# archive: {group.archive_name}",
+        f"# types: {group.category}",
+    ]
+    if group.part_count > 1:
+        lines.append(f"# part: {group.part_number} of {group.part_count}")
+    lines.append(f"# files: {len(members)}")
+    lines.append("filename\tbytes\tmodified_utc")
+    for member in members:
+        modified = datetime.fromtimestamp(member.modified_ns / 1_000_000_000, timezone.utc)
+        lines.append(f"{member.path.name}\t{member.size}\t{modified.isoformat()}")
+    return "".join(f"{line}\n" for line in lines)
+
+
+def _stable_mtime(members: list[FileSnapshot]) -> float:
+    """Archive and inventory mtime: the newest member's, so it is reproducible."""
+    return max(item.modified_ns for item in members) / 1_000_000_000
 
 
 def _windows_io_path(path: str | Path) -> str:

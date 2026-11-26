@@ -9,7 +9,7 @@ import signal
 from pathlib import Path
 
 from app.core.profiles import Profile
-from app.core.sync_compare import RemoteManifestCollector
+from app.core.sync_compare import LocalSyncScan, RemoteManifestCollector
 from app.gui.main_window import SyncCompareWorker
 
 
@@ -33,7 +33,7 @@ def test_cancel_before_scan_finishes_once_without_starting_process(monkeypatch, 
     worker = _worker(tmp_path)
     results = _capture(worker)
     worker.cancel()
-    monkeypatch.setattr("app.gui.main_window.scan_local_manifest", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("scan started")))
+    monkeypatch.setattr("app.gui.main_window.scan_local_for_sync", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("scan started")))
     monkeypatch.setattr("app.gui.main_window.subprocess.Popen", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("process started")))
 
     worker.run()
@@ -48,9 +48,9 @@ def test_cancel_during_local_scan_never_starts_remote_process(monkeypatch, tmp_p
     def cancel_scan(_path, cancel_event=None, progress_callback=None):
         assert cancel_event is worker._cancelled
         cancel_event.set()
-        return {"partial.txt": object()}
+        return LocalSyncScan({}, [], None, cancelled=True)
 
-    monkeypatch.setattr("app.gui.main_window.scan_local_manifest", cancel_scan)
+    monkeypatch.setattr("app.gui.main_window.scan_local_for_sync", cancel_scan)
     monkeypatch.setattr("app.gui.main_window.subprocess.Popen", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("process started")))
 
     worker.run()
@@ -104,7 +104,7 @@ def test_silent_remote_timeout_escalates_to_kill_and_finishes_once(monkeypatch, 
     worker.STOP_GRACE_SECONDS = 0.01
     results = _capture(worker)
     process = _HungProcess()
-    monkeypatch.setattr("app.gui.main_window.scan_local_manifest", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr("app.gui.main_window.scan_local_for_sync", lambda *_args, **_kwargs: LocalSyncScan({}, [], None))
     monkeypatch.setattr("app.gui.main_window.fallback_hosts", lambda _profile: ["host"])
     monkeypatch.setattr("app.gui.main_window.build_askpass_environment", lambda *_args, **_kwargs: {})
     monkeypatch.setattr("app.gui.main_window.scrub_askpass_environment", lambda _env: None)
@@ -134,7 +134,7 @@ def test_remote_manifest_is_parsed_incrementally(monkeypatch, tmp_path: Path) ->
     results = _capture(worker)
     process = _CompletedProcess(["a.txt\t1\t10.0\n", "nested/b.txt\t2\t11.0\n"])
     selection_file = tmp_path / "selection.txt"
-    monkeypatch.setattr("app.gui.main_window.scan_local_manifest", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr("app.gui.main_window.scan_local_for_sync", lambda *_args, **_kwargs: LocalSyncScan({}, [], None))
     monkeypatch.setattr("app.gui.main_window.fallback_hosts", lambda _profile: ["host"])
     monkeypatch.setattr("app.gui.main_window.build_askpass_environment", lambda *_args, **_kwargs: {})
     monkeypatch.setattr("app.gui.main_window.scrub_askpass_environment", lambda _env: None)
@@ -145,8 +145,9 @@ def test_remote_manifest_is_parsed_incrementally(monkeypatch, tmp_path: Path) ->
 
     assert len(results) == 1
     assert results[0][1] == ""
-    assert results[0][0]["selected"] == 0
-    assert results[0][0]["file_list"] == str(selection_file)
+    plan = results[0][0]["plan"]
+    assert sorted(item.path for item in plan.items) == ["a.txt", "nested/b.txt"]
+    assert all(item.direction == "download" for item in plan.items)
 
 
 def test_exit_zero_without_stdout_eof_fails_instead_of_using_partial_manifest(monkeypatch, tmp_path: Path) -> None:
@@ -156,7 +157,7 @@ def test_exit_zero_without_stdout_eof_fails_instead_of_using_partial_manifest(mo
     results = _capture(worker)
     process = _HungProcess()
     process.poll = lambda: 0
-    monkeypatch.setattr("app.gui.main_window.scan_local_manifest", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr("app.gui.main_window.scan_local_for_sync", lambda *_args, **_kwargs: LocalSyncScan({}, [], None))
     monkeypatch.setattr("app.gui.main_window.fallback_hosts", lambda _profile: ["host"])
     monkeypatch.setattr("app.gui.main_window.build_askpass_environment", lambda *_args, **_kwargs: {})
     monkeypatch.setattr("app.gui.main_window.scrub_askpass_environment", lambda _env: None)
@@ -282,7 +283,7 @@ def test_successful_process_with_malformed_manifest_fails_closed(monkeypatch, tm
     worker = _worker(tmp_path)
     results = _capture(worker)
     process = _CompletedProcess(["a.txt\t1\t10.0\n", "filename-with-tab\tbad\trow\n"])
-    monkeypatch.setattr("app.gui.main_window.scan_local_manifest", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr("app.gui.main_window.scan_local_for_sync", lambda *_args, **_kwargs: LocalSyncScan({}, [], None))
     monkeypatch.setattr("app.gui.main_window.fallback_hosts", lambda _profile: ["host"])
     monkeypatch.setattr("app.gui.main_window.build_askpass_environment", lambda *_args, **_kwargs: {})
     monkeypatch.setattr("app.gui.main_window.scrub_askpass_environment", lambda _env: None)

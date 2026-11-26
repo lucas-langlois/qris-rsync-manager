@@ -45,7 +45,7 @@ On first launch, Windows may show a security warning because this is not yet a c
 - Upload and download with rsync
 - Collection ↔ Collection mode for server-side copies between QRISdata collections
 - Compare/dry-run for upload and download
-- WinSCP-style upload selection for missing/changed files
+- WinSCP-style **Synchronise** window: side-by-side differences, tick boxes and per-file direction, archive-aware
 - Automatic, uncompressed TAR packaging for folders with many files of one type, with inventory files
 - QRIScloud Medici tape-recall requests for visible remote files
 - Live rsync log panel
@@ -55,7 +55,7 @@ On first launch, Windows may show a security warning because this is not yet a c
 - Unicode and long Windows/UNC path support for packaged uploads
 - Logs saved to `%APPDATA%\QRISRsyncManager\logs`
 
-See [the v1.2.0 release notes](RELEASE_NOTES_v1.2.0.md) for collection-to-collection copies and file management, [the v1.1.0 release notes](RELEASE_NOTES_v1.1.0.md) for transfer receipts and type-based archiving, [the v1.0.2 release notes](RELEASE_NOTES_v1.0.2.md) for recovery and Unicode fixes, and [the v1.0.0 release notes](RELEASE_NOTES_v1.0.0.md) for the complete feature list since v0.2.0.
+See [the v1.3.0 release notes](RELEASE_NOTES_v1.3.0.md) for the Synchronise window and folder trees, [the v1.2.0 release notes](RELEASE_NOTES_v1.2.0.md) for collection-to-collection copies and file management, [the v1.1.0 release notes](RELEASE_NOTES_v1.1.0.md) for transfer receipts and type-based archiving, [the v1.0.2 release notes](RELEASE_NOTES_v1.0.2.md) for recovery and Unicode fixes, and [the v1.0.0 release notes](RELEASE_NOTES_v1.0.0.md) for the complete feature list since v0.2.0.
 
 ## Install MSYS2, rsync, and SSH
 
@@ -166,7 +166,10 @@ See the official [QRISdata collection guide](https://www.qriscloud.org.au/suppor
 ## Organising Files and Folders
 
 Each pane (local, QRIScloud, and the second collection pane) works like a
-WinSCP file panel. Right-click an item, or use the keyboard while the file list
+WinSCP file panel. All panes are folder trees: click a folder's arrow to look
+inside it without leaving the current folder, or double-click it to open it.
+QRIScloud folders are listed the first time you expand them and then
+remembered until you click **Refresh**. Right-click an item, or use the keyboard while the file list
 has focus:
 
 | Action | Key | What it does |
@@ -337,26 +340,59 @@ disk cache to Medici tape. The action requests retrieval; it does not download
 the files. Recall runs in cancellable batches, reports periodic status, and can
 fall back between the two QRIScloud SSH hosts.
 
-## Sync Selection
+## Synchronise
 
-Use **Find changed files** to compare the current local folder against the current remote path.
+Click **Synchronise…** to compare the current local folder with the current
+QRIScloud folder side by side, like WinSCP's synchronise view. The app reads
+both folders (name, size and modified time), then opens a window listing only
+the differences:
 
-The comparison checks:
+| Row colour | Meaning | Default action |
+| --- | --- | --- |
+| Green | Only on this computer, or newer here | Ticked, **→ Upload** |
+| Blue | Only on QRIScloud, or newer there | Ticked, **← Download** |
+| Amber | Same time but a different size | Unticked: you decide |
+| Purple 📦 | A folder that uploads as a `.tar` archive | Ticked, **→ Upload** |
 
-- relative file path
-- file size
-- modified timestamp
+- Tick or untick any row. Click the **Action** cell to swap a file's direction.
+- **Direction** at the top resets the ticks: **Both ways** (newer file wins),
+  **Upload only**, or **Download only**.
+- Select several rows (Shift/Ctrl-click) and use **Tick**, **Untick**,
+  **→ Upload** or **← Download**, or the right-click menu.
+- Filter by name, or tick **Show only ticked** to review what will happen.
+- The summary shows how many items and bytes go each way, and warns when a
+  ticked file would replace a newer copy.
 
-It creates a temporary rsync `--files-from` list containing files that are missing remotely or appear changed.
+**Synchronise** asks for confirmation, then uploads the ticked files and, if
+that succeeds, downloads the ticked files. Both write transfer receipts.
 
-Use **Upload changed files** to upload only those files. This differs from **Compare upload**: it creates a reusable list of missing or changed files for a selective upload.
+Automatic archives are handled the same way as **Upload folder**:
+
+- A folder that qualifies for archiving appears as one 📦 row, not one row per
+  file. Uploading it packs it into `folder.tar` first.
+- The app knows an archive on QRIScloud is up to date without opening it: the
+  uploaded inventory is generated from the files, so its size and time are
+  compared with what the local files would produce. A matching archive is
+  counted as "already the same".
+- If any file in the folder changed, the row says **Archive out of date** and
+  uploading rebuilds the archive.
+- Archives that exist only on QRIScloud start unticked. Downloading one copies
+  the `.tar`; the app does not unpack it.
+
+Nothing is ever deleted on either side. Files that exist on only one side are
+copied across or left alone.
+
+If nothing matches and the QRIScloud folder contains a folder with the same
+name as your local folder, the window offers to compare with that folder
+instead. This catches the common slip of opening the parent folder you
+uploaded into.
 
 Notes:
 
-- This does not delete remote files.
-- This does not mirror folders.
-- Empty directories are not included yet.
-- Very large remote trees can take time to scan.
+- Empty folders are not included.
+- Very large QRIScloud folders can take a while to list. Use **Stop** to cancel.
+- **Compare upload** and **Compare download** still run an rsync dry run and
+  show its output in the log.
 
 ## Logs
 
@@ -396,7 +432,7 @@ was synced, and nowhere else:
   what was sent before the failure. Nothing is uploaded for it.
 
 `.qris-receipts` folders are never transferred as ordinary data and are ignored
-by **Find changed files**.
+by **Synchronise**.
 
 File paths in a receipt are relative to the synced folder. rsync already
 verifies each file it transfers with its own checksum. The receipt adds a
@@ -460,9 +496,9 @@ Check:
 
 The app uses rsync `--outbuf=N` and `--info=progress2`, but rsync may still spend time building the incremental file list before progress begins.
 
-### Find changed files seems slow
+### Synchronise seems slow
 
-The remote manifest step recursively scans the selected remote path. This can be slow for large QRIScloud folders. Use **Stop** to cancel it.
+The comparison recursively lists the selected QRIScloud folder. This can be slow for large QRIScloud folders. Use **Stop** to cancel it.
 
 ## Developer Setup
 
@@ -546,9 +582,9 @@ dist\QRIS_Rsync_Manager_Windows_Guide.pdf
 After building the executable:
 
 ```powershell
-git tag v1.2.0
-git push origin main v1.2.0
-gh release create v1.2.0 .\dist\QRISRsyncManager.exe --title "QRIS Rsync Manager v1.2.0" --notes-file .\RELEASE_NOTES_v1.2.0.md
+git tag v1.3.0
+git push origin main v1.3.0
+gh release create v1.3.0 .\dist\QRISRsyncManager.exe --title "QRIS Rsync Manager v1.3.0" --notes-file .\RELEASE_NOTES_v1.3.0.md
 ```
 
 If GitHub CLI is not authenticated:
