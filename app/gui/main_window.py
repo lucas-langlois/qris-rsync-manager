@@ -41,7 +41,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.core.askpass import build_askpass_environment, scrub_askpass_environment
+from app.core.askpass import (
+    build_askpass_environment,
+    passphrase_cache_key,
+    scrub_askpass_environment,
+    ssh_key_was_rejected,
+)
 from app.core.archive_upload import (
     ArchiveCancelled,
     UploadArchivePlan,
@@ -1515,7 +1520,10 @@ class MainWindow(QMainWindow):
         self.sync_selection: dict[str, object] | None = None
         self.remote_entries: list[RemoteEntry] = []
         self.remote_entries_path = ""
-        self.session_passphrase: str | None = None
+        # SSH key passphrases for this app session only, keyed by key file, so
+        # switching between profiles that use the same key does not ask again.
+        # Never saved to disk; forgotten when the key is rejected.
+        self._session_passphrases: dict[str, str] = {}
         self._close_after_stop = False
         self._cut_clipboard: tuple[str, list[str]] | None = None
 
@@ -1534,7 +1542,12 @@ class MainWindow(QMainWindow):
         self.remote_collection_combo.setToolTip(
             "Collections from your saved profiles. Picking one opens it here; it does not change the profile."
         )
-        self.collection_pane = CollectionPane(self.current_profile, self._get_session_passphrase, self.detected_ssh)
+        self.collection_pane = CollectionPane(
+            self.current_profile,
+            self._get_session_passphrase,
+            self.detected_ssh,
+            on_listing_error=self._forget_passphrase_if_rejected,
+        )
         self.left_stack = QStackedWidget()
         self.status_label = QLabel()
         self.transfer_progress = QProgressBar()
@@ -1794,7 +1807,6 @@ class MainWindow(QMainWindow):
         self._profile_changed()
 
     def _profile_changed(self) -> None:
-        self.session_passphrase = None
         self._pending_remote_path = None
         self._pending_remote_force = False
         self._cut_clipboard = None
@@ -2316,6 +2328,7 @@ class MainWindow(QMainWindow):
                     self.remote_status_label.setText("Remote listing cancelled.")
                     return
                 self.remote_status_label.setText("Remote listing failed.")
+                self._forget_passphrase_if_rejected(error)
                 QMessageBox.warning(self, "Remote listing failed", error)
                 return
             remote_entries = list(entries)
@@ -3434,12 +3447,28 @@ class MainWindow(QMainWindow):
     def _get_session_passphrase(self, profile: Profile) -> str | None:
         if not profile.ssh_key_path:
             return ""
-        if self.session_passphrase is not None:
-            return self.session_passphrase
+        key = passphrase_cache_key(profile.ssh_key_path)
+        if key in self._session_passphrases:
+            return self._session_passphrases[key]
         passphrase = self._ask_passphrase(profile)
         if passphrase is not None:
-            self.session_passphrase = passphrase
+            self._session_passphrases[key] = passphrase
         return passphrase
+
+    def _forget_passphrase_if_rejected(self, text: str) -> None:
+        """Drop a remembered passphrase after QRIScloud refuses the key.
+
+        Otherwise a mistyped passphrase would be reused for the rest of the
+        session. The next connection asks for it again.
+        """
+        profile = self.current_profile()
+        if profile is None or not profile.ssh_key_path or not ssh_key_was_rejected(text):
+            return
+        if self._session_passphrases.pop(passphrase_cache_key(profile.ssh_key_path), None) is not None:
+            self._append_log(
+                "\nThe SSH key was rejected, so the remembered passphrase has been cleared. "
+                "You will be asked for it again next time.\n"
+            )
 
     def _start_worker(
         self,
@@ -3540,6 +3569,8 @@ class MainWindow(QMainWindow):
         self.current_remote_cache_invalidations = []
         self.current_exit_code = None
         self._set_running(False)
+        if exit_code != 0:
+            self._forget_passphrase_if_rejected(self.log_output.toPlainText()[-20000:])
         if exit_code == 0:
             for profile, path, subdirectories in remote_cache_invalidations:
                 self.remote_directory_cache.invalidate(profile, path, subdirectories=subdirectories)

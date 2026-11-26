@@ -43,12 +43,14 @@ pane.
   failed or was stopped.
 - Receipts record the collection that was actually used, even when the
   dropdown has moved away from the profile's own collection.
+- **Fewer passphrase prompts.** The SSH key passphrase is remembered for the
+  whole app session, per key file, so switching between profiles that use the
+  same key no longer asks again. If QRIScloud rejects the key, the remembered
+  passphrase is cleared and you are asked again. It is still never saved.
 
 ## Validation
 
-- Full offline test suite: **250 passed, 4 skipped**. One test,
-  `test_live_process_that_closes_stdout_is_stopped`, fails in this development
-  environment on v1.1.0 as well.
+- Full offline test suite: **254 passed, 4 skipped**.
 - A small collection-to-collection copy and its re-run were checked live on
   QRIScloud. The new move, rename, new-folder and delete actions, and a
   whole-collection copy, have not yet been run against a live collection.

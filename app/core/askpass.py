@@ -53,6 +53,21 @@ def scrub_askpass_environment(env: dict[str, str]) -> None:
     env.pop(PASSPHRASE_ENV, None)
 
 
+def passphrase_cache_key(key_path: str) -> str:
+    """Identify an SSH key file so profiles sharing a key share its passphrase."""
+    return os.path.normcase(os.path.normpath(os.path.expanduser(key_path.strip())))
+
+
+# ssh prints this after it has tried the key (and any passphrase) and the
+# server still refused it. A wrong passphrase ends the same way.
+_KEY_REJECTED_MARKERS = ("permission denied (publickey", "incorrect passphrase", "bad passphrase")
+
+
+def ssh_key_was_rejected(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in _KEY_REJECTED_MARKERS)
+
+
 def main() -> int:
     print(os.environ.get(PASSPHRASE_ENV, ""))
     return 0
