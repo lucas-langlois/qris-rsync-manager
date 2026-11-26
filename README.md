@@ -38,7 +38,7 @@ On first launch, Windows may show a security warning because this is not yet a c
 - QRIScloud connection profiles
 - Atomic profile saving, backup recovery, and isolation of malformed profile records
 - SSH key authentication with in-app passphrase prompt
-- Session-only passphrase reuse; passphrases are not saved
+- Session-only passphrase reuse, shared by profiles that use the same SSH key; passphrases are not saved
 - First-time setup guide for MSYS2, rsync, SSH keys, QRIScloud key registration, and profiles
 - Per-user QRIScloud host-key trust with protection against unexpected server identity changes
 - Automatic fallback between `ssh1.qriscloud.org.au` and `ssh2.qriscloud.org.au`
@@ -142,7 +142,7 @@ Do not use the `.pub` file in the app. The `.pub` file is the public key you pro
 C:\Users\<you>\.ssh\qriscloud_ed25519.pub
 ```
 
-The app may ask for the SSH key passphrase. It keeps the passphrase in memory for the current app session only; it is not saved into the profile.
+The app may ask for the SSH key passphrase. It keeps the passphrase in memory for the current app session only; it is not saved into the profile. Profiles that use the same SSH key file share it, so switching profile does not ask again. If QRIScloud rejects the key, the remembered passphrase is cleared and you are asked again.
 
 On the first connection, the app automatically records the QRIScloud server identity in a per-user file under `%APPDATA%\QRISRsyncManager`. A new host is trusted once; an unexpected identity change is rejected. Users do not need to configure MSYS2 `known_hosts` manually, including on shared Windows servers.
 

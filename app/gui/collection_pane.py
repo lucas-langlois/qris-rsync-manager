@@ -96,10 +96,12 @@ class CollectionPane(QGroupBox):
         passphrase_provider: Callable[[Profile], str | None],
         ssh_path: str,
         parent=None,
+        on_listing_error: Callable[[str], None] | None = None,
     ) -> None:
         super().__init__("QRIScloud (second collection)", parent)
         self._profile_provider = profile_provider
         self._passphrase_provider = passphrase_provider
+        self._on_listing_error = on_listing_error
         self.ssh_path = ssh_path
         self.list_thread: QThread | None = None
         self.worker: RemoteListWorker | None = None
@@ -307,6 +309,8 @@ class CollectionPane(QGroupBox):
                     self.status_label.setText("Remote listing cancelled.")
                     return
                 self.status_label.setText("Remote listing failed.")
+                if self._on_listing_error is not None:
+                    self._on_listing_error(error)
                 QMessageBox.warning(
                     self,
                     "Remote listing failed",

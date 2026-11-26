@@ -1406,3 +1406,69 @@ def test_pickers_treat_data_and_qrisdata_as_the_same_collection(monkeypatch, tmp
     assert not combo.model().item(combo.findText("Q9560 Girringun")).isEnabled()
     assert window.collection_pane.collection_combo.currentText() == "Q9560 Girringun"
     window.close()
+
+
+# --- Session passphrase ---------------------------------------------------------
+
+
+def _passphrase_window(monkeypatch, tmp_path):
+    from app.core.profiles import Profile
+
+    window = _window(monkeypatch, tmp_path)
+    window.profiles = [
+        Profile(name="A", username="me", collection_id="Q9560", remote_path="/data/Q9560", ssh_key_path=r"C:\keys\qris"),
+        Profile(name="B", username="me", collection_id="Q8940", remote_path="/data/Q8940", ssh_key_path=r"c:\keys\QRIS"),
+        Profile(name="C", username="me", collection_id="Q1111", remote_path="/data/Q1111", ssh_key_path=r"C:\keys\other"),
+    ]
+    monkeypatch.setattr(window, "_refresh_remote_table", lambda *args, **kwargs: None)
+    monkeypatch.setattr(window.collection_pane, "refresh", lambda *args, **kwargs: None)
+    window._load_profile_combo("A")
+    asked: list[str] = []
+
+    def ask(profile):
+        asked.append(profile.name)
+        return f"secret-{profile.name}"
+
+    monkeypatch.setattr(window, "_ask_passphrase", ask)
+    return window, asked
+
+
+def test_passphrase_is_remembered_across_profiles_that_share_a_key(monkeypatch, tmp_path) -> None:
+    window, asked = _passphrase_window(monkeypatch, tmp_path)
+
+    assert window._get_session_passphrase(window.current_profile()) == "secret-A"
+    window.profile_combo.setCurrentIndex(window.profile_combo.findText("B"))
+    assert window._get_session_passphrase(window.current_profile()) == "secret-A"
+    window.profile_combo.setCurrentIndex(window.profile_combo.findText("C"))
+    assert window._get_session_passphrase(window.current_profile()) == "secret-C"
+    window.profile_combo.setCurrentIndex(window.profile_combo.findText("A"))
+    assert window._get_session_passphrase(window.current_profile()) == "secret-A"
+
+    assert asked == ["A", "C"]
+    window.close()
+
+
+def test_rejected_key_forgets_the_remembered_passphrase(monkeypatch, tmp_path) -> None:
+    window, asked = _passphrase_window(monkeypatch, tmp_path)
+    window._get_session_passphrase(window.current_profile())
+
+    window._forget_passphrase_if_rejected("rsync: connection unexpectedly closed")
+    window._get_session_passphrase(window.current_profile())
+    assert asked == ["A"]
+
+    window._forget_passphrase_if_rejected("me@ssh1.qriscloud.org.au: Permission denied (publickey).")
+    window._get_session_passphrase(window.current_profile())
+    assert asked == ["A", "A"]
+    window.close()
+
+
+def test_failed_collection_pane_listing_with_rejected_key_forgets_passphrase(monkeypatch, tmp_path) -> None:
+    window, asked = _passphrase_window(monkeypatch, tmp_path)
+    window._get_session_passphrase(window.current_profile())
+    monkeypatch.setattr(QMessageBox, "warning", lambda *_args, **_kwargs: None)
+
+    window.collection_pane._on_listing_error("Permission denied (publickey).")
+
+    window._get_session_passphrase(window.current_profile())
+    assert asked == ["A", "A"]
+    window.close()

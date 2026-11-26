@@ -116,7 +116,7 @@ Never:
 - log passwords, passphrases, or private key contents
 - concatenate shell command strings for execution
 
-Prefer SSH key authentication. Passphrases may be held in memory for the current app session only, and are passed to ssh through the askpass helper (`app/core/askpass.py`).
+Prefer SSH key authentication. Passphrases may be held in memory for the current app session only, and are passed to ssh through the askpass helper (`app/core/askpass.py`). The session cache is keyed by SSH key file (`passphrase_cache_key`), so profiles sharing a key share it. It must be cleared when ssh reports the key was rejected (`ssh_key_was_rejected`), so a mistyped passphrase is never reused.
 
 QRIScloud host keys are trusted per user. Do not weaken the check that rejects an unexpected server identity.
 
@@ -237,6 +237,21 @@ dist\QRISRsyncManager.exe
 `run_tests.ps1` and the build script prefer the project-local environment at `envs\qris-rsync-manager`.
 
 The packaged app should detect MSYS2 rsync/ssh on startup and allow custom executable paths.
+
+### Shared distribution folders
+
+Users run the app from shared team folders, not from GitHub downloads. After every new executable build that is meant for users, copy both `dist\QRISRsyncManager.exe` and `dist\QRIS_Rsync_Manager_Windows_Guide.pdf` to **both** folders:
+
+```text
+L:\RES_MEG\NESP\How To Do Everything\Data Storage Hard-drives\QrisCloud\QRISCloud transfer app
+L:\RES_MEG\NFCSecure\Custom Apps\QRISCloud transfer app
+```
+
+- Rebuild the guide PDF (`packaging\build_tutorial_pdf.py`) first if the tutorial changed.
+- Run the tests and smoke-test the new executable before copying.
+- Copy to a temporary `.incoming` name, check the SHA-256 hash against `dist\`, then rename over the old file, so users never open a half-copied executable.
+- Verify the final hash in both folders and report the result.
+- The beginner guide tells users to open the app from the same shared folder as the guide. Do not put these paths in the guide.
 
 ## Development Guidance
 
