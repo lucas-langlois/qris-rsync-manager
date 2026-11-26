@@ -275,7 +275,7 @@ If MSYS2 is installed elsewhere, **Browse** can change the rsync path, but that 
 
 **Window: QRIS Rsync Manager.**
 
-1. Select your profile and click **Test SSH**.
+1. Select your profile and click **Test SSH**, at the right of the Profile box.
 2. If asked for your **SSH key passphrase**, enter the one you chose in step 5. This is not your UQ password. The app keeps it only for the current session.
 3. Read the Log panel. Look for `QRIS_SSH_OK` and `SSH test succeeded using ...`. An exit code of **0** means success.
 4. In the **Remote** panel, check that **Path** is `/data/` plus your actual collection ID. Click **Load**.
@@ -469,7 +469,7 @@ If your account can access two collections, you can copy data from one to the ot
 
 **Folder address example only:** copying the folder `/data/Q0101/Survey 2025` into an open `/data/Q0202` produces `/data/Q0202/Survey 2025`.
 
-The copy runs on the QRIScloud server, so your network speed does not matter. It never deletes or moves anything, but files with the same name at the destination may be updated. Files on tape are recalled as they are read, so a large copy can be slow; use **Recall from tape** first. Collection copies do not write receipts. Set **Mode** back to **Local ↔ QRIScloud** for uploads and downloads.
+The copy runs on the QRIScloud server, so your network speed does not matter. It never deletes or moves anything, but files with the same name at the destination may be updated. Files on tape are recalled as they are read, so a large copy can be slow; recall them first from the **Tape status and recall** menu under the QRIScloud pane. Collection copies do not write receipts. Set **Mode** back to **Local ↔ QRIScloud** for uploads and downloads.
 
 <!-- pagebreak -->
 
@@ -505,7 +505,7 @@ Read the **first specific error** in the Log as well as the final exit code. A n
 | Not enough disk space during packaging | Check free space on the source drive against the temporary-space estimate, not just the destination quota. |
 | Upload reports quota or too many files | Contact the collection owner/support. Group suitable files into archives; do not delete shared files to make room without agreement. |
 | Log warns that the receipt could not be saved or uploaded | The transfer itself still completed. Check that you can write to the local folder. Any copy reported as saved is still valid. |
-| Download waits a long time or reports I/O errors | Some data may need retrieval from tape. **Recall from tape** requests retrieval for visible files; it does not download them. Contact support for persistent delays. |
+| Download waits a long time or reports I/O errors | Some data may need retrieval from tape. Select the files or folder, then choose **Tape status and recall → Check tape status…** under the QRIScloud pane. It shows what is on tape and offers to recall it; recalling does not download. Contact support for persistent delays. |
 
 **Need to stop?** Click **Stop** and wait for cancellation to finish. Source files remain; partial destination files can remain too. Compare the same source/destination again before retrying. Packaged uploads can retry interrupted connections automatically; authentication failures need correction rather than repeated retries.
 
@@ -547,6 +547,6 @@ Links in the PDF are clickable. Installation and account instructions were check
 - [Microsoft OpenSSH key management](https://learn.microsoft.com/en-us/windows-server/administration/openssh/openssh_keymanagement) for key-pair and passphrase guidance.
 - [OpenSSH authorized-key documentation](https://man.openbsd.org/sshd.8#AUTHORIZED_KEYS_FILE_FORMAT) for public-key registration on the server.
 
-App labels, profile fields, folder destinations, archive behavior, transfer receipts, file organising, and collection copies were checked against the repository's README, built-in setup guide, and implementation of **v1.3.0**. The registration command adapts the built-in method to use the installed MSYS2 SSH program explicitly and set accepted-key permissions. It has not been run against a live QRIScloud account for this guide.
+App labels, profile fields, folder destinations, archive behavior, transfer receipts, file organising, and collection copies were checked against the repository's README, built-in setup guide, and implementation of **v1.3.1**. The registration command adapts the built-in method to use the installed MSYS2 SSH program explicitly and set accepted-key permissions. It has not been run against a live QRIScloud account for this guide.
 
 The guide uses text path diagrams rather than simulated app screenshots. The editable source is `WINDOWS_BEGINNER_TUTORIAL.md` in the repository; the printable guide is built with `packaging/build_tutorial_pdf.py`.

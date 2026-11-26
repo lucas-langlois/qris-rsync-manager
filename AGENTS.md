@@ -120,6 +120,8 @@ Prefer SSH key authentication. Passphrases may be held in memory for the current
 
 QRIScloud host keys are trusted per user. Do not weaken the check that rejects an unexpected server identity.
 
+Profile export and import (`export_profiles`, `read_profile_file`, `adapt_profile_to_this_computer`, `merge_imported_profiles` in `app/core/profiles.py`) must never include secrets or private keys. Import accepts the export format or a copied `profiles.json` (with or without a BOM) and points key and rsync paths at the current computer.
+
 ## GUI and Background Work
 
 Keep GUI code in `app/gui/` and core logic in `app/core/`.
@@ -148,6 +150,7 @@ Remote and local file management already exists. Keep the current guardrails whe
 - Remote moves stay inside the collection the items come from. Collection roots and unsafe paths are protected (`is_dangerous_remote_path`). Rename is name-only.
 - Remote panes are folder trees (`RemoteMoveTree` in `app/gui/drag_views.py`). Expanding a folder lists it in the background through `RemoteFolderLoader` (read-only, its own thread, results cached). Double-click opens a folder.
 - Remote trees select entries by stored path, never by row position, because the `..` row and the "Loading…" note rows are display-only and never part of the entries list. Entries inside expanded folders are stored on their items; selected-file downloads keep their subfolder.
+- Layout: upload buttons sit under the left pane, download buttons and the **Tape status and recall ▾** menu under the QRIScloud pane (outside the pane boxes, so they stay visible when Collection ↔ Collection mode swaps the left pane). The three tape menu items click hidden buttons, so they follow the same enabled rules. Test SSH is in the Profile box; Stop is by the progress bar.
 - Right-click menus and keyboard shortcuts (`app/gui/pane_actions.py`) are scoped to the file list widget and gated on the matching button's enabled state.
 - Cut/Paste is internal (not the system clipboard), bound to the pane it was cut from, consumed by any paste attempt in that pane (a refused paste in another pane keeps it), and cleared on profile change.
 - Local drag moves stay inside the displayed folder. Local Move to… and Paste may reach any folder on the same drive and refuse other drives.
@@ -158,6 +161,12 @@ Remote and local file management already exists. Keep the current guardrails whe
 Do not add chmod, mirror, or `--delete` behavior. Any new destructive action needs a confirmation at least as strong as the existing ones.
 
 Medici tape recall (`app/core/medici.py`) only requests retrieval. It does not download files.
+
+**Check tape status** (`build_tape_status_command`, `app/gui/tape_status.py`) must stay read-only: it lists size and allocated blocks with `find -printf` and never opens file data, because reading a file on tape starts a recall. A file over 4 KB that uses less than half its size on disk is on tape: tape stubs use 0-1 blocks (checked live on /data/Q5722, a 7.7 MB photo on tape used 1 block). Files of 4 KB or less are always counted as on disk, because GPFS keeps them in the inode.
+
+Large recalls go to Bunya as a Slurm job (`write_bunya_recall_job`), because RCC requires recalls to run on a compute node, not a login node, with at most 4 concurrent recalls. The app writes the script and an explicit file list (recall_medici does not recurse reliably) with Unix line endings. **Submit to Bunya** (`app/core/bunya.py`, `BunyaSubmitWorker`) sends both over one SSH login and runs `sbatch`; nothing else runs on Bunya. Bunya needs key + MFA, so that connection uses `build_interactive_askpass_environment`: ssh runs the app itself with `--askpass` (`app/gui/askpass_prompt.py`), which shows the prompt and returns the answer on stdout. Never store or log MFA codes, and keep `NumberOfPasswordPrompts=1` so a wrong code cannot trigger repeated MFA pushes.
+
+Bunya and QRIScloud share the same disk cache (checked live on 26 Nov 2026: identical block counts from both sides, and files recalled on Bunya appear on disk on QRIScloud). So **Tape status and recall → Recall jobs on Bunya… → Check progress** (`app/gui/recall_jobs.py`) checks a job's own file list from QRIScloud with the normal key and no MFA; only **Show Bunya job log** logs in to Bunya. Submitted jobs are recorded in `%APPDATA%\QRISRsyncManager\bunya_jobs\jobs.json`. Send file lists to ssh as bytes with `\n` line endings: text-mode pipes on Windows add `\r` to every path. Paths handed to `recall_medici` are passed through `glob_escape`, because it expands every argument as a glob pattern.
 
 For sync selection, compare:
 

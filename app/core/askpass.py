@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import shlex
+import sys
 from pathlib import Path
 
 from .paths import MSYS2_SSH_PATH, app_data_dir, is_msys2_executable, windows_path_to_msys
@@ -41,6 +43,51 @@ def build_askpass_environment(passphrase: str, ssh_path: str | Path | None = Non
     env.update(
         {
             PASSPHRASE_ENV: passphrase,
+            "SSH_ASKPASS": askpass,
+            "SSH_ASKPASS_REQUIRE": "force",
+            "DISPLAY": env.get("DISPLAY") or "QRISRsyncManager",
+        }
+    )
+    return env
+
+
+def _app_launcher() -> list[str]:
+    """Command that starts this app (packaged .exe, or Python running the source)."""
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
+    python = Path(sys.executable)
+    windowed = python.with_name("pythonw.exe")
+    return [str(windowed if windowed.exists() else python), "-m", "app.main"]
+
+
+def ensure_interactive_askpass_helper() -> Path:
+    """Askpass script that asks the user in a small app window, for MFA logins."""
+    project_root = Path(__file__).resolve().parents[2]
+    launcher = " ".join(shlex.quote(windows_path_to_msys(part) if index == 0 else part)
+                        for index, part in enumerate(_app_launcher()))
+    helper = askpass_dir() / "qris_ssh_askpass_prompt.sh"
+    helper.write_text(
+        "#!/bin/sh\n"
+        + ("" if getattr(sys, "frozen", False) else f"cd {shlex.quote(windows_path_to_msys(project_root))} || exit 1\n")
+        + f'exec {launcher} --askpass "$1"\n',
+        encoding="utf-8",
+        newline="\n",
+    )
+    return helper
+
+
+def build_interactive_askpass_environment(ssh_path: str | Path | None = None) -> dict[str, str]:
+    """ssh environment that shows every login prompt (passphrase, MFA) in a window."""
+    env = os.environ.copy()
+    helper = ensure_interactive_askpass_helper()
+    if is_msys2_executable(ssh_path):
+        askpass = windows_path_to_msys(helper)
+        env["PATH"] = f"{MSYS2_SSH_PATH.parent}{os.pathsep}{env.get('PATH', '')}"
+    else:
+        askpass = str(helper)
+    env.pop(PASSPHRASE_ENV, None)
+    env.update(
+        {
             "SSH_ASKPASS": askpass,
             "SSH_ASKPASS_REQUIRE": "force",
             "DISPLAY": env.get("DISPLAY") or "QRISRsyncManager",
