@@ -530,11 +530,11 @@ Other app data, including profiles and temporary file lists, is saved under:
 
 Every real upload or download that transfers at least one file writes a
 receipt: the date, profile, collection, host, and each transferred file with its
-size, modification time, and SHA-256 checksum. Packaged uploads list the TAR and
+size, modification time, and MD5 checksum. Packaged uploads list the TAR and
 inventory files they sent. Compare/dry-run operations write no receipt.
 
 Each receipt has two files with the same name, for example
-`20261111T120922Z_upload.json` and `20261111T120922Z_upload.sha256`. Receipts
+`20261111T120922Z_upload.json` and `20261111T120922Z_upload.md5`. Receipts
 are never overwritten, so they build up a history of transfers.
 
 Receipts are stored in a hidden `.qris-receipts` folder inside the folder that
@@ -552,17 +552,21 @@ was synced, and nowhere else:
 `.qris-receipts` folders are never transferred as ordinary data and are ignored
 by **Synchronise**.
 
-File paths in a receipt are relative to the synced folder. rsync already
-verifies each file it transfers with its own checksum. The receipt adds a
-permanent SHA-256 record that you can check at any time. On QRIScloud or an HPC
-system, run this from the synced folder:
+File paths in a receipt are relative to the synced folder. The checksums come
+from rsync itself: rsync computes each file's MD5 while transferring it, and the
+receiving side checks it, so writing the receipt reads nothing a second time,
+even after a multi-TB upload. (A file rsync reports no checksum for is hashed
+locally instead.) To check the files later, run this from the synced folder on
+QRIScloud or an HPC system:
 
 ```bash
-sha256sum -c .qris-receipts/20261111T120922Z_upload.sha256
+md5sum -c .qris-receipts/20261111T120922Z_upload.md5
 ```
 
-Computing checksums reads every transferred file once more on the local side,
-so very large transfers take a little longer to finish.
+This reads every listed file, and files on tape are recalled first.
+
+Receipts written before v1.3.4 use SHA-256 and a `.sha256` file; check those
+with `sha256sum -c` instead.
 
 ## Safety Defaults
 

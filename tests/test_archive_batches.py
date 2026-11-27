@@ -169,7 +169,7 @@ def test_batch_hashes_survive_cleanup(tmp_path) -> None:
         receipt, Profile(name="Q1", username="u", host="h"), completed=False, emit=messages.append
     )
 
-    sums = [path for path in written if path.suffix == ".sha256"][0].read_text(encoding="utf-8")
+    sums = [path for path in written if path.suffix == ".md5"][0].read_text(encoding="utf-8")
     assert "a.tar" in sums and "not hashed" not in "".join(messages)
 
 

@@ -1,4 +1,4 @@
 """QRIS Rsync Manager application package."""
 
 # Keep in sync with pyproject.toml; a test enforces this.
-__version__ = "1.3.3"
+__version__ = "1.3.4"

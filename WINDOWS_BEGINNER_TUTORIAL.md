@@ -419,16 +419,16 @@ Selecting individual local files uploads those selected files without automatic 
 
 Every upload or download that copies at least one file writes a **receipt**. It is your record of what was transferred, when, and to where, so you can tell which folders have been synced and which have not.
 
-A receipt is two files with the same name, for example `20261111T052430Z_upload.json` and `20261111T052430Z_upload.sha256`. The name starts with the date and time in UTC. Receipts are never overwritten, so each transfer adds a new one.
+A receipt is two files with the same name, for example `20261111T052430Z_upload.json` and `20261111T052430Z_upload.md5`. The name starts with the date and time in UTC. Receipts are never overwritten, so each transfer adds a new one.
 
 - **Where:** in a `.qris-receipts` folder inside the folder you transferred. An upload keeps one copy on your computer and one on QRIScloud. A download keeps its receipt on your computer only, inside the download folder.
-- **What it lists:** each transferred file with its size, modification time, and **SHA-256 checksum**, a fingerprint of the file's exact contents. For a packaged upload, it lists the `.tar` and inventory files that were sent.
+- **What it lists:** each transferred file with its size, modification time, and **MD5 checksum**, a fingerprint of the file's exact contents. rsync computes it while sending the file, so writing the receipt adds no extra reading time. For a packaged upload, it lists the `.tar` and inventory files that were sent.
 - **Not listed:** files that were already up to date were not transferred, so they are not in the new receipt. A transfer that copied nothing writes no receipt.
 - **Interrupted transfers:** a receipt ending in `_incomplete` is kept on your computer only. It shows what was sent before the problem.
 
 The app never copies `.qris-receipts` folders as ordinary data, and **Synchronise** ignores them. Leave them in place.
 
-To check later that the files on QRIScloud still match, someone with command-line access to QRIScloud or an HPC system can open the transferred folder and run `sha256sum -c .qris-receipts/<receipt name>.sha256`. Each file should report `OK`. This reads every listed file, so it can take a while for large datasets.
+To check later that the files on QRIScloud still match, someone with command-line access to QRIScloud or an HPC system can open the transferred folder and run `md5sum -c .qris-receipts/<receipt name>.md5`. Each file should report `OK`. (Receipts from before v1.3.4 end in `.sha256`; use `sha256sum -c` for those.) This reads every listed file, so it can take a while for large datasets.
 
 ### Getting files out of an archive
 

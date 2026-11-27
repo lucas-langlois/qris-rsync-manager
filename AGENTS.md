@@ -207,6 +207,7 @@ Rules:
 - Analysis must not stat every ancestor of every folder: on a network share each stat is a round trip. Only the root is validated during the scan; scandir entries already prove subfolders are normal directories.
 - A folder that changes during the upload is skipped and reported (final code 23); the rest continues. rsync 23/24 in the loose phase do not stop the archives.
 - Windows Server deduplicated files (reparse tag 0x80000013) are ordinary files. Use `is_link_or_junction` (`app/core/paths.py`), never the bare reparse-point attribute: only name-surrogate tags (symlinks, junctions) are links. `os.scandir` reports the attribute on dedup files and `os.stat` does not. `DfsrPrivate`, `System Volume Information` and `$RECYCLE.BIN` are left out of scans and uploads.
+- Receipt checksums come from rsync (`TRANSFER_RECORD_OPTIONS`: `--out-format=%i %C %n%L`, `--checksum-choice=md5`), parsed by `TransferCollector`. Never re-read transferred files to hash them (multi-TB uploads); hash locally only files rsync gave no checksum for. md5 is forced because two current rsyncs otherwise pick xxh128. QRIScloud runs rsync 3.4.1 (checked 27 Nov 2026).
 - Do not retry authentication failures automatically.
 - Selected-file uploads are exact and are never packaged.
 

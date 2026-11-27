@@ -19,7 +19,7 @@ from app.core.receipts import (
     ReceiptFile,
     TransferCollector,
     hash_transferred_files,
-    sha256sum_text,
+    checksum_text,
     unescape_rsync_name,
     write_receipt,
 )
@@ -36,7 +36,7 @@ PROFILE = Profile(
 
 
 def _sha(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+    return hashlib.md5(data).hexdigest()
 
 
 def test_collector_reads_sent_files_across_chunks_and_progress_lines() -> None:
@@ -87,10 +87,10 @@ def test_hash_records_checksums_and_missing_files(tmp_path: Path) -> None:
 
     files = hash_transferred_files(["survey/a.jpg", "survey/gone.jpg"], tmp_path, "/data/Q0101/")
 
-    assert files[0].sha256 == _sha(b"alpha")
+    assert files[0].md5 == _sha(b"alpha")
     assert files[0].bytes == 5
     assert files[0].remote_path == "/data/Q0101/survey/a.jpg"
-    assert files[1].sha256 is None
+    assert files[1].md5 is None
     assert files[1].note.startswith("not hashed")
 
 
@@ -106,14 +106,14 @@ def test_hash_with_prefix_and_cancel(tmp_path: Path) -> None:
         hash_transferred_files(["img.tar"], tmp_path, "/data", cancel_event=cancelled)
 
 
-def test_sha256sum_text_is_coreutils_compatible() -> None:
+def test_checksum_text_is_coreutils_compatible() -> None:
     files = [
-        ReceiptFile("survey/a b.jpg", "", "", 1, None, "a" * 64),
-        ReceiptFile("odd\\name", "", "", 1, None, "b" * 64),
+        ReceiptFile("survey/a b.jpg", "", "", 1, None, "a" * 32),
+        ReceiptFile("odd\\name", "", "", 1, None, "b" * 32),
         ReceiptFile("missing", "", "", None, None, None),
     ]
 
-    assert sha256sum_text(files) == f"{'a' * 64}  survey/a b.jpg\n\\{'b' * 64}  odd\\\\name\n"
+    assert checksum_text(files) == f"{'a' * 32}  survey/a b.jpg\n\\{'b' * 32}  odd\\\\name\n"
 
 
 def test_write_receipt_never_overwrites(tmp_path: Path) -> None:
@@ -187,7 +187,7 @@ def test_completed_upload_writes_receipt_in_synced_folders(tmp_path: Path) -> No
     assert receipt["remote"] == "/data/Q0101/project/survey"
     assert receipt["files"][0]["path"] == "a.jpg"
     assert receipt["files"][0]["remote_path"] == "/data/Q0101/project/survey/a.jpg"
-    assert receipt["files"][0]["sha256"] == _sha(b"alpha")
+    assert receipt["files"][0]["md5"] == _sha(b"alpha")
     assert written[1].read_text(encoding="utf-8") == f"{_sha(b'alpha')}  a.jpg\n"
     assert commands[0][-1] == "alice@ssh1.qriscloud.org.au:/data/Q0101/project/survey/.qris-receipts/"
     assert set(uploaded) == {written[0].name, written[1].name}
@@ -257,7 +257,7 @@ def test_real_transfers_can_itemize_and_always_skip_receipt_folders(tmp_path: Pa
     command = build_rsync_command(PROFILE, tmp_path, dry_run=False, itemize=True)
     dry_run = build_rsync_command(PROFILE, tmp_path, dry_run=True)
 
-    assert "--itemize-changes" in command
+    assert "--out-format=%i %C %n%L" in command and "--checksum-choice=md5" in command
     assert "--dry-run" not in command
     assert "--exclude=.qris-receipts/" in command
     assert "--exclude=.qris-receipts/" in dry_run
@@ -303,3 +303,65 @@ def test_receipt_collection_id_comes_from_the_remote_path() -> None:
     assert _collection_id_for("/data/Q8940/survey", "Q9560") == "Q8940"
     assert _collection_id_for("/QRISdata/q8940", "Q9560") == "Q8940"
     assert _collection_id_for("/home/user", "Q9560") == "Q9560"
+
+
+def test_collector_takes_rsync_md5_and_still_reads_itemize_only_lines() -> None:
+    collector = TransferCollector("upload")
+    collector.feed(
+        "<f+++++++++ da01d255016970073ab3b03c8f3bcb97 big.bin\n"
+        "cd+++++++++                                  sub/\n"
+        "<f.st......                                  sub/no sum.txt\n"
+        "<f+++++++++ plain.txt\n"
+    )
+
+    assert collector.checksums() == {
+        "big.bin": "da01d255016970073ab3b03c8f3bcb97",
+        "sub/no sum.txt": None,
+        "plain.txt": None,
+    }
+
+
+def test_rsync_checksum_is_used_without_reading_the_file(tmp_path: Path, monkeypatch) -> None:
+    # 3.2 TB of loose files must not be read a second time for the receipt.
+    (tmp_path / "big.bin").write_bytes(b"data")
+    import app.core.receipts as receipts
+
+    monkeypatch.setattr(receipts, "_md5", lambda *_a, **_k: pytest.fail("file was read again"))
+    files = hash_transferred_files({"big.bin": "0" * 32}, tmp_path, "/data/Q1")
+
+    assert files[0].md5 == "0" * 32 and files[0].bytes == 4
+
+
+@pytest.mark.skipif(not Path(r"C:\msys64\usr\bin\rsync.exe").is_file(), reason="MSYS2 rsync is not installed")
+def test_real_rsync_upload_output_gives_the_receipt_true_md5s(tmp_path: Path) -> None:
+    """An upload's own output carries each file's MD5 (no second read).
+
+    A stand-in for ssh runs the "remote" rsync locally, so the app's rsync is
+    the sending side exactly as in a real upload.
+    """
+    import subprocess
+
+    from app.core.paths import path_for_rsync
+    from app.core.rsync_command import TRANSFER_RECORD_OPTIONS
+
+    rsync = r"C:\msys64\usr\bin\rsync.exe"
+    source = tmp_path / "src"
+    (source / "sub").mkdir(parents=True)
+    (source / "big.bin").write_bytes(bytes(range(256)) * 4000)
+    (source / "sub" / "a file.txt").write_bytes(b"hello\n")
+    fake_ssh = tmp_path / "fakessh.sh"
+    # Like ssh: drop the host and hand the command line to a shell, which
+    # undoes rsync's escaping of spaces in the remote path.
+    # /usr/bin/sh is MSYS2's own: a sh found on PATH (Git's) hangs the pipes.
+    fake_ssh.write_bytes(b'#!/usr/bin/sh\nshift\nexec /usr/bin/sh -c "$*"\n')
+    output = subprocess.run(
+        # rsync splits -e on spaces, so quote the stand-in's path.
+        [rsync, "-a", "-W", *TRANSFER_RECORD_OPTIONS, "-e", f"'{path_for_rsync(fake_ssh, rsync)}'",
+         path_for_rsync(source, rsync) + "/", f"fakehost:{path_for_rsync(tmp_path / 'dst', rsync)}/"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    collector = TransferCollector("upload")
+    collector.feed(output)
+
+    assert collector.checksums() == {
+        "big.bin": hashlib.md5((source / "big.bin").read_
