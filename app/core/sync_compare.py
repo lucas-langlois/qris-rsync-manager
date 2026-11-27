@@ -17,7 +17,7 @@ from .archive_upload import (
     archive_expectations,
 )
 from .file_scan import CancelSignal, FolderScan
-from .paths import app_data_dir, path_for_rsync
+from .paths import app_data_dir, is_excluded_folder_name, is_link_or_junction, path_for_rsync
 from .profiles import Profile
 from .receipts import RECEIPT_DIR_NAME
 from .remote_dirs import build_remote_ssh_base
@@ -117,7 +117,7 @@ def scan_local_manifest(
                         pass
                     elif stat_module.S_ISDIR(entry_stat.st_mode):
                         # Transfer receipts are managed by the app, not synced.
-                        if entry.name != RECEIPT_DIR_NAME:
+                        if entry.name != RECEIPT_DIR_NAME and not is_excluded_folder_name(entry.name):
                             pending.append(Path(entry.path))
                     elif stat_module.S_ISREG(entry_stat.st_mode):
                         relative_path = Path(entry.path).relative_to(root).as_posix()
@@ -489,7 +489,7 @@ def _clean_remote_path(remote_path: str) -> str:
 
 
 def _is_reparse_point(stat: os.stat_result) -> bool:
-    return bool(getattr(stat, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    return is_link_or_junction(stat)
 
 
 def _manifest_cancelled(cancel_event: CancelSignal | None) -> bool:

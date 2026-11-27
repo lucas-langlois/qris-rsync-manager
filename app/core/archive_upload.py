@@ -9,15 +9,22 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from hashlib import sha256
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Protocol
 
 from .file_scan import FolderScan
-from .paths import detect_tar, is_executable_file
+from .paths import (
+    detect_tar,
+    is_executable_file,
+    is_link_or_junction,
+    APP_WORK_FOLDER_MARKER,
+    is_excluded_folder_name,
+)
 from .receipts import RECEIPT_DIR_NAME
 
 
@@ -28,6 +35,15 @@ ARCHIVE_MIN_SAME_TYPE = 50
 # inventory. Smaller parts limit retry cost and tape-recall time on QRISdata.
 ARCHIVE_PART_BYTES = 50_000_000_000
 ARCHIVE_MAX_PARTS = 9_999
+# Archives are built and uploaded in batches of up to this size (or one bigger
+# archive part), each deleted before the next, so a large backup needs little
+# temporary space and starts sending early.
+ARCHIVE_BATCH_BYTES = 20_000_000_000
+# Always left free on the drive that holds the temporary archives, so a shared
+# drive never fills up for the people working on it.
+ARCHIVE_TEMP_RESERVE_BYTES = 5_000_000_000
+TAR_PER_FILE_BYTES = 1_536
+TAR_FIXED_BYTES = 64_000_000
 NATIVE_TAR_BLOCKING_FACTOR = 2048
 NATIVE_TAR_POLL_SECONDS = 0.2
 NATIVE_TAR_STOP_SECONDS = 5.0
@@ -188,12 +204,9 @@ def analyze_upload_tree(
     while pending:
         _raise_if_cancelled(cancel_event)
         folder = pending.pop()
-        try:
-            _validate_folder(folder, source)
-        except (OSError, ValueError):
-            scan.skipped_errors += 1
-            _report(progress_callback, scan)
-            continue
+        # Subfolders were queued only after their scandir entry showed a normal
+        # directory, so only the root needs a stat here. Re-checking every
+        # ancestor cost one network round trip per level per folder on a share.
         snapshots: list[FileSnapshot] = []
         scan.directory_count += 1
         try:
@@ -208,9 +221,10 @@ def analyze_upload_tree(
                 try:
                     info = entry.stat(follow_symlinks=False)
                     if _is_reparse(info):
-                        scan.skipped_errors += 1
+                        # Links and junctions are left to rsync, as in scan_folder.
+                        pass
                     elif stat_module.S_ISDIR(info.st_mode):
-                        if entry.name != RECEIPT_DIR_NAME:
+                        if entry.name != RECEIPT_DIR_NAME and not is_excluded_folder_name(entry.name):
                             pending.append(Path(entry.path))
                     elif stat_module.S_ISREG(info.st_mode):
                         snapshot = FileSnapshot(Path(entry.path), info.st_size, info.st_mtime_ns)
@@ -273,15 +287,28 @@ def prepare_upload_package(
     tar_path: str | Path | None = None,
     build_archives: bool = True,
     include_source_directory: bool = False,
+    work_parent: Path | None = None,
+    skip_changed: list[Path] | None = None,
 ) -> UploadPackage:
     """Prepare archive exclusions and, optionally, the TAR payload.
+
+    *work_parent* is where the temporary folder is made; by default beside the
+    upload folder (see ``plan_archive_batches``).
+
+    Without *skip_changed*, any folder that changed since the scan raises.
+    With a list, changed folders are appended to it instead and none of their
+    direct files is sent loose or archived: a share in use keeps going, and
+    the caller reports them for a later Synchronise.
 
     With ``build_archives=False`` this is a lightweight dry-run preparation:
     it creates only the exclusion file and returns the planned archive groups.
     """
     if not plan.groups:
         raise ValueError("The upload plan contains no archive groups.")
-    revalidate_upload_plan(plan, cancel_event)
+    if skip_changed is None:
+        revalidate_upload_plan(plan, cancel_event)
+    else:
+        revalidate_upload_plan(replace(plan, folders=[]), cancel_event)  # the root only
     tar_executable: str | None = None
     if build_archives:
         tar_executable = str(Path(tar_path).expanduser()) if tar_path else detect_tar()
@@ -290,19 +317,17 @@ def prepare_upload_package(
                 f"Native tar.exe was not found at {tar_executable}. "
                 "Windows Server 2022 normally provides C:\\Windows\\System32\\tar.exe."
             )
-    source_parent = plan.root.parent
-    if source_parent == plan.root:
-        source_parent = Path(tempfile.gettempdir()).resolve()
+    source_parent = work_parent or default_work_parent(plan.root)
     if build_archives:
-        required = plan.archived_bytes + max(1_073_741_824, plan.archived_bytes // 20)
+        required = required_temp_bytes(plan.groups)
         free = shutil.disk_usage(source_parent).free
         if free < required:
-            raise OSError(
-                f"Not enough temporary disk space beside the upload folder. "
+            raise NotEnoughTempSpace(
+                f"Not enough temporary disk space in {source_parent}. "
                 f"Required about {required:,} bytes; available {free:,} bytes."
             )
 
-    work_dir = Path(tempfile.mkdtemp(prefix=_work_directory_prefix(plan.root), dir=source_parent))
+    work_dir = _make_work_dir(source_parent, _work_directory_prefix(plan.root))
     payload_dir = work_dir / "payload"
     exclude_file = work_dir / "archived-files.exclude"
     payload_dir.mkdir()
@@ -313,7 +338,14 @@ def prepare_upload_package(
             inventory_count = 0
             for folder_plan in plan.folders:
                 _raise_if_cancelled(cancel_event)
-                snapshots = _validated_folder_snapshots(plan, folder_plan, cancel_event)
+                try:
+                    snapshots = _validated_folder_snapshots(plan, folder_plan, cancel_event)
+                except RuntimeError:
+                    if skip_changed is None:
+                        raise
+                    skip_changed.append(folder_plan.folder)
+                    exclusions.writelines(_folder_filter_rules(plan, folder_plan, [], include_source_directory))
+                    continue
                 member_map = dict(_archive_parts(snapshots, plan.max_part_bytes, plan.min_same_type))
                 for group in folder_plan.groups:
                     members = member_map[group.part_number]
@@ -333,11 +365,13 @@ def prepare_upload_package(
                         os.utime(_windows_io_path(inventory_path), (stable_mtime, stable_mtime))
                         archive_count += 1
                         inventory_count += 1
-                    for member in members:
-                        relative = _relative_posix(member.path, plan.root)
-                        if include_source_directory:
-                            relative = f"{plan.root.name}/{relative}"
-                        exclusions.write(f"/{_escape_rsync_pattern(relative)}\n")
+                archived = {member.path for members in member_map.values() for member in members}
+                exclusions.writelines(
+                    _folder_filter_rules(
+                        plan, folder_plan, [item for item in snapshots if item.path not in archived],
+                        include_source_directory,
+                    )
+                )
         return UploadPackage(work_dir, payload_dir, exclude_file, archive_count, inventory_count, tuple(plan.groups))
     except Exception as exc:
         cleanup_error = package.cleanup()
@@ -545,6 +579,140 @@ def subset_upload_plan(plan: UploadArchivePlan, relative_folders: set[str]) -> U
     )
 
 
+def required_temp_bytes(groups) -> int:
+    """Temporary space to build these archive parts: the tar size plus a margin.
+
+    A tar adds one 512-byte header per file (two for long or non-ASCII names)
+    and pads each file to 512 bytes.
+    """
+    return sum(group.member_bytes + group.member_count * TAR_PER_FILE_BYTES for group in groups) + TAR_FIXED_BYTES
+
+
+class NotEnoughTempSpace(OSError):
+    """The temporary folder no longer has room for a batch."""
+
+
+@dataclass(frozen=True)
+class ArchiveBatchPlan:
+    """Where to build archives, the batches to build and upload in turn, and
+    the archive parts too big for the free space (they are skipped)."""
+
+    work_parent: Path
+    batches: tuple[UploadArchivePlan, ...]
+    too_big: tuple[ArchiveGroupPlan, ...] = ()
+    room: int = 0
+
+
+def plan_archive_batches(
+    plan: UploadArchivePlan,
+    *,
+    batch_bytes: int = ARCHIVE_BATCH_BYTES,
+) -> ArchiveBatchPlan:
+    """Split *plan* into upload batches built one at a time on the source drive.
+
+    Archives are built beside the source folder, or inside it when the parent
+    is read-only (such as the root of a mapped share). Each batch is uploaded
+    and deleted before the next is built, so at most one batch (normally
+    about 20 GB, or one bigger archive part) uses space at a time, and
+    ``ARCHIVE_TEMP_RESERVE_BYTES`` always stays free for other people using
+    the drive. A part that cannot fit at all is listed in ``too_big``.
+    """
+    work_parent = choose_work_parent(plan.root)
+    room = _free_bytes(work_parent) - ARCHIVE_TEMP_RESERVE_BYTES
+    limit = max(0, min(batch_bytes, room))
+    batches: list[list[tuple[EligibleFolderPlan, ArchiveGroupPlan]]] = [[]]
+    too_big: list[ArchiveGroupPlan] = []
+    for folder in plan.folders:
+        for group in folder.groups:
+            if required_temp_bytes([group]) > room:
+                too_big.append(group)
+                continue
+            current = [item for _folder, item in batches[-1]]
+            if current and required_temp_bytes(current + [group]) > limit:
+                batches.append([])
+            batches[-1].append((folder, group))
+    return ArchiveBatchPlan(
+        work_parent,
+        tuple(_plan_from_groups(plan, batch) for batch in batches if batch),
+        tuple(too_big),
+        room,
+    )
+
+
+def split_batch_by_folder(batch: UploadArchivePlan) -> list[UploadArchivePlan]:
+    """One plan per folder, so a folder that changed can be skipped alone."""
+    return [replace(batch, folders=[folder]) for folder in batch.folders]
+
+
+def choose_work_parent(root: Path) -> Path:
+    """The folder beside *root* when writable, else *root* itself.
+
+    The parent of a top-level folder on a share is often the read-only share
+    root. A work folder inside *root* is hidden and never scanned or uploaded
+    (``is_app_work_folder``).
+    """
+    parent = root.parent
+    if parent != root and _is_writable_folder(parent):
+        return parent
+    return root
+
+
+def default_work_parent(root: Path) -> Path:
+    parent = root.parent
+    return Path(tempfile.gettempdir()).resolve() if parent == root else parent
+
+
+def _is_writable_folder(folder: Path) -> bool:
+    probe = folder / f".qris-write-check-{uuid.uuid4().hex}"
+    try:
+        os.mkdir(_windows_io_path(probe))
+    except OSError:
+        return False
+    try:
+        os.rmdir(_windows_io_path(probe))
+    except OSError:
+        pass
+    return True
+
+
+def _make_work_dir(parent: Path, prefix: str) -> Path:
+    """Create a unique work folder.
+
+    Not ``tempfile.mkdtemp``: on Windows it treats "access denied" as a name
+    clash and retries 10,000 times, which looks like a hang on a read-only
+    network folder.
+    """
+    for _attempt in range(5):
+        candidate = parent / f"{prefix}{uuid.uuid4().hex[:8]}"
+        try:
+            os.mkdir(_windows_io_path(candidate))
+            return candidate
+        except FileExistsError:
+            continue
+        except PermissionError as exc:
+            raise PermissionError(f"Cannot create a temporary folder in {parent}: {exc}") from exc
+    raise FileExistsError(f"Could not create a unique temporary folder in {parent}.")
+
+
+def _plan_from_groups(
+    plan: UploadArchivePlan, pairs: list[tuple[EligibleFolderPlan, ArchiveGroupPlan]]
+) -> UploadArchivePlan:
+    folders: list[EligibleFolderPlan] = []
+    for folder, group in pairs:
+        if folders and folders[-1].folder == folder.folder:
+            folders[-1] = replace(folders[-1], groups=folders[-1].groups + (group,))
+        else:
+            folders.append(replace(folder, groups=(group,)))
+    return replace(plan, folders=folders)
+
+
+def _free_bytes(path: Path) -> int:
+    try:
+        return shutil.disk_usage(path).free
+    except OSError:
+        return 0
+
+
 def revalidate_upload_plan(
     plan: UploadArchivePlan,
     cancel_event: CancelSignal | None = None,
@@ -584,17 +752,21 @@ def _validated_folder_snapshots(
     current_groups = _group_snapshots(
         plan.root, folder_plan.folder, snapshots, plan.max_part_bytes, plan.min_same_type
     )
+    # A batch may hold only some of a folder's archive parts.
     expected = {_group_identity(group) for group in folder_plan.groups}
     actual = {_group_identity(group) for group in current_groups}
-    if actual != expected:
+    if not expected <= actual:
         raise RuntimeError(
             f"{folder_plan.folder} changed after it was scanned. Start the upload again so it can be rechecked."
         )
     return snapshots
 
 
-def _group_identity(group: ArchiveGroupPlan) -> tuple[str, str, int, int, int]:
-    return (group.archive_name, group.category, group.media_count, group.member_count, group.member_bytes)
+def _group_identity(group: ArchiveGroupPlan) -> tuple[str, str, int, int, int, int]:
+    return (
+        group.archive_name, group.category, group.media_count, group.member_count, group.member_bytes,
+        group.part_number,
+    )
 
 
 def _write_tar(
@@ -801,7 +973,7 @@ def _work_directory_prefix(root: Path) -> str:
     label = root.name or "upload"
     if len(label) > 48:
         label = f"{label[:31]}-{sha256(label.encode('utf-8')).hexdigest()[:16]}"
-    return f".{label}.qris-upload-"
+    return f".{label}{APP_WORK_FOLDER_MARKER}"
 
 
 def _archive_basename(name: str) -> str:
@@ -860,6 +1032,31 @@ def _relative_posix(path: Path, root: Path) -> str:
     return "" if relative == Path(".") else PurePosixPath(relative).as_posix()
 
 
+def _folder_filter_rules(
+    plan: UploadArchivePlan,
+    folder_plan: EligibleFolderPlan,
+    loose: list[FileSnapshot],
+    include_source_directory: bool,
+) -> list[str]:
+    """rsync rules that leave out one archived folder's archived files.
+
+    A few rules per folder instead of one per archived file: rsync checks every
+    path against every rule, and 775,000 per-file rules (a real 4.6 TB share)
+    cost about 8 ms per path, hours per upload. The rules keep subfolders and
+    the folder's files that are not archived, and leave out the rest of the
+    files directly inside it. First match wins.
+    """
+    prefix = folder_plan.relative_folder
+    if include_source_directory:
+        prefix = f"{plan.root.name}/{prefix}" if prefix else plan.root.name
+    base = f"/{_escape_rsync_pattern(prefix)}/" if prefix else "/"
+    rules = [f"+ {base}*/\n"]
+    for item in loose:
+        rules.append(f"+ {base}{_escape_rsync_pattern(item.path.name)}\n")
+    rules.append(f"- {base}*\n")
+    return rules
+
+
 def _escape_rsync_pattern(path: str) -> str:
     escaped = path.replace("\\", "\\\\")
     for character in "*?[]":
@@ -877,7 +1074,7 @@ def _snapshot_signature(snapshots: list[FileSnapshot]) -> tuple[tuple[str, int, 
 
 
 def _is_reparse(info: os.stat_result) -> bool:
-    return bool(getattr(info, "st_file_attributes", 0) & getattr(info, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    return is_link_or_junction(info)
 
 
 def _raise_if_cancelled(cancel_event: CancelSignal | None) -> None:

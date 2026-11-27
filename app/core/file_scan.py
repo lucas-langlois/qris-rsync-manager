@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from .paths import is_excluded_folder_name, is_link_or_junction
+
 
 HIGH_FILE_COUNT = 100_000
 MANY_TINY_FILES = 50_000
@@ -105,7 +107,8 @@ def scan_folder(
                     if _is_reparse_point(stat):
                         pass
                     elif _is_directory(entry.path, stat):
-                        pending.append(Path(entry.path))
+                        if not is_excluded_folder_name(entry.name):
+                            pending.append(Path(entry.path))
                     elif _is_regular_file(stat):
                         result.file_count += 1
                         result.total_bytes += stat.st_size
@@ -140,7 +143,7 @@ def _is_regular_file(stat: os.stat_result) -> bool:
 
 
 def _is_reparse_point(stat: os.stat_result) -> bool:
-    return bool(getattr(stat, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    return is_link_or_junction(stat)
 
 
 def _cancelled(cancel_event: CancelSignal | None) -> bool:

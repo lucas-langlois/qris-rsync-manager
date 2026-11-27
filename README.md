@@ -266,19 +266,61 @@ inventory, and related files always stay in the same part. A single file larger
 than 50 GB gets a part of its own.
 
 The confirmation window shows the proposed archives before work begins. The
-source files are never modified or deleted. TAR files are built in a temporary
-folder beside the upload source and uploaded with rsync. Successful and cancelled
-operations remove the temporary package. If recovery from a transfer failure is
-exhausted, the package is retained and its location is shown in the log. Because
-media files are normally already compressed, the app uses `.tar` rather than
-`.tar.gz` to avoid costly compression with little storage benefit.
+source files are never modified or deleted. Because media files are normally
+already compressed, the app uses `.tar` rather than `.tar.gz` to avoid costly
+compression with little storage benefit.
+
+A real upload sends the loose (non-archived) files first. It then builds and
+uploads the archives one batch at a time: up to 20 GB of small archives, or
+one bigger archive part. Each batch is uploaded and deleted before the next is
+built, so a multi-TB backup needs little temporary space.
+
+- **Where batches are built.** Beside the source folder, on the same drive. If
+  that folder is read-only (for example the root of a mapped share such as
+  `L:\`), they are built in a hidden `.<folder>.qris-upload-…` folder inside the
+  source, which is never scanned or uploaded.
+- **Free space for colleagues.** 5 GB is always left free on that drive. An
+  archive part too big for the free space (parts can be up to 50 GB) is skipped
+  and listed in the log, and the rest carries on. Free some space and run
+  **Synchronise…** later to send it.
+- **Folders that change.** If someone changes files in a folder while the upload
+  runs, that folder's archive is skipped and listed in the log, and the rest
+  carries on. The upload then ends with rsync code 23. Run **Synchronise…**
+  later to send what was skipped.
+- **Loose files on a share in use.** rsync code 24 (files vanished during the
+  transfer) and 23 (some files could not be read) in the loose-file phase are
+  reported, but the archives are still uploaded.
+- **A failed batch.** If a batch still fails after the automatic retries, its
+  archives are kept and the log shows where. Earlier batches are already on
+  QRIScloud.
+- **Receipts.** Each batch's archives are checksummed for the receipt just
+  before they are deleted.
 
 **Compare upload folder** does not build the potentially very large TAR files.
 It compares the non-archived files and reports every planned TAR and inventory
 as a payload that the real upload will create. During a real upload, archived
-originals are excluded from the loose-file phase, the source is revalidated
-before the payload phase, and generated TAR/inventory files are always refreshed
-without an expensive remote checksum.
+originals are excluded from the loose-file phase, each folder is checked again
+just before its archive is built, and generated TAR/inventory files are always
+refreshed without an expensive remote checksum.
+
+### Large file shares
+
+Files on Windows file servers that use data deduplication are ordinary files and
+are scanned, archived and uploaded like any other file. (Before v1.3.2 they were
+reported as "could not be scanned".) The file server's own `DfsrPrivate`,
+`System Volume Information` and `$RECYCLE.BIN` folders are never uploaded.
+
+For a backup of a whole shared workspace (hundreds of thousands of files, TBs):
+
+- Upload one top-level folder at a time. Runs are shorter, and a problem in one
+  folder does not hold up the rest.
+- To resume or refresh a backup later, use **Synchronise…**. It skips archives
+  that are already up to date on QRIScloud. **Upload** rebuilds and resends
+  every archive.
+- Auto-archiving suits finished folders full of small files. A change to any
+  file in an archived folder means its whole archive is sent again.
+- Uploads never delete anything on QRIScloud, so files deleted or renamed in the
+  workspace stay there. QRIScloud keeps no versions.
 
 If QRIScloud resets a connection during a packaged upload, the app keeps the
 partial remote file and retries automatically with increasing delays. It tries
