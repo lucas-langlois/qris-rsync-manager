@@ -114,7 +114,8 @@ def test_folder_that_changes_is_skipped_and_the_rest_upload(monkeypatch, tmp_pat
     assert code == PackagedUploadWorker.PARTIAL_TRANSFER_CODE
     text = "".join(output)
     assert "site1" in text and "Run Synchronise later" in text
-    assert len(commands) == 2  # site0 and site2, one batch each after the split
+    # A quick listing check drops site1; site0 and site2 still go up in one batch.
+    assert len(commands) == 1
     assert not list(tmp_path.glob(".share.qris-upload-*"))
 
 
@@ -135,3 +136,41 @@ def test_batch_hashes_survive_cleanup(tmp_path) -> None:
 
     sums = [path for path in written if path.suffix == ".sha256"][0].read_text(encoding="utf-8")
     assert "a.tar" in sums and "not hashed" not in "".join(messages)
+
+
+def test_changed_folder_before_start_is_skipped_not_fatal(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    root = _tree(tmp_path)
+    plan = analyze_upload_tree(root, min_same_type=1)
+    (root / "site0" / "p9.jpg").write_bytes(b"new photo")  # added after the scan
+    profile = Profile(name="Q1", username="u", host="h", rsync_path="rsync.exe")
+    worker = PackagedUploadWorker(profile, plan, "/data/Q1", dry_run=False)
+    monkeypatch.setattr(worker, "_available_profile", lambda *args, **kwargs: profile)
+    commands: list[list[str]] = []
+    monkeypatch.setattr(worker.runner, "run", lambda command, *_a, **_k: commands.append(command) or 0)
+    results: list[int] = []
+    worker.finished.connect(results.append)
+    output: list[str] = []
+    worker.output.connect(output.append)
+
+    worker.run()
+
+    assert results == [PackagedUploadWorker.PARTIAL_TRANSFER_CODE]
+    assert len(commands) == 2  # loose files, then one archive batch
+    assert "site0" in "".join(output)
+
+
+def test_changed_folder_gets_no_loose_files_either(tmp_path) -> None:
+    root = _tree(tmp_path, folders=2)
+    plan = analyze_upload_tree(root, min_same_type=1)
+    (root / "site1" / "p0.jpg").write_bytes(b"edited")
+    changed: list[Path] = []
+
+    package = prepare_upload_package(plan, build_archives=False, skip_changed=changed)
+    try:
+        rules = package.exclude_file.read_text(encoding="utf-8").splitlines()
+    finally:
+        package.cleanup()
+
+    assert changed == [root / "site1"]
+    assert rules[-2:] == ["+ /site1/*/", "- /site1/*"]

@@ -283,18 +283,27 @@ def prepare_upload_package(
     build_archives: bool = True,
     include_source_directory: bool = False,
     work_parent: Path | None = None,
+    skip_changed: list[Path] | None = None,
 ) -> UploadPackage:
     """Prepare archive exclusions and, optionally, the TAR payload.
 
     *work_parent* is where the temporary folder is made; by default beside the
     upload folder (see ``plan_archive_batches``).
 
+    Without *skip_changed*, any folder that changed since the scan raises.
+    With a list, changed folders are appended to it instead and none of their
+    direct files is sent loose or archived: a share in use keeps going, and
+    the caller reports them for a later Synchronise.
+
     With ``build_archives=False`` this is a lightweight dry-run preparation:
     it creates only the exclusion file and returns the planned archive groups.
     """
     if not plan.groups:
         raise ValueError("The upload plan contains no archive groups.")
-    revalidate_upload_plan(plan, cancel_event)
+    if skip_changed is None:
+        revalidate_upload_plan(plan, cancel_event)
+    else:
+        revalidate_upload_plan(replace(plan, folders=[]), cancel_event)  # the root only
     tar_executable: str | None = None
     if build_archives:
         tar_executable = str(Path(tar_path).expanduser()) if tar_path else detect_tar()
@@ -324,7 +333,14 @@ def prepare_upload_package(
             inventory_count = 0
             for folder_plan in plan.folders:
                 _raise_if_cancelled(cancel_event)
-                snapshots = _validated_folder_snapshots(plan, folder_plan, cancel_event)
+                try:
+                    snapshots = _validated_folder_snapshots(plan, folder_plan, cancel_event)
+                except RuntimeError:
+                    if skip_changed is None:
+                        raise
+                    skip_changed.append(folder_plan.folder)
+                    exclusions.writelines(_folder_filter_rules(plan, folder_plan, [], include_source_directory))
+                    continue
                 member_map = dict(_archive_parts(snapshots, plan.max_part_bytes, plan.min_same_type))
                 for group in folder_plan.groups:
                     members = member_map[group.part_number]

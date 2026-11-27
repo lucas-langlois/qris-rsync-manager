@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 from datetime import datetime
+from dataclasses import replace
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
@@ -406,6 +407,7 @@ class PackagedUploadWorker(QObject):
         self._receipt_plan: ReceiptPlan | None = None
         self._collector = None
         self._last_attempt_profile: Profile | None = None
+        self._changed_folders: list[Path] = []
 
     @Slot()
     def run(self) -> None:
@@ -422,16 +424,23 @@ class PackagedUploadWorker(QObject):
                 return
             # Only the list of archived files is prepared here. Real archives
             # are built and sent batch by batch after the loose files.
+            self._changed_folders = []
             package = prepare_upload_package(
                 self.plan,
                 cancel_event=self._cancelled,
                 progress_callback=lambda message: self._emit(message + "\n"),
                 build_archives=False,
                 include_source_directory=self.include_source_directory,
+                skip_changed=self._changed_folders,
             )
             if self._cancelled.is_set():
                 code = 130
                 return
+            if self._changed_folders:
+                self._emit(
+                    f"{len(self._changed_folders):,} folder(s) changed since the scan and will be skipped; "
+                    "they are listed at the end.\n"
+                )
             self._emit(
                 f"{'Would create' if self.dry_run else 'Will create'} {len(package.planned_groups):,} TAR archive(s), "
                 "each with an inventory file.\n"
@@ -518,6 +527,9 @@ class PackagedUploadWorker(QObject):
         batch. A folder that changes while the upload runs (a live share) is
         skipped and reported instead of stopping the whole upload.
         """
+        skipped: list[str] = [str(folder) for folder in self._changed_folders]
+        changed = set(self._changed_folders)
+        plan = replace(plan, folders=[folder for folder in plan.folders if folder.folder not in changed])
         batch_plan = plan_archive_batches(plan)
         queue = list(batch_plan.batches)
         self._emit(
@@ -525,12 +537,12 @@ class PackagedUploadWorker(QObject):
             f"temporary folder in {batch_plan.work_parent}. Source files will not be changed; "
             "press Stop to cancel.\n"
         )
-        skipped: list[str] = []
         batch_number = 0
         while queue:
             if self._cancelled.is_set():
                 return 130
             batch = queue.pop(0)
+            changed_now: list[Path] = []
             try:
                 package = prepare_upload_package(
                     batch,
@@ -539,15 +551,26 @@ class PackagedUploadWorker(QObject):
                     build_archives=True,
                     include_source_directory=self.include_source_directory,
                     work_parent=batch_plan.work_parent,
+                    skip_changed=changed_now,
                 )
             except ArchiveCancelled:
                 raise
             except (RuntimeError, ValueError) as exc:
+                # A file changed while its archive was being written: rare, so
+                # retry this batch folder by folder and skip only that folder.
                 if len(batch.folders) > 1:
                     queue[0:0] = split_batch_by_folder(batch)
                     continue
                 skipped.append(str(batch.folders[0].folder))
                 self._emit(f"Skipped {batch.folders[0].folder}: {exc}\n")
+                continue
+            for folder in changed_now:
+                skipped.append(str(folder))
+                self._emit(f"Skipped {folder}: it changed after the scan.\n")
+            if package.archive_count == 0:
+                cleanup_error = package.cleanup()
+                if cleanup_error:
+                    self._emit(cleanup_error + "\n")
                 continue
             batch_number += 1
             keep = False
