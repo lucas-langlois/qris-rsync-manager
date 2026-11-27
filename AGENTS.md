@@ -196,6 +196,7 @@ Planning and building live in `app/core/archive_upload.py`. The README documents
 Rules:
 
 - Never modify or delete source files.
+- Name archives `<folder>_<types>.tar` (`PILOT_txt.tar`, `.partNN.tar` for parts) so the name never suggests the whole folder. Synchronise must keep recognising the pre-1.3.3 `<folder>.tar` names (`legacy_archive_name`) so old archives are not re-sent.
 - Use uncompressed `.tar` with a UTF-8 `.inventory.txt` sidecar. Keep files that share a base name (sidecars, shapefile sets) in the same archive and part.
 - Prefer Windows `tar.exe` and fall back to MSYS2 tar.
 - Compare/dry-run must not build TAR files.

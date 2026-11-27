@@ -392,20 +392,30 @@ def build_sync_plan(
         present = 0
         matching = 0
         for part in archive.parts:
-            tar_path = prefix + part.archive_name
-            inventory_path = prefix + part.inventory_name
-            archive_files.update((tar_path, inventory_path))
-            tar = remote.get(tar_path)
-            inventory = remote.get(inventory_path)
-            if tar is not None:
-                present += 1
-            if (
-                tar is not None
-                and inventory is not None
-                and inventory.size == part.inventory_size
-                and abs(inventory.modified_timestamp - part.modified) <= mtime_tolerance_seconds
-            ):
-                matching += 1
+            # Archives uploaded before v1.3.3 are named after the folder only;
+            # an up-to-date one under that name counts, so it is not re-sent.
+            names = [(part.archive_name, part.inventory_name, part.inventory_size)]
+            if part.legacy_archive_name:
+                names.append((part.legacy_archive_name, part.legacy_inventory_name, part.legacy_inventory_size))
+            part_present = part_matching = False
+            for archive_name, inventory_name, inventory_size in names:
+                tar_path = prefix + archive_name
+                inventory_path = prefix + inventory_name
+                tar = remote.get(tar_path)
+                inventory = remote.get(inventory_path)
+                if tar is not None or inventory is not None:
+                    archive_files.update((tar_path, inventory_path))
+                part_present = part_present or tar is not None
+                if (
+                    tar is not None
+                    and inventory is not None
+                    and inventory.size == inventory_size
+                    and abs(inventory.modified_timestamp - part.modified) <= mtime_tolerance_seconds
+                ):
+                    part_matching = True
+            archive_files.update((prefix + part.archive_name, prefix + part.inventory_name))
+            present += part_present
+            matching += part_matching
         if matching == len(archive.parts):
             identical_archives += 1
             continue

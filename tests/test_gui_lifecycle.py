@@ -570,7 +570,7 @@ def test_packaged_upload_confirmation_explains_archives_and_starts_packaged_work
     assert "uncompressed TAR archive" in shown[0]
     assert "source folder will not be changed" in shown[0]
     assert "will not be deleted automatically" in shown[0]
-    assert "survey.tar" in shown[0]
+    assert "survey_jpg.tar" in shown[0]
     assert isinstance(started[0][0], PackagedUploadWorker)
     assert started[0][1] == "Packaged upload"
     window.close()

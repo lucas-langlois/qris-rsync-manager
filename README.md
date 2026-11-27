@@ -252,16 +252,22 @@ example 704 `.png` tiles or 300 `.csv` files. Case is ignored, and `.jpg/.jpeg`,
 triggers packaging, so a few large rasters or videos upload as ordinary files
 and stay directly usable on QRIScloud.
 
-Each qualifying folder gets one uncompressed TAR archive named after the folder:
-a folder called `survey` produces `survey.tar`. It holds every file of each
-qualifying type plus files that share their names, so shapefile sets
-(`.shp/.shx/.dbf/.prj`), sidecars such as `IMG_0001.xmp` or `clip.mp4.json`, and
-`.aux.xml` files stay together. All other files stay outside the TAR and are
-uploaded normally. Each TAR has a UTF-8 `.inventory.txt` file listing its
-filenames, sizes, and modification times.
+Each qualifying folder gets one uncompressed TAR archive named after the folder
+and the file types it holds: a folder called `survey` with many `.jpg` photos
+produces `survey_jpg.tar`, and one with many `.jpg` and `.json` files produces
+`survey_jpg_json.tar`. The type in the name shows that the archive is not the
+whole folder. It holds every file of each qualifying type plus files that share
+their names, so shapefile sets (`.shp/.shx/.dbf/.prj`), sidecars such as
+`IMG_0001.xmp` or `clip.mp4.json`, and `.aux.xml` files stay together. All other
+files stay outside the TAR and are uploaded normally. Each TAR has a UTF-8
+`.inventory.txt` file listing its filenames, sizes, and modification times.
+
+Archives uploaded before v1.3.3 are named after the folder only (`survey.tar`).
+**Synchronise…** still recognises those: an up-to-date one is not sent again
+under the new name.
 
 When an archive would exceed 50 GB, it is split into numbered parts such as
-`survey.part01.tar`, `survey.part02.tar`, and so on. Each part has its own
+`survey_jpg.part01.tar`, `survey_jpg.part02.tar`, and so on. Each part has its own
 inventory, and related files always stay in the same part. A single file larger
 than 50 GB gets a part of its own.
 

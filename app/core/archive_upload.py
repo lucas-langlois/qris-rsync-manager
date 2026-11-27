@@ -80,6 +80,8 @@ class ArchiveGroupPlan:
     inventory_name: str
     part_number: int = 1
     part_count: int = 1
+    # Name used before v1.3.3 (folder name only), still recognised on QRIScloud.
+    legacy_archive_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -121,6 +123,13 @@ class ArchivePartExpectation:
     inventory_name: str
     inventory_size: int
     modified: float
+    # The same archive as uploaded before v1.3.3, named after the folder only.
+    legacy_archive_name: str = ""
+    legacy_inventory_size: int = 0
+
+    @property
+    def legacy_inventory_name(self) -> str:
+        return f"{self.legacy_archive_name}.inventory.txt" if self.legacy_archive_name else ""
 
 
 @dataclass(frozen=True)
@@ -399,16 +408,22 @@ def _group_snapshots(
             f"(maximum {ARCHIVE_MAX_PARTS:,}). Split the folder into smaller folders first."
         )
     relative_folder = _relative_posix(folder, root)
-    safe_base = _archive_basename(folder.name or root.name or "folder")
+    folder_name = folder.name or root.name or "folder"
+    # Named after the folder and the file types it holds (PILOT_txt.tar), so
+    # it is clear the archive is not the whole folder.
+    type_suffix = "_" + "_".join(_name_label(item) for item in sorted(types))
+    safe_base = _archive_basename(folder_name, type_suffix)
+    legacy_base = _archive_basename(folder_name)
     existing_names = {item.path.name.casefold() for item in snapshots}
     type_label = ", ".join(_type_label(item) for item in sorted(types))
     groups: list[ArchiveGroupPlan] = []
     for part_number, members in parts:
         if part_count == 1:
-            archive_name = f"{safe_base}.tar"
+            suffix = ".tar"
         else:
             width = max(2, len(str(part_count)))
-            archive_name = f"{safe_base}.part{part_number:0{width}d}.tar"
+            suffix = f".part{part_number:0{width}d}.tar"
+        archive_name = f"{safe_base}{suffix}"
         inventory_name = f"{archive_name}.inventory.txt"
         if archive_name.casefold() in existing_names or inventory_name.casefold() in existing_names:
             raise ValueError(
@@ -426,6 +441,7 @@ def _group_snapshots(
                 inventory_name=inventory_name,
                 part_number=part_number,
                 part_count=part_count,
+                legacy_archive_name=f"{legacy_base}{suffix}",
             )
         )
     return groups
@@ -548,12 +564,15 @@ def archive_expectations(
             members = member_map[group.part_number]
             member_paths.extend(_relative_posix(member.path, plan.root) for member in members)
             member_bytes += sum(member.size for member in members)
+            legacy = replace(group, archive_name=group.legacy_archive_name)
             parts.append(
                 ArchivePartExpectation(
                     archive_name=group.archive_name,
                     inventory_name=group.inventory_name,
                     inventory_size=len(_inventory_text(group, members).encode("utf-8")),
                     modified=_stable_mtime(members),
+                    legacy_archive_name=group.legacy_archive_name,
+                    legacy_inventory_size=len(_inventory_text(legacy, members).encode("utf-8")),
                 )
             )
         expectations.append(
@@ -976,15 +995,25 @@ def _work_directory_prefix(root: Path) -> str:
     return f".{label}{APP_WORK_FOLDER_MARKER}"
 
 
-def _archive_basename(name: str) -> str:
-    """Return a deterministic component that leaves room for archive suffixes."""
+def _archive_basename(name: str, type_suffix: str = "") -> str:
+    """Return a deterministic component that leaves room for archive suffixes.
+
+    *type_suffix* (``_txt``) is always kept whole; a long folder name is
+    shortened instead.
+    """
     # The longest generated component is ``.part0000.tar.inventory.txt``.
-    max_units = 255 - _utf16_units(".part0000.tar.inventory.txt")
+    max_units = 255 - _utf16_units(".part0000.tar.inventory.txt") - _utf16_units(type_suffix)
     if _utf16_units(name) <= max_units:
-        return name
+        return f"{name}{type_suffix}"
     digest = sha256(name.encode("utf-8")).hexdigest()[:16]
     suffix = f"-{digest}"
-    return f"{_truncate_utf16(name, max_units - _utf16_units(suffix))}{suffix}"
+    return f"{_truncate_utf16(name, max_units - _utf16_units(suffix))}{suffix}{type_suffix}"
+
+
+def _name_label(file_type: str) -> str:
+    """A file type as it appears in an archive name: ``txt``, ``noext``."""
+    label = file_type.lstrip(".")
+    return "".join(character if character.isalnum() else "-" for character in label) or "noext"
 
 
 def _utf16_units(value: str) -> int:
