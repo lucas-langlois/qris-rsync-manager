@@ -1,9 +1,14 @@
-"""Transfer receipts: which files moved, when, and their SHA-256 checksums.
+"""Transfer receipts: which files moved, when, and their MD5 checksums.
 
 A receipt is written after every real upload or download that transferred at
 least one file. It lists each transferred file with its size, modification time
-and SHA-256, so a collection's history can be audited and any copy can be
-checked later with ``sha256sum -c``.
+and MD5, so a collection's history can be audited and any copy can be checked
+later with ``md5sum -c``.
+
+The MD5 comes from rsync itself (``TRANSFER_RECORD_OPTIONS``): rsync computes
+it while transferring the file and the receiving side verifies it, so nothing
+is read twice. A file rsync gave no checksum for is hashed locally instead.
+Receipts before v1.3.4 used SHA-256 and a ``.sha256`` file.
 
 Receipts live in a hidden ``.qris-receipts`` folder inside the synced folder:
 locally, and for uploads also on QRIScloud. Downloads stay local-only so
@@ -24,9 +29,14 @@ from pathlib import Path, PurePosixPath
 from typing import Protocol
 
 RECEIPT_DIR_NAME = ".qris-receipts"
-RECEIPT_FORMAT = "qris-rsync-manager-receipt/1"
+RECEIPT_FORMAT = "qris-rsync-manager-receipt/2"
+CHECKSUM_ALGORITHM = "md5"
+SUMS_SUFFIX = ".md5"
 HASH_CHUNK_BYTES = 4 * 1_048_576
 _ESCAPE = re.compile(r"\\#([0-7]{3})")
+# "<f+++++++++ <md5 or 32 spaces> name", from TRANSFER_RECORD_OPTIONS; the
+# checksum is absent in older itemize-only output.
+_TRANSFER_LINE = re.compile(r"^([<>])f.{9} (?:([0-9a-f]{32}| {32}) )?(.*)$")
 
 
 class CancelSignal(Protocol):
@@ -44,7 +54,7 @@ class ReceiptFile:
     local_path: str
     bytes: int | None
     modified_utc: str | None
-    sha256: str | None
+    md5: str | None
     note: str = ""
 
 
@@ -58,7 +68,8 @@ class TransferCollector:
     """
 
     direction: str
-    names: dict[str, None] = field(default_factory=dict)
+    # name -> MD5 reported by rsync (None if it gave none).
+    names: dict[str, str | None] = field(default_factory=dict)
     _pending: str = ""
 
     def feed(self, text: str) -> None:
@@ -74,14 +85,20 @@ class TransferCollector:
             self._pending = ""
         return list(self.names)
 
+    def checksums(self) -> dict[str, str | None]:
+        self.finish()
+        return dict(self.names)
+
     def _parse(self, line: str) -> None:
         marker = "<" if self.direction == "upload" else ">"
-        # Itemize strings are 11 characters, e.g. "<f+++++++++ path" or "<f.st...... path".
-        if len(line) > 12 and line[0] == marker and line[1] == "f" and line[11] == " ":
-            name = unescape_rsync_name(line[12:])
+        # Itemize strings are 11 characters, e.g. "<f+++++++++ md5 path" or "<f.st...... md5 path".
+        match = _TRANSFER_LINE.match(line)
+        if match and match.group(1) == marker:
+            name = unescape_rsync_name(match.group(3))
+            checksum = (match.group(2) or "").strip() or None
             if name:
                 self.names.pop(name, None)
-                self.names[name] = None
+                self.names[name] = checksum
 
 
 def unescape_rsync_name(name: str) -> str:
@@ -110,7 +127,7 @@ def utc_iso(moment: datetime | None = None) -> str:
 
 
 def hash_transferred_files(
-    names: Iterable[str],
+    names: Iterable[str] | dict[str, str | None],
     local_base: str | Path,
     remote_base: str,
     *,
@@ -118,15 +135,17 @@ def hash_transferred_files(
     cancel_event: CancelSignal | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> list[ReceiptFile]:
-    """Hash each transferred file on the local side.
+    """Record each transferred file, hashing locally only when needed.
 
     *names* are paths relative to *local_base* and *remote_base*, as rsync
-    reports them. *relative_prefix* is prepended to the recorded path when the
+    reports them; a mapping gives rsync's MD5 for each, which is used as is
+    (only the file's size and time are read). *relative_prefix* is prepended to the recorded path when the
     receipt root is above *remote_base* (packaged archive payloads).
     """
     base = Path(local_base)
     remote_root = remote_base.rstrip("/") or "/"
     files: list[ReceiptFile] = []
+    known = dict(names) if isinstance(names, dict) else {}
     name_list = list(names)
     total = len(name_list)
     last_report = time.monotonic()
@@ -138,7 +157,7 @@ def hash_transferred_files(
         remote_path = f"{remote_root.rstrip('/')}/{name}"
         try:
             info = os.stat(local_path)
-            digest = _sha256(local_path, cancel_event)
+            digest = known.get(name) or _md5(local_path, cancel_event)
             modified = datetime.fromtimestamp(info.st_mtime_ns / 1_000_000_000, timezone.utc)
             files.append(
                 ReceiptFile(relative, remote_path, str(local_path), info.st_size, utc_iso(modified), digest)
@@ -181,7 +200,7 @@ def build_receipt(
         "local": local_source,
         "remote": remote_destination,
         "app_version": app_version,
-        "checksum_algorithm": "sha256",
+        "checksum_algorithm": CHECKSUM_ALGORITHM,
         "file_count": len(files),
         "total_bytes": sum(item.bytes or 0 for item in files),
         "files": [
@@ -191,7 +210,7 @@ def build_receipt(
                 "local_path": item.local_path,
                 "bytes": item.bytes,
                 "modified_utc": item.modified_utc,
-                "sha256": item.sha256,
+                "md5": item.md5,
                 **({"note": item.note} if item.note else {}),
             }
             for item in files
@@ -199,35 +218,35 @@ def build_receipt(
     }
 
 
-def sha256sum_text(files: list[ReceiptFile]) -> str:
-    """Return ``sha256sum``-compatible lines, paths relative to the receipt root."""
+def checksum_text(files: list[ReceiptFile]) -> str:
+    """Return ``md5sum``-compatible lines, paths relative to the receipt root."""
     lines = []
     for item in files:
-        if not item.sha256:
+        if not item.md5:
             continue
         path = item.path
         if "\\" in path or "\n" in path:
             # GNU coreutils convention for names containing backslash or newline.
             escaped = path.replace("\\", "\\\\").replace("\n", "\\n")
-            lines.append(f"\\{item.sha256}  {escaped}")
+            lines.append(f"\\{item.md5}  {escaped}")
         else:
-            lines.append(f"{item.sha256}  {path}")
+            lines.append(f"{item.md5}  {path}")
     return "\n".join(lines) + ("\n" if lines else "")
 
 
 def write_receipt(receipt: dict, files: list[ReceiptFile], directory: str | Path, base_name: str) -> list[Path]:
-    """Write ``<base_name>.json`` and ``<base_name>.sha256``; never overwrite."""
+    """Write ``<base_name>.json`` and ``<base_name>.md5``; never overwrite."""
     folder = Path(directory)
     folder.mkdir(parents=True, exist_ok=True)
     name = base_name
     suffix = 1
-    while (folder / f"{name}.json").exists() or (folder / f"{name}.sha256").exists():
+    while (folder / f"{name}.json").exists() or (folder / f"{name}{SUMS_SUFFIX}").exists():
         suffix += 1
         name = f"{base_name}-{suffix}"
     json_path = folder / f"{name}.json"
-    sums_path = folder / f"{name}.sha256"
+    sums_path = folder / f"{name}{SUMS_SUFFIX}"
     json_path.write_text(json.dumps(receipt, indent=2, ensure_ascii=False) + "\n", encoding="utf-8", newline="\n")
-    sums_path.write_text(sha256sum_text(files), encoding="utf-8", newline="\n")
+    sums_path.write_text(checksum_text(files), encoding="utf-8", newline="\n")
     return [json_path, sums_path]
 
 
@@ -243,8 +262,8 @@ def app_version() -> str:
     return __version__
 
 
-def _sha256(path: Path, cancel_event: CancelSignal | None) -> str:
-    digest = hashlib.sha256()
+def _md5(path: Path, cancel_event: CancelSignal | None) -> str:
+    digest = hashlib.md5()
     with open(path, "rb") as handle:
         while True:
             if cancel_event and cancel_event.is_set():

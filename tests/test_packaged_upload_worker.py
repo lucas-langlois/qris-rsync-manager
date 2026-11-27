@@ -433,7 +433,7 @@ def test_packaged_worker_writes_receipt_with_loose_files_and_archives(monkeypatc
             payload = Path(command[-2].rstrip("/"))
             if not payload.exists():  # MSYS-style /x/... path
                 payload = Path(f"{command[-2][1].upper()}:{command[-2][2:]}")
-            tar_hash.append(hashlib.sha256((payload / "source_jpg.tar").read_bytes()).hexdigest())
+            tar_hash.append(hashlib.md5((payload / "source_jpg.tar").read_bytes()).hexdigest())
         if len(commands) <= 2:
             on_output(outputs[len(commands) - 1])
         return 0
@@ -452,6 +452,6 @@ def test_packaged_worker_writes_receipt_with_loose_files_and_archives(monkeypatc
     receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
     by_path = {item["path"]: item for item in receipt["files"]}
     assert set(by_path) == {"notes.txt", "source_jpg.tar", "source_jpg.tar.inventory.txt"}
-    assert by_path["notes.txt"]["sha256"] == hashlib.sha256(b"loose").hexdigest()
-    assert by_path["source_jpg.tar"]["sha256"] == tar_hash[0]
+    assert by_path["notes.txt"]["md5"] == hashlib.md5(b"loose").hexdigest()
+    assert by_path["source_jpg.tar"]["md5"] == tar_hash[0]
     assert receipt["status"] == "complete"

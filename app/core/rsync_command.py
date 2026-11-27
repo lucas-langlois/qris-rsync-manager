@@ -42,6 +42,15 @@ DRY_RUN_COMPARE_OPTIONS = [
     "--itemize-changes",
 ]
 
+# Real transfers print each file's itemize code, MD5 and name. rsync computes
+# that MD5 while it sends or receives the file (and the receiving side checks
+# it), so receipts need no second read of the data. md5 is forced because two
+# current rsyncs otherwise agree on xxh128, which common tools cannot check.
+TRANSFER_RECORD_OPTIONS = [
+    "--out-format=%i %C %n%L",
+    "--checksum-choice=md5",
+]
+
 
 def remote_target(profile: Profile, remote_path: str | None = None) -> str:
     clean = profile.normalized()
@@ -144,8 +153,8 @@ def build_rsync_command(
         command.extend(DRY_RUN_COMPARE_OPTIONS)
     elif itemize:
         # Real transfers itemize so the app can record exactly which files
-        # were sent or received in a transfer receipt.
-        command.append("--itemize-changes")
+        # were sent or received, with their MD5, in a transfer receipt.
+        command.extend(TRANSFER_RECORD_OPTIONS)
     if ignore_times:
         command.append("--ignore-times")
     # Receipts are written into synced folders by the app itself; never sync

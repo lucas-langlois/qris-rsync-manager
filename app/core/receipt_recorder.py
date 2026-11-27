@@ -2,7 +2,7 @@
 
 The receipt lives in a hidden ``.qris-receipts`` folder inside the folder that
 was synced: locally, and for completed uploads also on QRIScloud. Paths in the
-receipt are relative to that synced folder, so ``sha256sum -c`` works from it
+receipt are relative to that synced folder, so ``md5sum -c`` works from it
 on either side. Downloads write locally only, keeping QRIScloud read-only.
 """
 
@@ -72,7 +72,7 @@ def hash_phase_now(
         if phase.collector is collector and phase.hashed is None:
             try:
                 phase.hashed = hash_transferred_files(
-                    collector.finish(),
+                    collector.checksums(),
                     phase.local_base,
                     phase.remote_base,
                     cancel_event=cancel_event,
@@ -127,13 +127,13 @@ def record_transfer_receipt(
     to QRIScloud; it is used only for completed uploads.
     """
     try:
-        names_by_phase = [[] if phase.hashed is not None else phase.collector.finish() for phase in plan.phases]
+        names_by_phase = [{} if phase.hashed is not None else phase.collector.checksums() for phase in plan.phases]
         if not any(names_by_phase) and not any(phase.hashed for phase in plan.phases):
             emit("No files were transferred, so no receipt was written.\n")
             return []
-        count = sum(len(names) for names in names_by_phase)
-        if count:
-            emit(f"Computing SHA-256 checksums of {count:,} transferred file(s) for the receipt...\n")
+        missing = sum(1 for names in names_by_phase for checksum in names.values() if not checksum)
+        if missing:
+            emit(f"Computing MD5 checksums of {missing:,} transferred file(s) rsync did not report...\n")
         files: list[ReceiptFile] = []
         for phase, names in zip(plan.phases, names_by_phase):
             hashed = phase.hashed
@@ -174,7 +174,7 @@ def record_transfer_receipt(
                 emit(f"Warning: the receipt could not be uploaded to QRIScloud: {exc}\n")
         elif plan.direction == "upload" and not completed:
             emit("The transfer did not complete, so the receipt was kept locally only.\n")
-        missing = sum(1 for item in files if item.sha256 is None)
+        missing = sum(1 for item in files if item.md5 is None)
         if missing:
             emit(f"Warning: {missing:,} file(s) could not be hashed; see the receipt for details.\n")
         return written
