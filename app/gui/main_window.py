@@ -54,6 +54,8 @@ from app.core.archive_upload import (
     UploadArchivePlan,
     UploadPackage,
     analyze_upload_tree,
+    ARCHIVE_TEMP_RESERVE_BYTES,
+    NotEnoughTempSpace,
     plan_archive_batches,
     required_temp_bytes,
     prepare_upload_package,
@@ -533,10 +535,17 @@ class PackagedUploadWorker(QObject):
         batch_plan = plan_archive_batches(plan)
         queue = list(batch_plan.batches)
         self._emit(
-            f"Building {len(plan.groups):,} TAR archive(s) in {len(queue):,} batch(es), "
-            f"temporary folder in {batch_plan.work_parent}. Source files will not be changed; "
-            "press Stop to cancel.\n"
+            f"Building {len(plan.groups):,} TAR archive(s) one batch at a time ({len(queue):,} batch(es)), "
+            f"each deleted before the next. Temporary folder in {batch_plan.work_parent}. "
+            "Source files will not be changed; press Stop to cancel.\n"
         )
+        for group in batch_plan.too_big:
+            skipped.append(f"{group.folder} ({group.archive_name})")
+            self._emit(
+                f"Skipped {group.folder / group.archive_name}: it needs about "
+                f"{format_bytes(required_temp_bytes([group]))} of temporary space, but only "
+                f"{format_bytes(max(0, batch_plan.room))} can be used in {batch_plan.work_parent}.\n"
+            )
         batch_number = 0
         while queue:
             if self._cancelled.is_set():
@@ -555,6 +564,12 @@ class PackagedUploadWorker(QObject):
                 )
             except ArchiveCancelled:
                 raise
+            except NotEnoughTempSpace as exc:
+                # Someone else filled the drive since the plan was made.
+                for folder in batch.folders:
+                    skipped.append(str(folder.folder))
+                self._emit(f"Skipped {len(batch.folders):,} folder(s): {exc}\n")
+                continue
             except (RuntimeError, ValueError) as exc:
                 # A file changed while its archive was being written: rare, so
                 # retry this batch folder by folder and skip only that folder.
@@ -619,7 +634,8 @@ class PackagedUploadWorker(QObject):
                         self._emit(cleanup_error + "\n")
         if skipped:
             self._emit(
-                f"{len(skipped):,} folder(s) changed during the upload and were not archived:\n"
+                f"{len(skipped):,} folder(s) were not archived (changed during the upload, or not enough "
+                "temporary space):\n"
                 + "".join(f"  {folder}\n" for folder in skipped[:20])
                 + "Run Synchronise later to upload them.\n"
             )
@@ -3759,12 +3775,20 @@ class MainWindow(QMainWindow):
             batch_plan = plan_archive_batches(archive_plan)
         except OSError:
             return total
-        largest = max((batch.archived_bytes for batch in batch_plan.batches), default=0)
-        return (
-            f"{total} They are built and uploaded in {len(batch_plan.batches):,} batch(es) after the other "
-            f"files, each deleted once sent. Temporary space needed: about {format_bytes(required_temp_bytes(largest))} "
-            f"in {batch_plan.work_parent}."
+        largest = max((required_temp_bytes(batch.groups) for batch in batch_plan.batches), default=0)
+        text = (
+            f"{total} After the other files, they are built and uploaded one batch at a time "
+            f"({len(batch_plan.batches):,} batch(es)), each deleted before the next. Temporary space used at most: "
+            f"about {format_bytes(largest)} in {batch_plan.work_parent}; "
+            f"{format_bytes(ARCHIVE_TEMP_RESERVE_BYTES)} is always left free there."
         )
+        if batch_plan.too_big:
+            text += (
+                f"\n{len(batch_plan.too_big):,} archive part(s) are too big for the free space there and will be "
+                "skipped and listed in the log, for example: "
+                + ", ".join(group.archive_name for group in batch_plan.too_big[:3])
+            )
+        return text
 
     def _start_resolved_rsync(
         self,

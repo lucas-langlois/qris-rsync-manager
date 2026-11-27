@@ -31,24 +31,23 @@ def is_link_or_junction(info: os.stat_result) -> bool:
     return not tag or bool(tag & REPARSE_TAG_NAME_SURROGATE)
 
 
+# Hidden folders the app builds archives in (".<folder>.qris-upload-xxxx").
+APP_WORK_FOLDER_MARKER = ".qris-upload-"
+APP_WORK_FOLDER_PATTERN = f".*{APP_WORK_FOLDER_MARKER}*"
+
+
 def is_windows_system_folder(name: str) -> bool:
     return name.casefold() in _WINDOWS_SYSTEM_FOLDER_KEYS
 
 
-def is_network_path(path: str | Path) -> bool:
-    """True for UNC paths and mapped network drives such as L:."""
-    text = str(path)
-    if text.startswith(("\\\\", "//")):
-        return True
-    if os.name != "nt" or len(text) < 2 or text[1] != ":":
-        return False
-    import ctypes
+def is_app_work_folder(name: str) -> bool:
+    return name.startswith(".") and APP_WORK_FOLDER_MARKER in name
 
-    DRIVE_REMOTE = 4
-    try:
-        return ctypes.windll.kernel32.GetDriveTypeW(f"{text[0]}:\\") == DRIVE_REMOTE
-    except (AttributeError, OSError):
-        return False
+
+def is_excluded_folder_name(name: str) -> bool:
+    """Folders never scanned or uploaded: file-server system folders and the
+    app's own temporary archive folders (which may sit inside the source)."""
+    return is_windows_system_folder(name) or is_app_work_folder(name)
 
 
 APP_DIR_NAME = "QRISRsyncManager"

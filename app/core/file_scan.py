@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from .paths import is_link_or_junction, is_windows_system_folder
+from .paths import is_excluded_folder_name, is_link_or_junction
 
 
 HIGH_FILE_COUNT = 100_000
@@ -107,7 +107,7 @@ def scan_folder(
                     if _is_reparse_point(stat):
                         pass
                     elif _is_directory(entry.path, stat):
-                        if not is_windows_system_folder(entry.name):
+                        if not is_excluded_folder_name(entry.name):
                             pending.append(Path(entry.path))
                     elif _is_regular_file(stat):
                         result.file_count += 1

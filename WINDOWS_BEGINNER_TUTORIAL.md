@@ -405,7 +405,7 @@ In a qualifying folder, every file of the qualifying type goes into one archive,
 **Illustrative example:** a folder named `Dive photos` with 300 JPEG photos can produce `Dive photos.tar` and `Dive photos.tar.inventory.txt`. If that folder also held 80 `.json` files, they would go into the same `Dive photos.tar`. The inventory is a readable list of filenames, sizes, and modification times. Use the actual names shown in the app's archive plan; long or unusual folder names can be adjusted. If a folder's archive would be larger than 50 GB, the app splits it into numbered parts, such as `Dive photos.part01.tar` and `Dive photos.part02.tar`, and each part gets its own inventory.
 
 1. Read the proposed archive list in the confirmation before agreeing.
-2. Check the temporary space. Archives are built and uploaded in batches of about 100 GB, and each batch is deleted once it is on QRIScloud. For a folder on a network drive (such as `L:`), batches are built on your computer if it has room; otherwise they are built beside the source folder. A TAR is not a compressed space-saving backup.
+2. Check the temporary space. Archives are built on the same drive as the source folder, one batch at a time (up to 20 GB, or one bigger archive part), and each batch is deleted before the next. 5 GB is always left free for other people using the drive; an archive too big for the free space is skipped and listed in the Log. A TAR is not a compressed space-saving backup.
 3. Leave the source data alone until the operation completes.
 4. After upload, expect the TAR and inventory on QRIScloud rather than separate copies of those archived originals. The source files on your computer remain unchanged.
 
@@ -502,7 +502,7 @@ Read the **first specific error** in the Log as well as the final exit code. A n
 | Server key changed / host identification warning | Stop and ask IT or QRIScloud to verify the change. Do not erase trust files or disable the check to make it go away. |
 | Transfer button is disabled | Wait for the active operation to finish. For **Selected items**, select supported items in the correct pane. |
 | Files appear in the wrong folder | Check both Path boxes and the upload/download examples in step 10 before repeating the transfer. |
-| Not enough disk space during packaging | Archives are built in batches of about 100 GB. Free some space on your C: drive (for a source on a network drive) or on the source drive. |
+| Log says an archive was skipped for lack of space | Archives are built on the source drive, one at a time, and parts can be up to 50 GB. Free some space on that drive, then run **Synchronise…** to send what was skipped. |
 | Backing up a large shared workspace | Upload one top-level folder at a time. To resume or refresh it later, use **Synchronise…**, which skips archives already up to date. |
 | Upload reports quota or too many files | Contact the collection owner/support. Group suitable files into archives; do not delete shared files to make room without agreement. |
 | Log warns that the receipt could not be saved or uploaded | The transfer itself still completed. Check that you can write to the local folder. Any copy reported as saved is still valid. |

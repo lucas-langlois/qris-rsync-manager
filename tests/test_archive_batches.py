@@ -7,12 +7,15 @@ from pathlib import Path
 
 import app.core.archive_upload as archive_upload
 from app.core.archive_upload import (
+    ARCHIVE_TEMP_RESERVE_BYTES,
+    required_temp_bytes,
     analyze_upload_tree,
     plan_archive_batches,
     prepare_upload_package,
     split_batch_by_folder,
 )
 from app.core.profiles import Profile
+from app.core.rsync_command import build_rsync_command
 from app.core.receipt_recorder import ReceiptPlan, hash_phase_now, record_transfer_receipt
 from app.gui.main_window import PackagedUploadWorker
 
@@ -40,33 +43,65 @@ def _free(monkeypatch, by_drive: dict[str, int]) -> None:
 def test_batches_hold_whole_parts_and_cover_every_archive(tmp_path, monkeypatch) -> None:
     plan = analyze_upload_tree(_tree(tmp_path), min_same_type=1)
     _free(monkeypatch, {str(tmp_path)[:1].upper(): 1000 * GB})
+    two = required_temp_bytes(plan.groups[:2])
 
-    batches = plan_archive_batches(plan, batch_bytes=60).batches
+    batch_plan = plan_archive_batches(plan, batch_bytes=two)
 
-    assert [len(batch.groups) for batch in batches] == [2, 1]
-    assert [g.archive_name for b in batches for g in b.groups] == [g.archive_name for g in plan.groups]
+    assert [len(batch.groups) for batch in batch_plan.batches] == [2, 1]
+    assert [g.archive_name for b in batch_plan.batches for g in b.groups] == [g.archive_name for g in plan.groups]
+    assert batch_plan.too_big == ()
 
 
-def test_network_source_builds_on_local_temp_when_it_has_room(tmp_path, monkeypatch) -> None:
+def test_archives_are_built_beside_the_source_or_inside_it_when_the_parent_is_read_only(tmp_path, monkeypatch) -> None:
     plan = analyze_upload_tree(_tree(tmp_path), min_same_type=1)
-    monkeypatch.setattr(archive_upload, "is_network_path", lambda _path: True)
-    local = Path("Z:/temp")
-    _free(monkeypatch, {"Z": 50 * GB, str(tmp_path)[:1].upper(): 1000 * GB})
+    assert plan_archive_batches(plan).work_parent == plan.root.parent
 
-    batch_plan = plan_archive_batches(plan, local_temp=local)
-
-    assert batch_plan.work_parent == local
-    assert len(batch_plan.batches) == 1
+    monkeypatch.setattr(archive_upload, "_is_writable_folder", lambda folder: folder != plan.root.parent)
+    assert plan_archive_batches(plan).work_parent == plan.root
 
 
-def test_network_source_falls_back_beside_source_when_local_temp_is_full(tmp_path, monkeypatch) -> None:
+def test_parts_too_big_for_the_free_space_are_skipped_not_fatal(tmp_path, monkeypatch) -> None:
     plan = analyze_upload_tree(_tree(tmp_path), min_same_type=1)
-    monkeypatch.setattr(archive_upload, "is_network_path", lambda _path: True)
-    _free(monkeypatch, {"Z": 1 * GB, str(tmp_path)[:1].upper(): 1000 * GB})
+    # Room for one part only, after the reserve that stays free for colleagues.
+    room = required_temp_bytes(plan.groups[:1])
+    _free(monkeypatch, {str(tmp_path)[:1].upper(): ARCHIVE_TEMP_RESERVE_BYTES + room})
+    monkeypatch.setattr(archive_upload, "required_temp_bytes",
+                        lambda groups: sum(g.member_bytes for g in groups) * (10 ** 9 if any(
+                            g.relative_folder == "site2" for g in groups) else 1))
 
-    batch_plan = plan_archive_batches(plan, local_temp=Path("Z:/temp"))
+    batch_plan = plan_archive_batches(plan)
 
-    assert batch_plan.work_parent == plan.root.parent
+    assert [group.relative_folder for group in batch_plan.too_big] == ["site2"]
+    assert sorted(g.relative_folder for b in batch_plan.batches for g in b.groups) == ["site0", "site1"]
+
+
+def test_work_folder_inside_the_source_is_never_scanned_or_uploaded(tmp_path) -> None:
+    from app.core.file_scan import scan_folder
+
+    root = _tree(tmp_path, folders=1)
+    work = root / ".share.qris-upload-1234abcd" / "payload"
+    work.mkdir(parents=True)
+    (work / "site0.tar").write_bytes(b"tar")
+
+    assert scan_folder(root).file_count == 3
+    assert analyze_upload_tree(root, min_same_type=1).scan.file_count == 3
+    command = build_rsync_command(Profile(username="u", host="h", collection_id="Q1"), root, remote_path="/data/Q1")
+    assert "--exclude=.*.qris-upload-*/" in command
+
+
+def test_work_folder_creation_does_not_retry_on_access_denied(tmp_path, monkeypatch) -> None:
+    calls: list[str] = []
+
+    def denied(path, *args, **kwargs):
+        calls.append(path)
+        raise PermissionError(13, "Access is denied")
+
+    monkeypatch.setattr(archive_upload.os, "mkdir", denied)
+    import pytest
+
+    with pytest.raises(PermissionError):
+        archive_upload._make_work_dir(tmp_path, ".x.qris-upload-")
+    assert len(calls) == 1
 
 
 def test_batch_with_some_parts_of_a_folder_builds(tmp_path) -> None:

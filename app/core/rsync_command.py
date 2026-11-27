@@ -9,6 +9,7 @@ from .paths import (
     file_source_for_rsync,
     path_for_rsync,
     WINDOWS_SYSTEM_FOLDER_NAMES,
+    APP_WORK_FOLDER_PATTERN,
     ssh_host_key_options,
 )
 from .profiles import Profile
@@ -153,6 +154,8 @@ def build_rsync_command(
     if direction == "upload":
         # File-server system folders are unreadable and never research data.
         command.extend(f"--exclude={name}/" for name in WINDOWS_SYSTEM_FOLDER_NAMES)
+        # The app's own temporary archive folder, when it is inside the source.
+        command.append(f"--exclude={APP_WORK_FOLDER_PATTERN}/")
     if files_from:
         command.append(f"--files-from={path_for_rsync(files_from, clean.rsync_path)}")
     if exclude_from:

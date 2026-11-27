@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from hashlib import sha256
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -21,8 +22,8 @@ from .paths import (
     detect_tar,
     is_executable_file,
     is_link_or_junction,
-    is_network_path,
-    is_windows_system_folder,
+    APP_WORK_FOLDER_MARKER,
+    is_excluded_folder_name,
 )
 from .receipts import RECEIPT_DIR_NAME
 
@@ -34,11 +35,15 @@ ARCHIVE_MIN_SAME_TYPE = 50
 # inventory. Smaller parts limit retry cost and tape-recall time on QRISdata.
 ARCHIVE_PART_BYTES = 50_000_000_000
 ARCHIVE_MAX_PARTS = 9_999
-# Archives are built and uploaded in batches of about this size, so a large
-# backup needs at most one batch of temporary space and starts sending early.
-ARCHIVE_BATCH_BYTES = 100_000_000_000
-# Space kept free on the temporary drive on top of each batch.
+# Archives are built and uploaded in batches of up to this size (or one bigger
+# archive part), each deleted before the next, so a large backup needs little
+# temporary space and starts sending early.
+ARCHIVE_BATCH_BYTES = 20_000_000_000
+# Always left free on the drive that holds the temporary archives, so a shared
+# drive never fills up for the people working on it.
 ARCHIVE_TEMP_RESERVE_BYTES = 5_000_000_000
+TAR_PER_FILE_BYTES = 1_536
+TAR_FIXED_BYTES = 64_000_000
 NATIVE_TAR_BLOCKING_FACTOR = 2048
 NATIVE_TAR_POLL_SECONDS = 0.2
 NATIVE_TAR_STOP_SECONDS = 5.0
@@ -219,7 +224,7 @@ def analyze_upload_tree(
                         # Links and junctions are left to rsync, as in scan_folder.
                         pass
                     elif stat_module.S_ISDIR(info.st_mode):
-                        if entry.name != RECEIPT_DIR_NAME and not is_windows_system_folder(entry.name):
+                        if entry.name != RECEIPT_DIR_NAME and not is_excluded_folder_name(entry.name):
                             pending.append(Path(entry.path))
                     elif stat_module.S_ISREG(info.st_mode):
                         snapshot = FileSnapshot(Path(entry.path), info.st_size, info.st_mtime_ns)
@@ -314,15 +319,15 @@ def prepare_upload_package(
             )
     source_parent = work_parent or default_work_parent(plan.root)
     if build_archives:
-        required = required_temp_bytes(plan.archived_bytes)
+        required = required_temp_bytes(plan.groups)
         free = shutil.disk_usage(source_parent).free
         if free < required:
-            raise OSError(
+            raise NotEnoughTempSpace(
                 f"Not enough temporary disk space in {source_parent}. "
                 f"Required about {required:,} bytes; available {free:,} bytes."
             )
 
-    work_dir = Path(tempfile.mkdtemp(prefix=_work_directory_prefix(plan.root), dir=source_parent))
+    work_dir = _make_work_dir(source_parent, _work_directory_prefix(plan.root))
     payload_dir = work_dir / "payload"
     exclude_file = work_dir / "archived-files.exclude"
     payload_dir.mkdir()
@@ -574,54 +579,64 @@ def subset_upload_plan(plan: UploadArchivePlan, relative_folders: set[str]) -> U
     )
 
 
-def required_temp_bytes(archived_bytes: int) -> int:
-    """Temporary space needed to build archives holding *archived_bytes*."""
-    return archived_bytes + max(1_073_741_824, archived_bytes // 20)
+def required_temp_bytes(groups) -> int:
+    """Temporary space to build these archive parts: the tar size plus a margin.
+
+    A tar adds one 512-byte header per file (two for long or non-ASCII names)
+    and pads each file to 512 bytes.
+    """
+    return sum(group.member_bytes + group.member_count * TAR_PER_FILE_BYTES for group in groups) + TAR_FIXED_BYTES
+
+
+class NotEnoughTempSpace(OSError):
+    """The temporary folder no longer has room for a batch."""
 
 
 @dataclass(frozen=True)
 class ArchiveBatchPlan:
-    """Where to build archives, and the batches to build and upload in turn."""
+    """Where to build archives, the batches to build and upload in turn, and
+    the archive parts too big for the free space (they are skipped)."""
 
     work_parent: Path
     batches: tuple[UploadArchivePlan, ...]
+    too_big: tuple[ArchiveGroupPlan, ...] = ()
+    room: int = 0
 
 
 def plan_archive_batches(
     plan: UploadArchivePlan,
     *,
     batch_bytes: int = ARCHIVE_BATCH_BYTES,
-    local_temp: str | Path | None = None,
 ) -> ArchiveBatchPlan:
-    """Split *plan* into upload batches and choose the temporary folder.
+    """Split *plan* into upload batches built one at a time on the source drive.
 
-    Archives for a source on a network share are built on this computer's
-    temporary drive when it has room for the largest archive part: that avoids
-    writing every archive back to the share and reading it again to upload.
-    Otherwise they are built beside the source folder, as before. Each batch
-    holds whole archive parts and fits the free space with a reserve.
+    Archives are built beside the source folder, or inside it when the parent
+    is read-only (such as the root of a mapped share). Each batch is uploaded
+    and deleted before the next is built, so at most one batch (normally
+    about 20 GB, or one bigger archive part) uses space at a time, and
+    ``ARCHIVE_TEMP_RESERVE_BYTES`` always stays free for other people using
+    the drive. A part that cannot fit at all is listed in ``too_big``.
     """
-    groups = [(folder, group) for folder in plan.folders for group in folder.groups]
-    if not groups:
-        return ArchiveBatchPlan(default_work_parent(plan.root), ())
-    largest = max(group.member_bytes for _folder, group in groups)
-    work_parent = default_work_parent(plan.root)
-    if is_network_path(plan.root):
-        local = Path(local_temp or tempfile.gettempdir())
-        if _free_bytes(local) - ARCHIVE_TEMP_RESERVE_BYTES >= required_temp_bytes(largest):
-            work_parent = local
+    work_parent = choose_work_parent(plan.root)
     room = _free_bytes(work_parent) - ARCHIVE_TEMP_RESERVE_BYTES
-    budget = max(largest, min(batch_bytes, int(room / 1.05) - 1_073_741_824))
-
+    limit = max(0, min(batch_bytes, room))
     batches: list[list[tuple[EligibleFolderPlan, ArchiveGroupPlan]]] = [[]]
-    size = 0
-    for folder, group in groups:
-        if batches[-1] and size + group.member_bytes > budget:
-            batches.append([])
-            size = 0
-        batches[-1].append((folder, group))
-        size += group.member_bytes
-    return ArchiveBatchPlan(work_parent, tuple(_plan_from_groups(plan, batch) for batch in batches))
+    too_big: list[ArchiveGroupPlan] = []
+    for folder in plan.folders:
+        for group in folder.groups:
+            if required_temp_bytes([group]) > room:
+                too_big.append(group)
+                continue
+            current = [item for _folder, item in batches[-1]]
+            if current and required_temp_bytes(current + [group]) > limit:
+                batches.append([])
+            batches[-1].append((folder, group))
+    return ArchiveBatchPlan(
+        work_parent,
+        tuple(_plan_from_groups(plan, batch) for batch in batches if batch),
+        tuple(too_big),
+        room,
+    )
 
 
 def split_batch_by_folder(batch: UploadArchivePlan) -> list[UploadArchivePlan]:
@@ -629,9 +644,54 @@ def split_batch_by_folder(batch: UploadArchivePlan) -> list[UploadArchivePlan]:
     return [replace(batch, folders=[folder]) for folder in batch.folders]
 
 
+def choose_work_parent(root: Path) -> Path:
+    """The folder beside *root* when writable, else *root* itself.
+
+    The parent of a top-level folder on a share is often the read-only share
+    root. A work folder inside *root* is hidden and never scanned or uploaded
+    (``is_app_work_folder``).
+    """
+    parent = root.parent
+    if parent != root and _is_writable_folder(parent):
+        return parent
+    return root
+
+
 def default_work_parent(root: Path) -> Path:
     parent = root.parent
     return Path(tempfile.gettempdir()).resolve() if parent == root else parent
+
+
+def _is_writable_folder(folder: Path) -> bool:
+    probe = folder / f".qris-write-check-{uuid.uuid4().hex}"
+    try:
+        os.mkdir(_windows_io_path(probe))
+    except OSError:
+        return False
+    try:
+        os.rmdir(_windows_io_path(probe))
+    except OSError:
+        pass
+    return True
+
+
+def _make_work_dir(parent: Path, prefix: str) -> Path:
+    """Create a unique work folder.
+
+    Not ``tempfile.mkdtemp``: on Windows it treats "access denied" as a name
+    clash and retries 10,000 times, which looks like a hang on a read-only
+    network folder.
+    """
+    for _attempt in range(5):
+        candidate = parent / f"{prefix}{uuid.uuid4().hex[:8]}"
+        try:
+            os.mkdir(_windows_io_path(candidate))
+            return candidate
+        except FileExistsError:
+            continue
+        except PermissionError as exc:
+            raise PermissionError(f"Cannot create a temporary folder in {parent}: {exc}") from exc
+    raise FileExistsError(f"Could not create a unique temporary folder in {parent}.")
 
 
 def _plan_from_groups(
@@ -913,7 +973,7 @@ def _work_directory_prefix(root: Path) -> str:
     label = root.name or "upload"
     if len(label) > 48:
         label = f"{label[:31]}-{sha256(label.encode('utf-8')).hexdigest()[:16]}"
-    return f".{label}.qris-upload-"
+    return f".{label}{APP_WORK_FOLDER_MARKER}"
 
 
 def _archive_basename(name: str) -> str:

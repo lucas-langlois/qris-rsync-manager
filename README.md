@@ -271,15 +271,18 @@ already compressed, the app uses `.tar` rather than `.tar.gz` to avoid costly
 compression with little storage benefit.
 
 A real upload sends the loose (non-archived) files first. It then builds and
-uploads the archives in batches of about 100 GB, deleting each batch once it is
-on QRIScloud. So a large backup needs temporary space for one batch, not for
-every archive, and the first archives go up early.
+uploads the archives one batch at a time: up to 20 GB of small archives, or
+one bigger archive part. Each batch is uploaded and deleted before the next is
+built, so a multi-TB backup needs little temporary space.
 
-- **Where batches are built.** When the source is on a network share (a mapped
-  drive such as `L:` or a `\\server\share` path), batches are built on this
-  computer's temporary folder if it has room for the largest archive part.
-  This avoids writing every archive back to the share and reading it again.
-  Otherwise they are built beside the source folder.
+- **Where batches are built.** Beside the source folder, on the same drive. If
+  that folder is read-only (for example the root of a mapped share such as
+  `L:\`), they are built in a hidden `.<folder>.qris-upload-…` folder inside the
+  source, which is never scanned or uploaded.
+- **Free space for colleagues.** 5 GB is always left free on that drive. An
+  archive part too big for the free space (parts can be up to 50 GB) is skipped
+  and listed in the log, and the rest carries on. Free some space and run
+  **Synchronise…** later to send it.
 - **Folders that change.** If someone changes files in a folder while the upload
   runs, that folder's archive is skipped and listed in the log, and the rest
   carries on. The upload then ends with rsync code 23. Run **Synchronise…**

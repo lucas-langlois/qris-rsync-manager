@@ -18,13 +18,17 @@ deduplication, and makes very large backups safer and lighter on disk space.
 
 ## Large backups
 
-- **Archives are built and uploaded in batches** of about 100 GB, after the
-  loose files. Each batch is deleted once it is on QRIScloud, so a multi-TB
-  backup needs temporary space for one batch, not all of them, and archives
-  start uploading early.
-- **Less network traffic for network shares.** For a source on a network
-  drive, batches are built on this computer when there is room, instead of
-  being written back to the share and read again.
+- **Archives are built and uploaded one batch at a time** after the loose
+  files: up to 20 GB of small archives, or one bigger archive part. Each batch
+  is deleted before the next is built, so a multi-TB backup needs little
+  temporary space. Before, every archive was built first (1.5 TB for one real
+  share).
+- **Works from the top of a share.** Batches are built beside the source
+  folder, or in a hidden folder inside it when the parent is read-only, as the
+  root of `L:` is. Before, the app could seem to hang there.
+- **Leaves room for colleagues.** 5 GB is always left free on the drive. An
+  archive part too big for the free space is skipped and listed in the log
+  instead of stopping the upload.
 - **A share in use no longer stops the whole upload.** A folder whose files
   change during the upload is skipped and listed in the log, and the rest
   carries on. Files that vanish or cannot be read during the loose-file phase
