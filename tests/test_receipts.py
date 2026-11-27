@@ -364,4 +364,6 @@ def test_real_rsync_upload_output_gives_the_receipt_true_md5s(tmp_path: Path) ->
     collector.feed(output)
 
     assert collector.checksums() == {
-        "big.bin": hashlib.md5((source / "big.bin").read_
+        "big.bin": hashlib.md5((source / "big.bin").read_bytes()).hexdigest(),
+        "sub/a file.txt": hashlib.md5(b"hello\n").hexdigest(),
+    }
