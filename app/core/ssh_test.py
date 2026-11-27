@@ -79,8 +79,13 @@ def run_ssh_test(
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _stop_process(process)
-                process.communicate()
-                return CommandResult(124, f"SSH test timed out after {timeout} seconds.")
+                partial, _ = process.communicate()
+                # Keep what ssh printed: it shows where the connection stalled.
+                lines = [line for line in (partial or "").splitlines() if line.strip()]
+                detail = ("\nssh said:\n" + "\n".join(lines[-8:])) if lines else (
+                    "\nssh printed nothing: the connection or DNS lookup probably never completed."
+                )
+                return CommandResult(124, f"SSH test timed out after {timeout} seconds.{detail}")
             try:
                 output, _ = process.communicate(timeout=min(0.2, remaining))
                 return CommandResult(process.returncode, output)
