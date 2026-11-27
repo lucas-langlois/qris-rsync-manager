@@ -89,18 +89,18 @@ def test_qualifying_type_and_named_companions_share_one_archive(tmp_path: Path) 
     plan = analyze_upload_tree(root, min_same_type=2)
 
     assert [(group.archive_name, group.category, group.media_count, group.member_count) for group in plan.groups] == [
-        ("survey.tar", "jpg", 3, 4),
+        ("survey_jpg.tar", "jpg", 3, 4),
     ]
     package = build_upload_package(plan)
     try:
-        with tarfile.open(package.payload_dir / "survey.tar") as archive:
+        with tarfile.open(package.payload_dir / "survey_jpg.tar") as archive:
             assert archive.getnames() == ["station00.jpg", "station00.xmp", "station01.jpg", "station02.jpg"]
 
         assert _excluded(package.exclude_file, "/station00.xmp")
         assert not _excluded(package.exclude_file, "/transect01.mp4")
         assert not _excluded(package.exclude_file, "/field-notes.txt")
 
-        inventory = (package.payload_dir / "survey.tar.inventory.txt").read_text(encoding="utf-8")
+        inventory = (package.payload_dir / "survey_jpg.tar.inventory.txt").read_text(encoding="utf-8")
         assert "# types: jpg" in inventory
         assert "filename\tbytes\tmodified_utc" in inventory
         assert "station00.xmp" in inventory
@@ -119,7 +119,7 @@ def test_native_tar_handles_unicode_spaces_and_leading_dash_names(tmp_path: Path
 
     package = build_upload_package(plan)
     try:
-        with tarfile.open(package.payload_dir / "survey.tar") as archive:
+        with tarfile.open(package.payload_dir / "survey_jpg.tar") as archive:
             assert archive.getnames() == ["-leading.jpg", "café photo.jpg", "ordinary.jpg"]
     finally:
         package.cleanup()
@@ -223,7 +223,7 @@ def test_qualifying_nested_folder_preserves_remote_relative_path(tmp_path: Path)
     plan = analyze_upload_tree(root, min_same_type=1)
     package = build_upload_package(plan)
     try:
-        assert (package.payload_dir / "camera A" / "camera A.tar").is_file()
+        assert (package.payload_dir / "camera A" / "camera A_jpg.tar").is_file()
         assert _excluded(package.exclude_file, "/camera A/one.jpg")
     finally:
         package.cleanup()
@@ -410,8 +410,8 @@ def test_package_writes_inventory_beyond_windows_max_path(tmp_path: Path) -> Non
 
     package = build_upload_package(plan)
     try:
-        inventory = package.payload_dir / long_folder.name / f"{long_folder.name}.tar.inventory.txt"
-        archive = package.payload_dir / long_folder.name / f"{long_folder.name}.tar"
+        inventory = package.payload_dir / long_folder.name / f"{long_folder.name}_jpg.tar.inventory.txt"
+        archive = package.payload_dir / long_folder.name / f"{long_folder.name}_jpg.tar"
         assert len(str(inventory)) > 260
         assert len(str(archive)) > 260
         with open(_windows_io_path(inventory), encoding="utf-8") as inventory_file:
@@ -433,7 +433,7 @@ def test_small_archive_keeps_single_unnumbered_name(tmp_path: Path) -> None:
     plan = analyze_upload_tree(root, min_same_type=1, max_part_bytes=10)
 
     assert [(group.archive_name, group.part_number, group.part_count) for group in plan.groups] == [
-        ("survey.tar", 1, 1),
+        ("survey_jpg.tar", 1, 1),
     ]
 
 
@@ -448,16 +448,16 @@ def test_large_archive_splits_into_parts_with_their_own_inventories(tmp_path: Pa
     plan = analyze_upload_tree(root, min_same_type=1, max_part_bytes=11)
 
     assert [(group.archive_name, group.part_number, group.part_count, group.member_count) for group in plan.groups] == [
-        ("survey.part01.tar", 1, 3, 2),
-        ("survey.part02.tar", 2, 3, 1),
-        ("survey.part03.tar", 3, 3, 1),
+        ("survey_jpg.part01.tar", 1, 3, 2),
+        ("survey_jpg.part02.tar", 2, 3, 1),
+        ("survey_jpg.part03.tar", 3, 3, 1),
     ]
     package = build_upload_package(plan)
     try:
         expected = {
-            "survey.part01.tar": ["a.jpg", "a.xmp"],
-            "survey.part02.tar": ["b.jpg"],
-            "survey.part03.tar": ["c.jpg"],
+            "survey_jpg.part01.tar": ["a.jpg", "a.xmp"],
+            "survey_jpg.part02.tar": ["b.jpg"],
+            "survey_jpg.part03.tar": ["c.jpg"],
         }
         for archive_name, names in expected.items():
             with tarfile.open(package.payload_dir / archive_name) as archive:
@@ -485,8 +485,8 @@ def test_parts_keep_sidecars_with_media_and_oversized_units_alone() -> None:
     groups = _group_snapshots(Path("root"), folder, snapshots, max_part_bytes=10, min_same_type=1)
 
     assert [(group.archive_name, group.member_count, group.member_bytes, group.media_count) for group in groups] == [
-        ("cam.part01.tar", 2, 101, 1),
-        ("cam.part02.tar", 2, 3, 1),
+        ("cam_mp4.part01.tar", 2, 101, 1),
+        ("cam_mp4.part02.tar", 2, 3, 1),
     ]
 
 
@@ -511,7 +511,7 @@ def test_several_qualifying_types_share_one_folder_archive() -> None:
     groups = _group_snapshots(Path("root"), folder, snapshots, min_same_type=2)
 
     assert [(group.archive_name, group.category, group.member_count) for group in groups] == [
-        ("cam.tar", "csv, png", 6),
+        ("cam_csv_png.tar", "csv, png", 6),
     ]
 
 

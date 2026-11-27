@@ -124,7 +124,7 @@ def test_local_scan_groups_archive_members(tmp_path: Path) -> None:
     assert len(scan.archives) == 1
     archive = scan.archives[0]
     assert archive.relative_folder == "photos" and archive.member_count == 60
-    assert archive.parts[0].archive_name == "photos.tar"
+    assert archive.parts[0].archive_name == "photos_jpg.tar"
 
 
 def test_archive_folder_is_one_row_until_uploaded(tmp_path: Path) -> None:
@@ -165,9 +165,9 @@ def test_changed_member_makes_the_archive_out_of_date(tmp_path: Path) -> None:
     scan = scan_local_for_sync(root)
     part = scan.archives[0].parts[0]
     remote = {
-        "photos/photos.tar": FileRecord("photos/photos.tar", 99_999, part.modified),
-        "photos/photos.tar.inventory.txt": FileRecord(
-            "photos/photos.tar.inventory.txt", part.inventory_size, part.modified
+        "photos/photos_jpg.tar": FileRecord("photos/photos_jpg.tar", 99_999, part.modified),
+        "photos/photos_jpg.tar.inventory.txt": FileRecord(
+            "photos/photos_jpg.tar.inventory.txt", part.inventory_size, part.modified
         ),
     }
     (root / "photos" / "IMG_0003.jpg").write_bytes(b"changed and longer")
@@ -266,3 +266,38 @@ def test_filter_and_ticked_only() -> None:
     dialog.proxy.set_ticked_only(True)
     assert dialog.proxy.rowCount() == sum(1 for item in dialog.plan.items if item.checked)
     dialog.close()
+
+
+def test_archive_uploaded_under_the_old_folder_only_name_counts_as_up_to_date(tmp_path: Path) -> None:
+    # Before v1.3.3 photos/ was archived as photos.tar; it must not be sent
+    # again as photos_jpg.tar.
+    root = _photo_folder(tmp_path)
+    scan = scan_local_for_sync(root)
+    part = scan.archives[0].parts[0]
+    assert (part.archive_name, part.legacy_archive_name) == ("photos_jpg.tar", "photos.tar")
+    remote = {
+        "notes.txt": scan.records["notes.txt"],
+        "photos/photos.tar": FileRecord("photos/photos.tar", 99_999, part.modified),
+        "photos/photos.tar.inventory.txt": FileRecord(
+            "photos/photos.tar.inventory.txt", part.legacy_inventory_size, part.modified
+        ),
+    }
+
+    plan = build_sync_plan(scan.records, remote, scan.archives)
+
+    assert plan.identical_archives == 1 and plan.items == []
+
+
+def test_archive_names_say_which_types_they_hold(tmp_path: Path) -> None:
+    from app.core.archive_upload import analyze_upload_tree
+
+    root = tmp_path / "PILOT"
+    root.mkdir()
+    for index in range(3):
+        (root / f"L{index}.txt").write_text("x", encoding="utf-8")
+        (root / f"R{index}").write_text("x", encoding="utf-8")
+    (root / "I79.TIF").write_bytes(b"tif")
+
+    names = [group.archive_name for group in analyze_upload_tree(root, min_same_type=2).groups]
+
+    assert names == ["PILOT_noext_txt.tar"]
