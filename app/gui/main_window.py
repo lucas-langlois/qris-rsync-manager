@@ -53,8 +53,10 @@ from app.core.archive_upload import (
     UploadArchivePlan,
     UploadPackage,
     analyze_upload_tree,
+    plan_archive_batches,
+    required_temp_bytes,
     prepare_upload_package,
-    revalidate_upload_plan,
+    split_batch_by_folder,
     subset_upload_plan,
 )
 from app.core.logging_utils import new_log_file
@@ -79,11 +81,12 @@ from app.core.profiles import (
 from app.core.progress import parse_rsync_progress
 from app.core.receipt_recorder import (
     ReceiptPlan,
+    hash_phase_now,
     record_transfer_receipt,
     upload_local_base,
     upload_receipt_roots,
 )
-from app.core.remote_dirs import RemoteDirectoryCache, RemoteEntry, build_list_remote_entries_command
+from app.core.remote_dirs import RemoteDirectoryCache, RemoteEntry, build_list_remote_entries_command, format_bytes
 from app.core.remote_ops import (
     build_remote_delete_command,
     build_remote_mkdir_command,
@@ -372,6 +375,10 @@ class PackagedUploadWorker(QObject):
     # and repeatedly retrying a rejected key can trigger QRIScloud throttling.
     RETRYABLE_RSYNC_EXIT_CODES = frozenset({10, 12, 30, 35})
     RETRY_DELAYS_SECONDS = (10, 30, 60)
+    # rsync 23 (some files unreadable) and 24 (files vanished, normal on a
+    # share in use) still let the archives go up; the final code reports it.
+    CONTINUE_AFTER_LOOSE_CODES = frozenset({0, 23, 24})
+    PARTIAL_TRANSFER_CODE = 23
 
     def __init__(
         self,
@@ -413,25 +420,21 @@ class PackagedUploadWorker(QObject):
             if self._available_profile() is None:
                 code = 130 if self._cancelled.is_set() else 124
                 return
-            self._emit(
-                "Preparing uncompressed TAR archives. Source files will not be changed; "
-                "press Stop to cancel.\n"
-            )
+            # Only the list of archived files is prepared here. Real archives
+            # are built and sent batch by batch after the loose files.
             package = prepare_upload_package(
                 self.plan,
                 cancel_event=self._cancelled,
                 progress_callback=lambda message: self._emit(message + "\n"),
-                build_archives=not self.dry_run,
+                build_archives=False,
                 include_source_directory=self.include_source_directory,
             )
             if self._cancelled.is_set():
                 code = 130
                 return
-            archive_count = len(package.planned_groups) if self.dry_run else package.archive_count
-            inventory_count = len(package.planned_groups) if self.dry_run else package.inventory_count
             self._emit(
-                f"{'Would create' if self.dry_run else 'Prepared'} {archive_count:,} TAR archive(s) and "
-                f"{inventory_count:,} inventory file(s).\n"
+                f"{'Would create' if self.dry_run else 'Will create'} {len(package.planned_groups):,} TAR archive(s), "
+                "each with an inventory file.\n"
             )
             if self.dry_run:
                 self._emit_planned_payload(package)
@@ -468,47 +471,26 @@ class PackagedUploadWorker(QObject):
                 log_file,
                 "Uploading non-archived files and folders",
             )
-            if code != 0:
-                return
             if self.dry_run:
                 # No TAR is materialised for comparisons: the loose dry-run
                 # covers retained files, while planned archive payload is logged.
-                code = 0
                 return
-            revalidate_upload_plan(self.plan, cancel_event=self._cancelled)
-            if self._cancelled.is_set():
-                code = 130
+            loose_code = code
+            if code not in self.CONTINUE_AFTER_LOOSE_CODES:
                 return
+            if code:
+                self._emit(
+                    f"Some loose files were not sent (rsync exit code {code}); "
+                    "continuing with the archives. See the log above.\n"
+                )
             payload_remote = (
                 f"{self.remote_path.rstrip('/')}/{self.plan.root.name}"
                 if self.include_source_directory
                 else self.remote_path
             )
-            if self._receipt_plan is not None:
-                self._collector = self._receipt_plan.add_phase(package.payload_dir, payload_remote)
-            code = self._run_transfer_with_retries(
-                lambda attempt_profile, is_retry: build_rsync_command(
-                    attempt_profile,
-                    package.payload_dir,
-                    remote_path=(
-                        f"{self.remote_path.rstrip('/')}/{self.plan.root.name}"
-                        if self.include_source_directory
-                        else self.remote_path
-                    ),
-                    dry_run=self.dry_run,
-                    ssh_path=self.ssh_path,
-                    batch_mode=not bool(self.passphrase),
-                    direction="upload",
-                    # TARs and inventories deliberately use source-derived mtimes.
-                    # They must be sent even if an older payload happens to match
-                    # their size and timestamp at the remote destination.
-                    ignore_times=True,
-                    resume_partial=is_retry,
-                    itemize=True,
-                ),
-                log_file,
-                "Uploading TAR archives and inventories",
-            )
+            code = self._upload_archives_in_batches(self.plan, payload_remote, log_file)
+            if code == 0:
+                code = loose_code
         except ArchiveCancelled:
             self._emit("Archive preparation was cancelled.\n")
             code = 130
@@ -519,24 +501,108 @@ class PackagedUploadWorker(QObject):
             # Hash before cleanup: the receipt includes the temporary TAR files.
             if self._receipt_plan is not None and self._last_attempt_profile is not None and log_file is not None:
                 self._write_receipt(code == 0, log_file)
-            should_cleanup_package = package is not None and (code in {0, 130} or self.dry_run)
-            if should_cleanup_package and package is not None:
+            if package is not None:
+                # Holds only the exclusion list; archive batches clean up after themselves.
                 cleanup_error = package.cleanup()
                 if cleanup_error:
-                    self._emit(cleanup_error + "\nPlease ask local IT to remove that folder after closing the app.\n")
-                    if code == 0:
-                        code = 1
-                else:
-                    self._emit("Removed temporary archive files.\n")
-            elif package is not None:
-                self._emit(
-                    "Packaged upload did not complete after automatic recovery attempts. "
-                    f"Temporary archive files were retained at: {package.work_dir}\n"
-                    "Keep this folder until the upload problem is resolved; it may use substantial disk space.\n"
-                )
+                    self._emit(cleanup_error + "\n")
             if log_file is not None and log_file.exists():
                 self.output.emit(f"\nLog saved to: {log_file}\n")
             self.finished.emit(code)
+
+    def _upload_archives_in_batches(self, plan: UploadArchivePlan, payload_remote: str, log_file: Path) -> int:
+        """Build and upload archives one batch at a time.
+
+        Each batch is removed once it is on QRIScloud, so a large backup needs
+        temporary space for one batch only, and a failure costs at most one
+        batch. A folder that changes while the upload runs (a live share) is
+        skipped and reported instead of stopping the whole upload.
+        """
+        batch_plan = plan_archive_batches(plan)
+        queue = list(batch_plan.batches)
+        self._emit(
+            f"Building {len(plan.groups):,} TAR archive(s) in {len(queue):,} batch(es), "
+            f"temporary folder in {batch_plan.work_parent}. Source files will not be changed; "
+            "press Stop to cancel.\n"
+        )
+        skipped: list[str] = []
+        batch_number = 0
+        while queue:
+            if self._cancelled.is_set():
+                return 130
+            batch = queue.pop(0)
+            try:
+                package = prepare_upload_package(
+                    batch,
+                    cancel_event=self._cancelled,
+                    progress_callback=lambda message: self._emit(message + "\n"),
+                    build_archives=True,
+                    include_source_directory=self.include_source_directory,
+                    work_parent=batch_plan.work_parent,
+                )
+            except ArchiveCancelled:
+                raise
+            except (RuntimeError, ValueError) as exc:
+                if len(batch.folders) > 1:
+                    queue[0:0] = split_batch_by_folder(batch)
+                    continue
+                skipped.append(str(batch.folders[0].folder))
+                self._emit(f"Skipped {batch.folders[0].folder}: {exc}\n")
+                continue
+            batch_number += 1
+            keep = False
+            try:
+                self._emit(
+                    f"Archive batch {batch_number}: uploading {package.archive_count:,} archive(s) "
+                    f"({format_bytes(batch.archived_bytes)}).\n"
+                )
+                if self._receipt_plan is not None:
+                    self._collector = self._receipt_plan.add_phase(package.payload_dir, payload_remote)
+                code = self._run_transfer_with_retries(
+                    lambda attempt_profile, is_retry: build_rsync_command(
+                        attempt_profile,
+                        package.payload_dir,
+                        remote_path=payload_remote,
+                        ssh_path=self.ssh_path,
+                        batch_mode=not bool(self.passphrase),
+                        direction="upload",
+                        # TARs and inventories deliberately use source-derived mtimes.
+                        # They must be sent even if an older payload happens to match
+                        # their size and timestamp at the remote destination.
+                        ignore_times=True,
+                        resume_partial=is_retry,
+                        itemize=True,
+                    ),
+                    log_file,
+                    "Uploading TAR archives and inventories",
+                )
+                if self._receipt_plan is not None and self._collector is not None:
+                    # Hash now: this batch's archives are deleted below.
+                    hash_phase_now(self._receipt_plan, self._collector, emit=self._emit, cancel_event=self._cancelled)
+                    self._collector = None
+                if code != 0:
+                    keep = code != 130
+                    if keep:
+                        self._emit(
+                            f"Archive batch {batch_number} did not upload. Its archives were kept at: "
+                            f"{package.work_dir}\nEarlier batches are on QRIScloud. Run Synchronise later "
+                            "to send what is missing.\n"
+                        )
+                    return code
+            finally:
+                if not keep:
+                    cleanup_error = package.cleanup()
+                    if cleanup_error:
+                        self._emit(cleanup_error + "\n")
+        if skipped:
+            self._emit(
+                f"{len(skipped):,} folder(s) changed during the upload and were not archived:\n"
+                + "".join(f"  {folder}\n" for folder in skipped[:20])
+                + "Run Synchronise later to upload them.\n"
+            )
+            return self.PARTIAL_TRANSFER_CODE
+        self._emit("All archives were uploaded and the temporary files removed.\n")
+        return 0
 
     def _available_profile(
         self,
@@ -699,9 +765,9 @@ class SyncUploadWorker(PackagedUploadWorker):
     """Upload the files ticked in the Synchronise window.
 
     Loose files go up as an exact ``--files-from`` list. Ticked archive
-    folders are packed into ``.tar`` archives first, exactly as a packaged
-    upload would pack them, and only those archives are sent. It reuses the
-    packaged upload's host checks, automatic retries and receipts.
+    folders are then packed into ``.tar`` archives batch by batch, exactly as
+    a packaged upload would pack them, and only those archives are sent. It
+    reuses the packaged upload's host checks, automatic retries and receipts.
     """
 
     def __init__(
@@ -729,7 +795,6 @@ class SyncUploadWorker(PackagedUploadWorker):
 
     @Slot()
     def run(self) -> None:
-        package: UploadPackage | None = None
         log_file: Path | None = None
         code = 1
         try:
@@ -738,20 +803,6 @@ class SyncUploadWorker(PackagedUploadWorker):
             if self._available_profile() is None:
                 code = 130 if self._cancelled.is_set() else 124
                 return
-            if self.archive_plan is not None and self.archive_plan.folders:
-                self._emit(
-                    "Packing ticked folders into uncompressed TAR archives. "
-                    "Source files will not be changed; press Stop to cancel.\n"
-                )
-                package = prepare_upload_package(
-                    self.archive_plan,
-                    cancel_event=self._cancelled,
-                    progress_callback=lambda message: self._emit(message + "\n"),
-                    build_archives=True,
-                )
-                if self._cancelled.is_set():
-                    code = 130
-                    return
             self._receipt_plan = ReceiptPlan("upload", self.local_root, self.remote_path)
             code = 0
             if self.loose_list is not None:
@@ -771,29 +822,14 @@ class SyncUploadWorker(PackagedUploadWorker):
                     log_file,
                     "Uploading ticked files",
                 )
-            if code != 0 or package is None:
+            if self.archive_plan is None or not self.archive_plan.folders:
                 return
-            revalidate_upload_plan(self.archive_plan, cancel_event=self._cancelled)
-            if self._cancelled.is_set():
-                code = 130
+            loose_code = code
+            if code not in self.CONTINUE_AFTER_LOOSE_CODES:
                 return
-            self._collector = self._receipt_plan.add_phase(package.payload_dir, self.remote_path)
-            code = self._run_transfer_with_retries(
-                lambda attempt_profile, is_retry: build_rsync_command(
-                    attempt_profile,
-                    package.payload_dir,
-                    remote_path=self.remote_path,
-                    ssh_path=self.ssh_path,
-                    batch_mode=not bool(self.passphrase),
-                    direction="upload",
-                    # Archives use source-derived mtimes; always send them.
-                    ignore_times=True,
-                    resume_partial=is_retry,
-                    itemize=True,
-                ),
-                log_file,
-                "Uploading TAR archives and inventories",
-            )
+            code = self._upload_archives_in_batches(self.archive_plan, self.remote_path, log_file)
+            if code == 0:
+                code = loose_code
         except ArchiveCancelled:
             self._emit("Archive preparation was cancelled.\n")
             code = 130
@@ -803,20 +839,6 @@ class SyncUploadWorker(PackagedUploadWorker):
         finally:
             if self._receipt_plan is not None and self._last_attempt_profile is not None and log_file is not None:
                 self._write_receipt(code == 0, log_file)
-            if package is not None:
-                if code in {0, 130}:
-                    cleanup_error = package.cleanup()
-                    if cleanup_error:
-                        self._emit(cleanup_error + "\n")
-                        if code == 0:
-                            code = 1
-                    else:
-                        self._emit("Removed temporary archive files.\n")
-                else:
-                    self._emit(
-                        "The upload did not complete. Temporary archive files were kept at: "
-                        f"{package.work_dir}\n"
-                    )
             if log_file is not None and log_file.exists():
                 self.output.emit(f"\nLog saved to: {log_file}\n")
             self.finished.emit(code)
@@ -3705,6 +3727,22 @@ class MainWindow(QMainWindow):
             selected_remote_files_from,
         )
 
+    @staticmethod
+    def _archive_batch_summary(archive_plan: UploadArchivePlan, dry_run: bool) -> str:
+        total = f"Archives hold {archive_plan.archived_file_count:,} files ({format_bytes(archive_plan.archived_bytes)})."
+        if dry_run:
+            return total + " A comparison does not build them."
+        try:
+            batch_plan = plan_archive_batches(archive_plan)
+        except OSError:
+            return total
+        largest = max((batch.archived_bytes for batch in batch_plan.batches), default=0)
+        return (
+            f"{total} They are built and uploaded in {len(batch_plan.batches):,} batch(es) after the other "
+            f"files, each deleted once sent. Temporary space needed: about {format_bytes(required_temp_bytes(largest))} "
+            f"in {batch_plan.work_parent}."
+        )
+
     def _start_resolved_rsync(
         self,
         profile: Profile,
@@ -3750,7 +3788,8 @@ class MainWindow(QMainWindow):
                 "The source folder will not be changed. Existing individual copies already on QRIScloud "
                 "will not be deleted automatically.\n"
                 + "\n".join(group_lines)
-                + f"\nTemporary space required: approximately {archive_plan.archived_bytes:,} bytes plus overhead."
+                + "\n"
+                + self._archive_batch_summary(archive_plan, dry_run)
             )
         mode = "Dry run / compare (no files will be changed)" if dry_run else "Transfer (existing files may be updated; destination files are not deleted)"
         if (

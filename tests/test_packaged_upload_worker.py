@@ -49,22 +49,43 @@ def test_packaged_worker_uploads_loose_tree_then_archive_payload_and_cleans_up(m
     assert not list(tmp_path.glob(".source.qris-upload-*"))
 
 
-def test_packaged_worker_stops_after_loose_upload_failure_and_retains_package(monkeypatch, tmp_path: Path) -> None:
+def test_packaged_worker_stops_after_loose_upload_failure_before_building_archives(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
     plan = _plan(tmp_path)
     profile = Profile(name="Q0101", username="user", host="host", rsync_path="rsync.exe")
     worker = PackagedUploadWorker(profile, plan, "/data/Q0101", dry_run=False)
     monkeypatch.setattr(worker, "_available_profile", lambda *args, **kwargs: profile)
     commands: list[list[str]] = []
-    monkeypatch.setattr(worker.runner, "run", lambda command, *_args, **_kwargs: commands.append(command) or 23)
+    monkeypatch.setattr(worker.runner, "run", lambda command, *_args, **_kwargs: commands.append(command) or 11)
     results: list[int] = []
     worker.finished.connect(results.append)
 
     worker.run()
 
-    assert results == [23]
+    assert results == [11]
     assert len(commands) == 1
-    assert len(list(tmp_path.glob(".source.qris-upload-*"))) == 1
+    # No archive was built, and the exclusion list was removed.
+    assert not list(tmp_path.glob(".source.qris-upload-*"))
+
+
+def test_vanished_loose_files_still_let_the_archives_go_up(monkeypatch, tmp_path: Path) -> None:
+    # rsync 24 is normal on a share people are working in.
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+    plan = _plan(tmp_path)
+    profile = Profile(name="Q0101", username="user", host="host", rsync_path="rsync.exe")
+    worker = PackagedUploadWorker(profile, plan, "/data/Q0101", dry_run=False)
+    monkeypatch.setattr(worker, "_available_profile", lambda *args, **kwargs: profile)
+    codes = iter([24, 0])
+    commands: list[list[str]] = []
+    monkeypatch.setattr(worker.runner, "run", lambda command, *_a, **_k: commands.append(command) or next(codes))
+    results: list[int] = []
+    worker.finished.connect(results.append)
+
+    worker.run()
+
+    assert results == [24]
+    assert len(commands) == 2 and "--ignore-times" in commands[1]
+    assert not list(tmp_path.glob(".source.qris-upload-*"))
 
 
 def test_packaged_worker_preserves_source_folder_for_both_upload_phases(monkeypatch, tmp_path: Path) -> None:
@@ -127,12 +148,12 @@ def test_packaged_worker_rechecks_host_and_plan_before_forced_payload_upload(mon
     exclude_file = work_dir / "exclude"
     exclude_file.write_text("/source/one.jpg\n", encoding="utf-8")
     package = UploadPackage(work_dir, payload_dir, exclude_file, 1, 1)
-    prep_kwargs: dict[str, object] = {}
+    calls: list[dict[str, object]] = []
     hosts: list[object] = []
 
     def prepare(_plan, **kwargs):
-        assert len(hosts) == 1
-        prep_kwargs.update(kwargs)
+        assert len(hosts) == (1 if not calls else 2)
+        calls.append(kwargs)
         return package
 
     monkeypatch.setattr(
@@ -140,19 +161,19 @@ def test_packaged_worker_rechecks_host_and_plan_before_forced_payload_upload(mon
         prepare,
     )
     monkeypatch.setattr(worker, "_available_profile", lambda *args, **kwargs: hosts.append(object()) or profile)
-    revalidated: list[object] = []
-    monkeypatch.setattr("app.gui.main_window.revalidate_upload_plan", lambda *args, **_kwargs: revalidated.append(args[0]))
     commands: list[list[str]] = []
     monkeypatch.setattr(worker.runner, "run", lambda command, *_args, **_kwargs: commands.append(command) or 0)
 
     worker.run()
 
-    assert prep_kwargs["cancel_event"] is worker._cancelled
-    assert callable(prep_kwargs["progress_callback"])
-    assert prep_kwargs["build_archives"] is True
-    assert prep_kwargs["include_source_directory"] is True
+    # First the exclusion list only, then one archive batch.
+    assert [call["build_archives"] for call in calls] == [False, True]
+    for call in calls:
+        assert call["cancel_event"] is worker._cancelled
+        assert callable(call["progress_callback"])
+        assert call["include_source_directory"] is True
+    assert calls[1]["work_parent"] is not None
     assert len(hosts) == 3
-    assert revalidated == [plan]
     assert len(commands) == 2
     assert "--ignore-times" in commands[1]
     assert commands[1][-1] == "user@host:/data/Q0101/source/"
@@ -174,7 +195,6 @@ def test_packaged_dry_run_does_not_build_or_transfer_tar_payload(monkeypatch, tm
         lambda _plan, **kwargs: prep_kwargs.update(kwargs) or package,
     )
     monkeypatch.setattr(worker, "_available_profile", lambda *args, **kwargs: profile)
-    monkeypatch.setattr("app.gui.main_window.revalidate_upload_plan", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("revalidated")))
     commands: list[list[str]] = []
     monkeypatch.setattr(worker.runner, "run", lambda command, *_args, **_kwargs: commands.append(command) or 0)
     output: list[str] = []

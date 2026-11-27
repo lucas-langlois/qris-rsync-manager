@@ -200,6 +200,11 @@ Rules:
 - Prefer Windows `tar.exe` and fall back to MSYS2 tar.
 - Compare/dry-run must not build TAR files.
 - Remove temporary packages after success or cancel. Keep them after retries are exhausted and log where they are.
+- Real uploads send loose files first, then build and upload archives in batches (`plan_archive_batches`, `PackagedUploadWorker._upload_archives_in_batches`, about 100 GB each), deleting each batch once sent and hashing it for the receipt first (`hash_phase_now`). Only a failed batch is kept. For a network-share source, batches are built in local temp when it fits the largest part.
+- The loose-file pass leaves out archived files with a few rules per archived folder (`_folder_filter_rules`: keep subfolders, keep its loose files, leave out the rest), never one exclude line per archived file. rsync checks every path against every rule: 775,000 per-file lines cost ~8 ms per path (hours on a 1.2M-file share).
+- Analysis must not stat every ancestor of every folder: on a network share each stat is a round trip. Only the root is validated during the scan; scandir entries already prove subfolders are normal directories.
+- A folder that changes during the upload is skipped and reported (final code 23); the rest continues. rsync 23/24 in the loose phase do not stop the archives.
+- Windows Server deduplicated files (reparse tag 0x80000013) are ordinary files. Use `is_link_or_junction` (`app/core/paths.py`), never the bare reparse-point attribute: only name-surrogate tags (symlinks, junctions) are links. `os.scandir` reports the attribute on dedup files and `os.stat` does not. `DfsrPrivate`, `System Volume Information` and `$RECYCLE.BIN` are left out of scans and uploads.
 - Do not retry authentication failures automatically.
 - Selected-file uploads are exact and are never packaged.
 

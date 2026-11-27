@@ -39,6 +39,9 @@ class ReceiptPhase:
     collector: TransferCollector
     local_base: Path
     remote_base: str
+    # Set by hash_phase_now when the local files are temporary and are about
+    # to be removed (archive batches); the receipt then reuses these hashes.
+    hashed: list[ReceiptFile] | None = None
 
 
 @dataclass
@@ -55,6 +58,29 @@ class ReceiptPlan:
         collector = TransferCollector(self.direction)
         self.phases.append(ReceiptPhase(collector, Path(local_base), remote_base))
         return collector
+
+
+def hash_phase_now(
+    plan: ReceiptPlan,
+    collector: TransferCollector,
+    *,
+    emit: Callable[[str], None],
+    cancel_event: CancelSignal | None = None,
+) -> None:
+    """Hash one finished phase now, before its local files are deleted. Never raises."""
+    for phase in plan.phases:
+        if phase.collector is collector and phase.hashed is None:
+            try:
+                phase.hashed = hash_transferred_files(
+                    collector.finish(),
+                    phase.local_base,
+                    phase.remote_base,
+                    cancel_event=cancel_event,
+                    progress=lambda message: emit(message + "\n"),
+                )
+            except Exception as exc:  # The receipt must never fail the transfer.
+                emit(f"Warning: could not compute receipt checksums for this batch: {exc}\n")
+            return
 
 
 def upload_local_base(local_path: str | Path, *, files_from: bool, include_source_directory: bool) -> Path:
@@ -101,21 +127,24 @@ def record_transfer_receipt(
     to QRIScloud; it is used only for completed uploads.
     """
     try:
-        names_by_phase = [phase.collector.finish() for phase in plan.phases]
-        if not any(names_by_phase):
+        names_by_phase = [[] if phase.hashed is not None else phase.collector.finish() for phase in plan.phases]
+        if not any(names_by_phase) and not any(phase.hashed for phase in plan.phases):
             emit("No files were transferred, so no receipt was written.\n")
             return []
         count = sum(len(names) for names in names_by_phase)
-        emit(f"Computing SHA-256 checksums of {count:,} transferred file(s) for the receipt...\n")
+        if count:
+            emit(f"Computing SHA-256 checksums of {count:,} transferred file(s) for the receipt...\n")
         files: list[ReceiptFile] = []
         for phase, names in zip(plan.phases, names_by_phase):
-            hashed = hash_transferred_files(
-                names,
-                phase.local_base,
-                phase.remote_base,
-                cancel_event=cancel_event,
-                progress=lambda message: emit(message + "\n"),
-            )
+            hashed = phase.hashed
+            if hashed is None:
+                hashed = hash_transferred_files(
+                    names,
+                    phase.local_base,
+                    phase.remote_base,
+                    cancel_event=cancel_event,
+                    progress=lambda message: emit(message + "\n"),
+                )
             files.extend(replace(item, path=_relative_to_root(item, plan)) for item in hashed)
         clean = profile.normalized()
         receipt = build_receipt(

@@ -24,6 +24,33 @@ from app.core.archive_upload import (
 )
 
 
+
+def _excluded(exclude_file: Path, path: str) -> bool:
+    """Apply the exclusion file to a file *path* (``/a/b.jpg``) as rsync does: first match wins."""
+    import re
+
+    for line in exclude_file.read_text(encoding="utf-8").splitlines():
+        kind, pattern = line[0], line[2:]
+        if pattern.endswith("/"):
+            continue  # directory-only rule; *path* is a file
+        regex = ""
+        index = 0
+        while index < len(pattern):
+            character = pattern[index]
+            if character == "\\":
+                index += 1
+                regex += re.escape(pattern[index])
+            elif character == "*":
+                regex += "[^/]*"
+            elif character == "?":
+                regex += "[^/]"
+            else:
+                regex += re.escape(character)
+            index += 1
+        if re.fullmatch(regex, path):
+            return kind == "-"
+    return False
+
 def _write(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
@@ -69,9 +96,9 @@ def test_qualifying_type_and_named_companions_share_one_archive(tmp_path: Path) 
         with tarfile.open(package.payload_dir / "survey.tar") as archive:
             assert archive.getnames() == ["station00.jpg", "station00.xmp", "station01.jpg", "station02.jpg"]
 
-        exclusions = package.exclude_file.read_text(encoding="utf-8").splitlines()
-        assert "/station00.xmp" in exclusions
-        assert all("transect01.mp4" not in line and "field-notes.txt" not in line for line in exclusions)
+        assert _excluded(package.exclude_file, "/station00.xmp")
+        assert not _excluded(package.exclude_file, "/transect01.mp4")
+        assert not _excluded(package.exclude_file, "/field-notes.txt")
 
         inventory = (package.payload_dir / "survey.tar.inventory.txt").read_text(encoding="utf-8")
         assert "# types: jpg" in inventory
@@ -180,10 +207,9 @@ def test_same_named_file_of_other_type_joins_archive_but_unrelated_stays_loose(t
     plan = analyze_upload_tree(root, min_same_type=2)
     package = build_upload_package(plan)
     try:
-        exclusions = package.exclude_file.read_text(encoding="utf-8")
-        assert "/sample.jpg" in exclusions
-        assert "/sample.mp4" in exclusions
-        assert "unrelated.mp4" not in exclusions
+        assert _excluded(package.exclude_file, "/sample.jpg")
+        assert _excluded(package.exclude_file, "/sample.mp4")
+        assert not _excluded(package.exclude_file, "/unrelated.mp4")
     finally:
         package.cleanup()
 
@@ -198,7 +224,7 @@ def test_qualifying_nested_folder_preserves_remote_relative_path(tmp_path: Path)
     package = build_upload_package(plan)
     try:
         assert (package.payload_dir / "camera A" / "camera A.tar").is_file()
-        assert "/camera A/one.jpg" in package.exclude_file.read_text(encoding="utf-8")
+        assert _excluded(package.exclude_file, "/camera A/one.jpg")
     finally:
         package.cleanup()
 
@@ -265,9 +291,8 @@ def test_rsync_exclusions_escape_wildcards_in_real_filenames(tmp_path: Path) -> 
 
     package = build_upload_package(plan)
     try:
-        exclusions = package.exclude_file.read_text(encoding="utf-8")
-        assert r"/photo\[1\].jpg" in exclusions
-        assert r"/photo\[2\].jpg" in exclusions
+        assert _excluded(package.exclude_file, "/photo[1].jpg")
+        assert _excluded(package.exclude_file, "/photo[2].jpg")
     finally:
         package.cleanup()
 
@@ -316,15 +341,14 @@ def test_dry_preparation_writes_only_exclusions_and_exposes_planned_groups(tmp_p
         assert package.planned_groups == tuple(plan.groups)
         assert package.payload_dir.exists()
         assert not list(package.payload_dir.rglob("*.tar"))
-        assert "/survey/one.jpg" in package.exclude_file.read_text(encoding="utf-8")
+        assert _excluded(package.exclude_file, "/survey/one.jpg")
     finally:
         package.cleanup()
 
     contents_package = prepare_upload_package(plan, build_archives=False, include_source_directory=False)
     try:
-        exclusions = contents_package.exclude_file.read_text(encoding="utf-8")
-        assert "/one.jpg" in exclusions
-        assert "/survey/one.jpg" not in exclusions
+        assert _excluded(contents_package.exclude_file, "/one.jpg")
+        assert not _excluded(contents_package.exclude_file, "/survey/one.jpg")
     finally:
         contents_package.cleanup()
 
@@ -443,8 +467,8 @@ def test_large_archive_splits_into_parts_with_their_own_inventories(tmp_path: Pa
             assert "# part: " in inventory and " of 3" in inventory
             assert all(name in inventory for name in names)
         assert package.archive_count == package.inventory_count == 3
-        exclusions = package.exclude_file.read_text(encoding="utf-8").splitlines()
-        assert sorted(exclusions) == ["/a.jpg", "/a.xmp", "/b.jpg", "/c.jpg"]
+        for name in ("/a.jpg", "/a.xmp", "/b.jpg", "/c.jpg"):
+            assert _excluded(package.exclude_file, name)
     finally:
         package.cleanup()
 
@@ -520,3 +544,34 @@ def test_folder_below_same_type_threshold_is_not_archived(tmp_path: Path) -> Non
     assert not analyze_upload_tree(root).groups
     _write(root / "tile50.png", b"x")
     assert [group.media_count for group in analyze_upload_tree(root).groups] == [51]
+
+
+@pytest.mark.skipif(not Path(r"C:\msys64\usr\bin\rsync.exe").is_file(), reason="MSYS2 rsync is not installed")
+def test_real_rsync_sends_exactly_the_loose_files(tmp_path: Path) -> None:
+    """The folder rules leave out archived files and keep everything else, as rsync reads them."""
+    import subprocess
+
+    from app.core.paths import path_for_rsync
+
+    rsync = r"C:\msys64\usr\bin\rsync.exe"
+    root = tmp_path / "share"
+    for name in ("a.jpg", "b.jpg", "c.jpg", "a.xmp", "notes [v2].docx"):
+        _write(root / "site [1]" / name, b"x")
+    for name in ("d.jpg", "e.jpg", "f.jpg"):
+        _write(root / "site [1]" / "nested" / name, b"x")
+    _write(root / "site [1]" / "nested" / "keep.csv", b"x")
+    _write(root / "loose.txt", b"x")
+    _write(root / "other" / "g.jpg", b"x")
+    plan = analyze_upload_tree(root, min_same_type=2)
+    assert {group.relative_folder for group in plan.groups} == {"site [1]", "site [1]/nested"}
+    package = prepare_upload_package(plan, build_archives=False)
+    try:
+        output = subprocess.run(
+            [rsync, "-a", "-n", "--out-format=%n", f"--exclude-from={path_for_rsync(package.exclude_file, rsync)}",
+             path_for_rsync(root, rsync) + "/", path_for_rsync(tmp_path / "dest", rsync) + "/"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+    finally:
+        package.cleanup()
+    sent = {line for line in output.splitlines() if line and not line.endswith("/")}
+    assert sent == {"loose.txt", "other/g.jpg", "site [1]/notes [v2].docx", "site [1]/nested/keep.csv"}

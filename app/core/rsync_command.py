@@ -8,6 +8,7 @@ from .paths import (
     directory_source_for_rsync,
     file_source_for_rsync,
     path_for_rsync,
+    WINDOWS_SYSTEM_FOLDER_NAMES,
     ssh_host_key_options,
 )
 from .profiles import Profile
@@ -149,6 +150,9 @@ def build_rsync_command(
     # Receipts are written into synced folders by the app itself; never sync
     # them as ordinary data, or they would be re-sent and listed as transfers.
     command.append(f"--exclude={RECEIPT_DIR_NAME}/")
+    if direction == "upload":
+        # File-server system folders are unreadable and never research data.
+        command.extend(f"--exclude={name}/" for name in WINDOWS_SYSTEM_FOLDER_NAMES)
     if files_from:
         command.append(f"--files-from={path_for_rsync(files_from, clean.rsync_path)}")
     if exclude_from:
